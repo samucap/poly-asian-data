@@ -1,0 +1,43 @@
+# .golangci.yml - Security-focused linter configuration
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  disable-all: true
+  enable:
+    # Security linters
+    - gosec          # Security issues
+    - bodyclose      # HTTP response body not closed
+    - noctx          # HTTP requests without context.Context
+
+    # Standard linters
+    - govet          # Go vet
+    - errcheck       # Unchecked errors
+    - staticcheck    # Static analysis
+    - unused         # Unused code
+    - ineffassign    # Ineffectual assignments
+    - typecheck      # Type checking
+
+linters-settings:
+  gosec:
+    excludes:
+      - G104  # Audit errors not checked (too noisy for some patterns)
+    config:
+      global:
+        audit: enabled
+
+  govet:
+    enable-all: true
+
+issues:
+  exclude-rules:
+    # Exclude test files from certain checks
+    - path: _test\.go
+      linters:
+        - gosec
+        - errcheck
+
+  max-issues-per-linter: 50
+  max-same-issues: 10
