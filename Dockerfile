@@ -18,7 +18,7 @@ COPY . .
 # Build the application with security flags
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags="-w -s" \
-    -o main cmd/pipeline/main.go
+    -o main cmd/main.go
 
 # Final Stage - Distroless with nonroot
 FROM gcr.io/distroless/static-debian12:nonroot

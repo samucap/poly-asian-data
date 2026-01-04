@@ -46,7 +46,7 @@ func main() {
 	// The redaction is based on KEY names, so sensitive data in VALUES
 	// should be handled by not logging them at all, or masking in the struct.
 	logging.Info("Application initialized. Ready for connections.")
-
+	
 	// Graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)

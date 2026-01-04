@@ -2,7 +2,7 @@
 
 BINARY_NAME=poly-asian-data
 DOCKER_COMPOSE_FILE=docker-compose.yml
-MAIN_PATH=cmd/pipeline/main.go
+MAIN_PATH=cmd/main.go
 
 .PHONY: all build clean test coverage lint run dev audit sec docker-up docker-down
 
@@ -78,13 +78,6 @@ sec:
 docker-up:
 	@echo "Starting Docker environment..."
 	docker-compose -f $(DOCKER_COMPOSE_FILE) up --build
-
-docker-down:
-	@echo "Stopping Docker environment..."
-	docker-compose -f $(DOCKER_COMPOSE_FILE) down
-
-docker-logs:
-	docker-compose -f $(DOCKER_COMPOSE_FILE) logs -f
 
 # Install development tools
 tools:
