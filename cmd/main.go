@@ -38,15 +38,13 @@ func main() {
 	logging.Info("Configuration loaded successfully",
 		slog.String("environment", cfg.Environment),
 		slog.String("log_level", cfg.LogLevel),
-		slog.String("polymarket_api_key", cfg.PolymarketAPIKey), // Will be redacted
-		slog.String("postgres_url", cfg.PostgresURL),             // Contains password, but key doesn't match pattern
 	)
 
 	// Note: For postgres_url, the value itself may contain password.
 	// The redaction is based on KEY names, so sensitive data in VALUES
 	// should be handled by not logging them at all, or masking in the struct.
 	logging.Info("Application initialized. Ready for connections.")
-	
+
 	// Graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
