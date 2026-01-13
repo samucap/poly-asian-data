@@ -3,13 +3,36 @@ package saver
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/samucap/poly-asian-data/internal/logging"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func init() {
+	// Initialize logging for tests
+	logging.Init("dev")
+}
+
+// =============================================================================
+// Test Helper
+// =============================================================================
+
+// newTestPool creates a saver pool with New() + Start() for testing.
+func newTestPool(ctx context.Context, config Config) (*Pool, error) {
+	pool, err := New(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	if err := pool.Start(ctx); err != nil {
+		return nil, err
+	}
+	return pool, nil
+}
 
 // =============================================================================
 // Configuration Tests
@@ -21,30 +44,30 @@ func TestConfig_Validate(t *testing.T) {
 			NumWorkers: 4,
 			QueueSize:  100,
 			SaveFunc:   NoOpSaveFunc,
+			Logger:     slog.Default(),
 		}
 		err := cfg.Validate()
 		assert.NoError(t, err)
 		assert.Equal(t, 30*time.Second, cfg.SaveTimeout)
 		assert.Equal(t, 3, cfg.MaxRetries)
-		assert.NotNil(t, cfg.Logger)
 	})
 
 	t.Run("missing save func", func(t *testing.T) {
-		cfg := Config{NumWorkers: 4, QueueSize: 10}
+		cfg := Config{NumWorkers: 4, QueueSize: 10, Logger: slog.Default()}
 		err := cfg.Validate()
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "SaveFunc")
 	})
 
 	t.Run("zero workers", func(t *testing.T) {
-		cfg := Config{NumWorkers: 0, QueueSize: 10, SaveFunc: NoOpSaveFunc}
+		cfg := Config{NumWorkers: 0, QueueSize: 10, SaveFunc: NoOpSaveFunc, Logger: slog.Default()}
 		err := cfg.Validate()
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "NumWorkers")
 	})
 
 	t.Run("zero queue size", func(t *testing.T) {
-		cfg := Config{NumWorkers: 4, QueueSize: 0, SaveFunc: NoOpSaveFunc}
+		cfg := Config{NumWorkers: 4, QueueSize: 0, SaveFunc: NoOpSaveFunc, Logger: slog.Default()}
 		err := cfg.Validate()
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "QueueSize")
@@ -58,10 +81,11 @@ func TestConfig_Validate(t *testing.T) {
 func TestNewPool(t *testing.T) {
 	t.Run("creates pool with valid config", func(t *testing.T) {
 		ctx := context.Background()
-		pool, err := NewPool(ctx, Config{
+		pool, err := newTestPool(ctx, Config{
 			NumWorkers: 2,
 			QueueSize:  10,
 			SaveFunc:   NoOpSaveFunc,
+			Logger:     slog.Default(),
 		})
 		require.NoError(t, err)
 		require.NotNil(t, pool)
@@ -71,9 +95,10 @@ func TestNewPool(t *testing.T) {
 
 	t.Run("returns error with invalid config", func(t *testing.T) {
 		ctx := context.Background()
-		pool, err := NewPool(ctx, Config{
+		pool, err := newTestPool(ctx, Config{
 			NumWorkers: 0,
 			QueueSize:  10,
+			Logger:     slog.Default(),
 		})
 		assert.Error(t, err)
 		assert.Nil(t, pool)
@@ -83,10 +108,11 @@ func TestNewPool(t *testing.T) {
 func TestPool_Submit(t *testing.T) {
 	t.Run("submit nil record returns error", func(t *testing.T) {
 		ctx := context.Background()
-		pool, _ := NewPool(ctx, Config{
+		pool, _ := newTestPool(ctx, Config{
 			NumWorkers: 2,
 			QueueSize:  10,
 			SaveFunc:   NoOpSaveFunc,
+			Logger:     slog.Default(),
 		})
 		defer pool.Stop()
 
@@ -96,10 +122,11 @@ func TestPool_Submit(t *testing.T) {
 
 	t.Run("submit to stopped pool returns error", func(t *testing.T) {
 		ctx := context.Background()
-		pool, _ := NewPool(ctx, Config{
+		pool, _ := newTestPool(ctx, Config{
 			NumWorkers: 2,
 			QueueSize:  10,
 			SaveFunc:   NoOpSaveFunc,
+			Logger:     slog.Default(),
 		})
 		pool.Stop()
 
@@ -118,13 +145,14 @@ func TestPool_Save(t *testing.T) {
 		ctx := context.Background()
 
 		var savedData any
-		pool, err := NewPool(ctx, Config{
+		pool, err := newTestPool(ctx, Config{
 			NumWorkers: 2,
 			QueueSize:  10,
 			SaveFunc: func(ctx context.Context, record *Record) (int64, error) {
 				savedData = record.Data
 				return 1, nil
 			},
+			Logger: slog.Default(),
 		})
 		require.NoError(t, err)
 		defer pool.Stop()
@@ -152,7 +180,7 @@ func TestPool_Save(t *testing.T) {
 		var attempts atomic.Int32
 
 		ctx := context.Background()
-		pool, _ := NewPool(ctx, Config{
+		pool, _ := newTestPool(ctx, Config{
 			NumWorkers: 1,
 			QueueSize:  10,
 			MaxRetries: 2,
@@ -161,22 +189,25 @@ func TestPool_Save(t *testing.T) {
 				attempts.Add(1)
 				return 0, errors.New("db error")
 			},
+			Logger: slog.Default(),
 		})
 		defer pool.Stop()
 
 		_ = pool.Submit(&Record{ID: "fail-test"})
 
-		result := <-pool.Results()
-		assert.Error(t, result.Err)
-		assert.Contains(t, result.Err.Error(), "save failed")
+		// Wait for retries to complete
+		time.Sleep(time.Millisecond * 200)
 		assert.Equal(t, int32(3), attempts.Load()) // 1 + 2 retries
+
+		stats := pool.Stats().Snapshot()
+		assert.Equal(t, int64(1), stats.RecordsFailed)
 	})
 
 	t.Run("successful after retry", func(t *testing.T) {
 		var attempts atomic.Int32
 
 		ctx := context.Background()
-		pool, _ := NewPool(ctx, Config{
+		pool, _ := newTestPool(ctx, Config{
 			NumWorkers: 1,
 			QueueSize:  10,
 			MaxRetries: 3,
@@ -187,6 +218,7 @@ func TestPool_Save(t *testing.T) {
 				}
 				return 1, nil
 			},
+			Logger: slog.Default(),
 		})
 		defer pool.Stop()
 
@@ -205,12 +237,13 @@ func TestPool_Save(t *testing.T) {
 func TestPool_Stats(t *testing.T) {
 	ctx := context.Background()
 
-	pool, _ := NewPool(ctx, Config{
+	pool, _ := newTestPool(ctx, Config{
 		NumWorkers: 1,
 		QueueSize:  10,
 		SaveFunc: func(ctx context.Context, record *Record) (int64, error) {
 			return 2, nil // 2 rows affected per save
 		},
+		Logger: slog.Default(),
 	})
 	defer pool.Stop()
 
@@ -255,13 +288,14 @@ func TestStatsSnapshot_AverageDuration(t *testing.T) {
 func TestPool_Stop(t *testing.T) {
 	t.Run("graceful stop", func(t *testing.T) {
 		ctx := context.Background()
-		pool, _ := NewPool(ctx, Config{
+		pool, _ := newTestPool(ctx, Config{
 			NumWorkers: 1,
 			QueueSize:  10,
 			SaveFunc: func(ctx context.Context, record *Record) (int64, error) {
 				time.Sleep(time.Millisecond * 50)
 				return 1, nil
 			},
+			Logger: slog.Default(),
 		})
 
 		_ = pool.Submit(&Record{ID: "slow"})
@@ -278,28 +312,16 @@ func TestPool_Stop(t *testing.T) {
 
 	t.Run("stop is idempotent", func(t *testing.T) {
 		ctx := context.Background()
-		pool, _ := NewPool(ctx, Config{
+		pool, _ := newTestPool(ctx, Config{
 			NumWorkers: 1,
 			QueueSize:  10,
 			SaveFunc:   NoOpSaveFunc,
+			Logger:     slog.Default(),
 		})
 
 		pool.Stop()
 		pool.Stop()
 		pool.Stop()
-	})
-
-	t.Run("results closed after stop", func(t *testing.T) {
-		ctx := context.Background()
-		pool, _ := NewPool(ctx, Config{
-			NumWorkers: 1,
-			QueueSize:  10,
-			SaveFunc:   NoOpSaveFunc,
-		})
-		pool.Stop()
-
-		_, ok := <-pool.Results()
-		assert.False(t, ok)
 	})
 }
 

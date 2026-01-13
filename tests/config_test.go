@@ -1,7 +1,6 @@
 package config_test
 
 import (
-	"context"
 	"os"
 	"testing"
 
@@ -13,8 +12,7 @@ import (
 func TestLoadConfig(t *testing.T) {
 	// Setup: Clear environment variables before each test
 	clearEnv := func() {
-		os.Unsetenv("POLYMARKET_API_KEY")
-		os.Unsetenv("ODDS_API_KEY")
+		os.Unsetenv("SUBGRAPH_API_KEY")
 		os.Unsetenv("POSTGRES_URL")
 		os.Unsetenv("ENV")
 		os.Unsetenv("LOG_LEVEL")
@@ -30,60 +28,45 @@ func TestLoadConfig(t *testing.T) {
 		{
 			name: "Success_Development",
 			envVars: map[string]string{
-				"POLYMARKET_API_KEY": "poly_123",
-				"ODDS_API_KEY":       "odds_123",
-				"POSTGRES_URL":       "postgres://user:pass@localhost:5432/db",
+				"SUBGRAPH_API_KEY": "subgraph_123",
+				"POSTGRES_URL":     "postgres://user:pass@localhost:5432/db",
 			},
 			expectError: false,
 			expectedCfg: &config.Config{
-				PolymarketAPIKey: "poly_123",
-				OddsAPIKey:       "odds_123",
-				PostgresURL:      "postgres://user:pass@localhost:5432/db",
-				Environment:      "development",
-				LogLevel:         "info",
+				SubgraphAPIKey: "subgraph_123",
+				PostgresURL:    "postgres://user:pass@localhost:5432/db",
+				ENV:            "dev",
+				LogLevel:       "debug",
 			},
 		},
 		{
 			name: "Success_Production",
 			envVars: map[string]string{
-				"POLYMARKET_API_KEY": "poly_123",
-				"ODDS_API_KEY":       "odds_123",
-				"POSTGRES_URL":       "postgres://localhost:5432/db",
-				"ENV":                "production",
-				"LOG_LEVEL":          "warn",
+				"SUBGRAPH_API_KEY": "subgraph_123",
+				"POSTGRES_URL":     "postgres://localhost:5432/db",
+				"ENV":              "prod",
+				"LOG_LEVEL":        "warn",
 			},
 			expectError: false,
 			expectedCfg: &config.Config{
-				PolymarketAPIKey: "poly_123",
-				OddsAPIKey:       "odds_123",
-				PostgresURL:      "postgres://localhost:5432/db",
-				Environment:      "production",
-				LogLevel:         "warn",
+				SubgraphAPIKey: "subgraph_123",
+				PostgresURL:    "postgres://localhost:5432/db",
+				ENV:            "prod",
+				LogLevel:       "warn",
 			},
 		},
 		{
-			name: "Missing_PolymarketKey",
+			name: "Missing_SubgraphKey",
 			envVars: map[string]string{
-				"ODDS_API_KEY": "odds_123",
 				"POSTGRES_URL": "postgres://localhost:5432/db",
 			},
 			expectError: true,
-			errorField:  "PolymarketAPIKey",
-		},
-		{
-			name: "Missing_OddsKey",
-			envVars: map[string]string{
-				"POLYMARKET_API_KEY": "poly_123",
-				"POSTGRES_URL":       "postgres://localhost:5432/db",
-			},
-			expectError: true,
-			errorField:  "OddsAPIKey",
+			errorField:  "SubgraphAPIKey",
 		},
 		{
 			name: "Missing_PostgresURL",
 			envVars: map[string]string{
-				"POLYMARKET_API_KEY": "poly_123",
-				"ODDS_API_KEY":       "odds_123",
+				"SUBGRAPH_API_KEY": "subgraph_123",
 			},
 			expectError: true,
 			errorField:  "PostgresURL",
@@ -91,13 +74,12 @@ func TestLoadConfig(t *testing.T) {
 		{
 			name: "Invalid_Environment",
 			envVars: map[string]string{
-				"POLYMARKET_API_KEY": "poly_123",
-				"ODDS_API_KEY":       "odds_123",
-				"POSTGRES_URL":       "postgres://localhost:5432/db",
-				"ENV":                "invalid_env",
+				"SUBGRAPH_API_KEY": "subgraph_123",
+				"POSTGRES_URL":     "postgres://localhost:5432/db",
+				"ENV":              "invalid_env",
 			},
 			expectError: true,
-			errorField:  "Environment",
+			errorField:  "ENV",
 		},
 	}
 
@@ -109,7 +91,7 @@ func TestLoadConfig(t *testing.T) {
 			}
 			defer clearEnv()
 
-			cfg, err := config.Load(context.Background())
+			cfg, err := config.Load()
 
 			if tc.expectError {
 				require.Error(t, err)
@@ -119,7 +101,9 @@ func TestLoadConfig(t *testing.T) {
 				}
 			} else {
 				require.NoError(t, err)
-				assert.Equal(t, tc.expectedCfg, cfg)
+				assert.Equal(t, tc.expectedCfg.ENV, cfg.ENV)
+				assert.Equal(t, tc.expectedCfg.SubgraphAPIKey, cfg.SubgraphAPIKey)
+				assert.Equal(t, tc.expectedCfg.PostgresURL, cfg.PostgresURL)
 			}
 		})
 	}

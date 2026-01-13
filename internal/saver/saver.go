@@ -7,10 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/samucap/poly-asian-data/internal/processor"
 	"github.com/samucap/poly-asian-data/internal/workerpool"
 )
 
@@ -134,97 +134,148 @@ func (c *Config) Validate() error {
 // Pool Implementation
 // =============================================================================
 
-// Pool is a saver pool using generic workerpool.Pool.
+// Pool is a saver that wraps workerpool.Pool.
+// Only contains domain-specific state - lifecycle is managed by workerpool.
 type Pool struct {
 	pool    *workerpool.Pool[*Record, *SaveResult]
 	config  Config
 	stats   Stats
 	logger  *slog.Logger
-	ctx     context.Context
-	cancel  context.CancelFunc
-	stopped atomic.Bool
-
-	// Cached results channel
-	results chan *SaveResult
-
-	// Source listener
-	sourceWg sync.WaitGroup
+	input   chan *Record     // Owned internally
+	results chan *SaveResult // Owned internally, for test access
 }
 
-// NewPool creates a new saver pool.
-func NewPool(ctx context.Context, config Config) (*Pool, error) {
+// New creates and initializes a saver pool.
+// Validates config and sets up resources (logger, input channel).
+func New(ctx context.Context, config Config) (*Pool, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
 
-	poolCtx, cancel := context.WithCancel(ctx)
+	logger := config.Logger.With(
+		slog.String("component", "saver"),
+	)
 
-	s := &Pool{
+	p := &Pool{
 		config:  config,
-		logger:  config.Logger.With(slog.String("component", "saver")),
-		ctx:     poolCtx,
-		cancel:  cancel,
+		logger:  logger,
+		input:   make(chan *Record, config.QueueSize),
 		results: make(chan *SaveResult, config.QueueSize),
 	}
 
-	pool, err := workerpool.NewPool(poolCtx, workerpool.Config{
-		Name:       "saver",
-		NumWorkers: config.NumWorkers,
-		QueueSize:  config.QueueSize,
-		Logger:     config.Logger,
-	}, s.save)
+	logger.Info("saver initialized",
+		slog.Int("workers", config.NumWorkers),
+		slog.Int("queue_size", config.QueueSize),
+	)
 
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-
-	s.pool = pool
-
-	// Start result forwarder
-	go s.forwardResults()
-
-	return s, nil
+	return p, nil
 }
 
-// StartListening starts goroutines to listen on a source channel and save items.
-// This connects the saver to an upstream stage (e.g., processor outputs).
-func (s *Pool) StartListening(source <-chan *Record) {
-	s.sourceWg.Add(1)
+// Subscribe connects to an upstream processor's output channel (fan-in).
+// Converts processor.Output -> saver.Record and feeds to internal input channel.
+func (s *Pool) Subscribe(upstream <-chan *processor.Output) {
 	go func() {
-		defer s.sourceWg.Done()
-		for {
-			select {
-			case <-s.ctx.Done():
-				return
-			case record, ok := <-source:
-				if !ok {
-					return
-				}
-				s.stats.RecordsSubmitted.Add(1)
-				if err := s.pool.SubmitWait(record); err != nil {
-					s.logger.Error("failed to submit record",
-						slog.String("id", record.ID),
-						slog.String("error", err.Error()),
-					)
-				}
+		for output := range upstream {
+			s.input <- &Record{
+				ID:          output.InputID,
+				SourceURL:   output.SourceURL,
+				Data:        output.Data,
+				Metadata:    output.Metadata,
+				FetchedAt:   output.FetchedAt,
+				ProcessedAt: output.ProcessedAt,
 			}
 		}
+		close(s.input)
 	}()
 }
 
-// forwardResults forwards pool outputs to the cached results channel.
-func (s *Pool) forwardResults() {
-	defer close(s.results)
-	for result := range s.pool.Outputs() {
-		if result.Value != nil {
+
+
+// =============================================================================
+// Lifecycle Methods
+// =============================================================================
+
+// Name returns the pool's name.
+func (s *Pool) Name() string {
+	return "saver"
+}
+
+// Start begins the pool's work.
+// Workers read from internal input channel.
+func (s *Pool) Start(ctx context.Context) error {
+	if s.pool != nil {
+		return errors.New("pool is already running")
+	}
+
+	// Create the worker pool with the correct type parameters
+	pool, err := workerpool.NewPool[*Record, *SaveResult](ctx, "saver", s.config.NumWorkers, s.config.QueueSize)
+	if err != nil {
+		return err
+	}
+
+	// Set the WorkerTask function
+	pool.WorkerTask = s.Save
+
+	s.pool = pool
+
+	// Start input listener
+	go s.listenInput(ctx)
+
+	// Forward results from workerpool to internal results channel
+	go func() {
+		for result := range s.pool.Outputs() {
 			s.results <- result.Value
+		}
+		close(s.results)
+	}()
+
+	s.logger.Info("saver started",
+		slog.Int("workers", s.config.NumWorkers),
+	)
+
+	return nil
+}
+
+// IsRunning returns true if the pool is currently running.
+func (s *Pool) IsRunning() bool {
+	return s.pool != nil && !s.pool.IsStopped()
+}
+
+// listenInput reads from internal input channel and submits to worker pool.
+func (s *Pool) listenInput(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case record, ok := <-s.input:
+			if !ok {
+				return
+			}
+			s.stats.RecordsSubmitted.Add(1)
+			if err := s.pool.SubmitWait(record); err != nil {
+				s.logger.Error("failed to submit record",
+					slog.String("id", record.ID),
+					slog.String("error", err.Error()),
+				)
+			}
 		}
 	}
 }
 
-// save is the worker function with retry logic.
-func (s *Pool) save(ctx context.Context, record *Record) (*SaveResult, error) {
+// drainResults drains results (saver is final stage, results already logged in Save).
+func (s *Pool) drainResults() {
+	for range s.pool.Outputs() {
+		// Results are logged in Save() function, stats already tracked
+	}
+}
+
+// =============================================================================
+// SaverJob Interface - Work Function
+// =============================================================================
+
+// Save is the work function that persists a record.
+// This is the domain-specific operation for the saver stage.
+func (s *Pool) Save(ctx context.Context, record *Record) (*SaveResult, error) {
 	start := time.Now()
 
 	s.logger.Info("saving data",
@@ -293,19 +344,27 @@ func (s *Pool) save(ctx context.Context, record *Record) (*SaveResult, error) {
 	}, lastErr
 }
 
-// Submit adds a record to the pool directly.
+
+
+
+// Submit adds a record directly to the pool's internal input channel.
+// Primarily for testing. In production, use Subscribe() to connect upstream stages.
 func (s *Pool) Submit(record *Record) error {
 	if record == nil {
 		return errors.New("record cannot be nil")
 	}
-	if s.stopped.Load() {
+	if s.pool == nil {
+		return errors.New("pool not started: call Start() first")
+	}
+	if s.pool.IsStopped() {
 		return ErrPoolStopped
 	}
-	s.stats.RecordsSubmitted.Add(1)
-	return s.pool.SubmitWait(record)
+	s.input <- record
+	return nil
 }
 
-// Results returns the cached results channel.
+// Results returns the output channel with save results.
+// Primarily for testing. In production, results are logged.
 func (s *Pool) Results() <-chan *SaveResult {
 	return s.results
 }
@@ -320,25 +379,35 @@ func (s *Pool) NumWorkers() int {
 	return s.config.NumWorkers
 }
 
-// Stop gracefully shuts down.
-func (s *Pool) Stop() {
-	s.stopped.Store(true)
-	s.sourceWg.Wait() // Wait for source listeners to finish
+// =============================================================================
+// Lifecycle Methods
+// =============================================================================
+
+// Stop gracefully shuts down the pool.
+func (s *Pool) Stop() error {
+	if s.pool == nil {
+		return nil
+	}
+
 	s.pool.Stop()
-	s.cancel()
 
 	stats := s.stats.Snapshot()
-	s.logger.Info("saver pool stopped",
+	s.logger.Info("saver stopped",
 		slog.Int64("records_saved", stats.RecordsSaved),
 		slog.Int64("records_failed", stats.RecordsFailed),
 	)
+
+	return nil
 }
 
-// StopNow immediately stops.
-func (s *Pool) StopNow() {
-	s.stopped.Store(true)
+// StopNow immediately stops the pool.
+func (s *Pool) StopNow() error {
+	if s.pool == nil {
+		return nil
+	}
+
 	s.pool.StopNow()
-	s.cancel()
+	return nil
 }
 
 // =============================================================================

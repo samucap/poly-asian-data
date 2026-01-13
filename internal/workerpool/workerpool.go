@@ -19,11 +19,12 @@ package workerpool
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/samucap/poly-asian-data/internal/logging"
 )
 
 // =============================================================================
@@ -47,10 +48,6 @@ var (
 // =============================================================================
 // Generic Worker Pool
 // =============================================================================
-
-// ProcessFunc is the function signature for processing items.
-// T is the input type, R is the result type.
-type ProcessFunc[T, R any] func(ctx context.Context, input T) (R, error)
 
 // Result represents the outcome of processing an item.
 type Result[R any] struct {
@@ -112,56 +109,25 @@ func (s StatsSnapshot) AverageDuration() time.Duration {
 	return s.TotalDuration / time.Duration(total)
 }
 
-// Config holds the configuration for a worker pool.
-type Config struct {
-	// Name is an identifier for logging purposes.
-	Name string
-
-	// NumWorkers is the number of worker goroutines.
-	// Must be >= 1.
-	NumWorkers int
-
-	// QueueSize is the capacity of the input queue.
-	// Must be >= 1.
-	QueueSize int
-
-	// Logger is the structured logger to use. If nil, uses slog.Default().
-	Logger *slog.Logger
-}
-
-// Validate checks the configuration for errors.
-func (c *Config) Validate() error {
-	if c.NumWorkers < 1 {
-		return fmt.Errorf("%w: NumWorkers must be >= 1, got %d", ErrInvalidConfig, c.NumWorkers)
-	}
-	if c.QueueSize < 1 {
-		return fmt.Errorf("%w: QueueSize must be >= 1, got %d", ErrInvalidConfig, c.QueueSize)
-	}
-	if c.Logger == nil {
-		c.Logger = slog.Default()
-	}
-	if c.Name == "" {
-		c.Name = "pool"
-	}
-	return nil
-}
-
 // Pool is a generic worker pool for concurrent processing.
 // T is the input type, R is the result type.
 //
 // Workers read from a shared input channel (fan-out) and write results
 // to a shared output channel (fan-in).
 type Pool[T, R any] struct {
-	config  Config
-	process ProcessFunc[T, R]
-	stats   Stats
-	logger  *slog.Logger
+	PoolType   string // "fetcher", "processor", "writer"
+	stats      Stats
+	logger     *slog.Logger
+	numWorkers int
+	queueSize  int // input queue capacity
+	InputQ     chan T
+	OutputQ    chan Result[R]
 
-	// inputs is the channel where work items are submitted.
-	inputs chan T
+	// WorkerTask is the function called to process each input item.
+	WorkerTask func(ctx context.Context, input T) (R, error)
 
-	// outputs is the channel where results are published.
-	outputs chan Result[R]
+	// ownsOutput indicates whether this pool created and owns the output channel.
+	ownsOutput bool
 
 	// Internal synchronization
 	wg       sync.WaitGroup
@@ -171,37 +137,68 @@ type Pool[T, R any] struct {
 	stopOnce sync.Once
 }
 
+type PoolIF[T, R any] interface {
+	Inputs() chan<- T
+	Outputs() <-chan Result[R]
+	Stats() *Stats
+	IsStopped() bool
+	Stop()
+	StopNow()
+	Subscribe(ctx context.Context, target <-chan T)
+}
+
+func (p *Pool[T, R]) Subscribe(ctx context.Context, target <-chan T) {
+	go func() {
+		for {
+			select {
+			case o, ok := <-target:
+				if !ok {
+					return
+				}
+				p.logger.Info("Receiving message inside of", slog.String("pool", p.PoolType))
+				_ = p.SubmitWait(o)
+			case <-p.ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
 // NewPool creates a new worker pool with the given configuration.
 // The processFunc is called for each input item to produce a result.
-func NewPool[T, R any](ctx context.Context, config Config, processFunc ProcessFunc[T, R]) (*Pool[T, R], error) {
-	if processFunc == nil {
-		return nil, fmt.Errorf("%w: processFunc is required", ErrInvalidConfig)
-	}
-	if err := config.Validate(); err != nil {
-		return nil, err
-	}
+func NewPool[T, R any](ctx context.Context, pooltype string, numWorkers, qSize int) (*Pool[T, R], error) {
+	return NewPoolWithOutput[T, R](ctx, pooltype, numWorkers, qSize)
+}
 
+// NewPoolWithOutput creates a new worker pool that writes results to an external channel.
+// If output is nil, an internal output channel is created (accessible via Outputs()).
+func NewPoolWithOutput[T, R any](ctx context.Context, pooltype string, numWorkers, qSize int) (*Pool[T, R], error) {
+	logging.Info("Initializing pool",
+		slog.String("type", pooltype),
+		slog.Int("workers", numWorkers),
+		slog.Int("queue_size", qSize),
+	)
 	poolCtx, cancel := context.WithCancel(ctx)
-
 	p := &Pool[T, R]{
-		config:  config,
-		process: processFunc,
-		logger:  config.Logger.With(slog.String("component", config.Name)),
-		inputs:  make(chan T, config.QueueSize),
-		outputs: make(chan Result[R], config.QueueSize),
-		ctx:     poolCtx,
-		cancel:  cancel,
+		PoolType:   pooltype,
+		numWorkers: numWorkers,
+		InputQ:     make(chan T, qSize),
+		OutputQ:    make(chan Result[R], qSize),
+		ownsOutput: true,
+		logger:     logging.Logger.With(slog.String("component", pooltype)),
+		ctx:        poolCtx,
+		cancel:     cancel,
 	}
 
 	// Start workers (fan-out pattern)
-	for i := 0; i < config.NumWorkers; i++ {
+	for i := 0; i < numWorkers; i++ {
 		p.wg.Add(1)
 		go p.worker(i)
 	}
 
 	p.logger.Info("pool started",
-		slog.Int("workers", config.NumWorkers),
-		slog.Int("queue_size", config.QueueSize),
+		slog.Int("workers", numWorkers),
+		slog.Int("queue_size", qSize),
 	)
 
 	return p, nil
@@ -217,13 +214,21 @@ func (p *Pool[T, R]) worker(id int) {
 		select {
 		case <-p.ctx.Done():
 			return
-		case input, ok := <-p.inputs:
+		case input, ok := <-p.InputQ:
 			if !ok {
 				return
 			}
-			result := p.processItem(input)
-			p.sendResult(result)
+			p.sendResult(p.processItem(input))
 		}
+	}
+}
+
+func (p *Pool[T, R]) sendResult(result Result[R]) {
+	// Otherwise send full Result to internal outputs channel
+	select {
+	case p.OutputQ <- result:
+		return
+	case <-p.ctx.Done():
 	}
 }
 
@@ -234,7 +239,7 @@ func (p *Pool[T, R]) processItem(input T) Result[R] {
 
 	start := time.Now()
 
-	value, err := p.process(p.ctx, input)
+	value, err := p.WorkerTask(p.ctx, input)
 
 	duration := time.Since(start)
 	p.stats.TotalDuration.Add(int64(duration))
@@ -256,14 +261,6 @@ func (p *Pool[T, R]) processItem(input T) Result[R] {
 	}
 }
 
-// sendResult safely sends a result to the output channel.
-func (p *Pool[T, R]) sendResult(result Result[R]) {
-	select {
-	case p.outputs <- result:
-	case <-p.ctx.Done():
-	}
-}
-
 // Submit adds an input item to the pool's queue for processing.
 // Returns an error if the pool is stopped or the queue is full.
 func (p *Pool[T, R]) Submit(input T) error {
@@ -274,7 +271,7 @@ func (p *Pool[T, R]) Submit(input T) error {
 	p.stats.Submitted.Add(1)
 
 	select {
-	case p.inputs <- input:
+	case p.InputQ <- input:
 		return nil
 	case <-p.ctx.Done():
 		p.stats.Submitted.Add(-1)
@@ -295,7 +292,7 @@ func (p *Pool[T, R]) SubmitWait(input T) error {
 	p.stats.Submitted.Add(1)
 
 	select {
-	case p.inputs <- input:
+	case p.InputQ <- input:
 		return nil
 	case <-p.ctx.Done():
 		p.stats.Submitted.Add(-1)
@@ -306,27 +303,18 @@ func (p *Pool[T, R]) SubmitWait(input T) error {
 // Inputs returns the input channel for direct writing.
 // Use with caution - prefer Submit/SubmitWait for proper stats tracking.
 func (p *Pool[T, R]) Inputs() chan<- T {
-	return p.inputs
+	return p.InputQ
 }
 
 // Outputs returns the channel where results are published.
+// Panics if an external output channel was provided to NewPoolWithOutput.
 func (p *Pool[T, R]) Outputs() <-chan Result[R] {
-	return p.outputs
+	return p.OutputQ
 }
 
 // Stats returns the current statistics.
 func (p *Pool[T, R]) Stats() *Stats {
 	return &p.stats
-}
-
-// NumWorkers returns the number of workers in the pool.
-func (p *Pool[T, R]) NumWorkers() int {
-	return p.config.NumWorkers
-}
-
-// Name returns the pool's name.
-func (p *Pool[T, R]) Name() string {
-	return p.config.Name
 }
 
 // IsStopped returns true if the pool has been stopped.
@@ -336,14 +324,18 @@ func (p *Pool[T, R]) IsStopped() bool {
 
 // Stop gracefully shuts down the pool.
 // It stops accepting new work, waits for in-progress work to complete,
-// then closes the output channel.
+// then closes the output channel (if owned by this pool).
 func (p *Pool[T, R]) Stop() {
 	p.stopOnce.Do(func() {
 		p.stopped.Store(true)
-		close(p.inputs)
+		close(p.InputQ)
 		p.wg.Wait()
 		p.cancel()
-		close(p.outputs)
+
+		// Only close output channel if we created it
+		if p.ownsOutput && p.OutputQ != nil {
+			close(p.OutputQ)
+		}
 
 		stats := p.stats.Snapshot()
 		p.logger.Info("pool stopped",
@@ -358,9 +350,13 @@ func (p *Pool[T, R]) StopNow() {
 	p.stopOnce.Do(func() {
 		p.stopped.Store(true)
 		p.cancel()
-		close(p.inputs)
+		close(p.InputQ)
 		p.wg.Wait()
-		close(p.outputs)
+
+		// Only close output channel if we created it
+		if p.ownsOutput && p.OutputQ != nil {
+			close(p.OutputQ)
+		}
 	})
 }
 
@@ -701,12 +697,12 @@ type Counter struct {
 	value atomic.Int64
 }
 
-func (c *Counter) Add(delta int64) int64  { return c.value.Add(delta) }
-func (c *Counter) Inc() int64             { return c.value.Add(1) }
-func (c *Counter) Dec() int64             { return c.value.Add(-1) }
-func (c *Counter) Load() int64            { return c.value.Load() }
-func (c *Counter) Store(val int64)        { c.value.Store(val) }
-func (c *Counter) Reset() int64           { return c.value.Swap(0) }
+func (c *Counter) Add(delta int64) int64 { return c.value.Add(delta) }
+func (c *Counter) Inc() int64            { return c.value.Add(1) }
+func (c *Counter) Dec() int64            { return c.value.Add(-1) }
+func (c *Counter) Load() int64           { return c.value.Load() }
+func (c *Counter) Store(val int64)       { c.value.Store(val) }
+func (c *Counter) Reset() int64          { return c.value.Swap(0) }
 
 // =============================================================================
 // Rate Limiter

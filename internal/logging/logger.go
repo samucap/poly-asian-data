@@ -28,7 +28,7 @@ var Logger *slog.Logger
 // Init initializes the global logger with redaction support.
 // In non-production, source location is enabled.
 func Init(env string) {
-	isProduction := env == "production"
+	isProduction := env == "prod"
 
 	opts := &slog.HandlerOptions{
 		Level:     slog.LevelInfo,

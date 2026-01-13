@@ -20,10 +20,29 @@ clean:
 	rm -rf bin/
 	rm -f coverage.out
 
-# Run tests
+# Run tests with gotestsum for colorized output with summary
 test:
 	@echo "Running tests..."
-	go test -v ./...
+	@if command -v gotestsum >/dev/null 2>&1; then \
+		gotestsum --format pkgname-and-test-fails --no-color=false -- -timeout=60s ./...; \
+	else \
+		echo "gotestsum not installed. Using go test..."; \
+		echo "Install gotestsum: go install gotest.tools/gotestsum@latest"; \
+		go test -v -timeout=60s ./...; \
+	fi
+
+# Run tests with verbose output (all test names)
+test-verbose:
+	@echo "Running tests (verbose)..."
+	@if command -v gotestsum >/dev/null 2>&1; then \
+		gotestsum --format testname -- -timeout=60s ./...; \
+	else \
+		go test -v -timeout=60s ./...; \
+	fi
+
+# Run tests with JSON output (for CI/debugging)
+test-json:
+	go test -v -json -timeout=60s ./...
 
 # Run tests with coverage
 coverage:
@@ -86,3 +105,4 @@ tools:
 	go install golang.org/x/vuln/cmd/govulncheck@latest
 	go install github.com/securego/gosec/v2/cmd/gosec@latest
 	go install github.com/air-verse/air@latest
+	go install gotest.tools/gotestsum@latest

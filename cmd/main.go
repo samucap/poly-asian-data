@@ -9,6 +9,8 @@ import (
 
 	"github.com/samucap/poly-asian-data/internal/config"
 	"github.com/samucap/poly-asian-data/internal/logging"
+	"github.com/samucap/poly-asian-data/internal/pipeline"
+	"github.com/samucap/poly-asian-data/internal/saver"
 )
 
 func main() {
@@ -18,36 +20,48 @@ func main() {
 	// Initialize logger with default env (will be overridden after config load)
 	env := os.Getenv("ENV")
 	if env == "" {
-		env = "development"
+		env = "dev"
 	}
 	logging.Init(env)
 
-	logging.Info("Starting Poly Data Pipeline...")
+	logging.Info("Starting Poly Asian Data Pipeline...")
 
 	// Load configuration
-	cfg, err := config.Load(ctx)
+	cfg, err := config.Load()
 	if err != nil {
 		logging.Error("Failed to load configuration", slog.Any("error", err))
 		os.Exit(1)
 	}
 
 	// Re-initialize logger with proper environment from config
-	logging.Init(cfg.Environment)
+	logging.Init(cfg.ENV)
 
 	// Log startup info (demonstrating redaction)
 	logging.Info("Configuration loaded successfully",
-		slog.String("environment", cfg.Environment),
-		slog.String("log_level", cfg.LogLevel),
+		slog.String("environment", cfg.ENV),
+		slog.String("log level", cfg.LogLevel),
 	)
 
-	// Note: For postgres_url, the value itself may contain password.
-	// The redaction is based on KEY names, so sensitive data in VALUES
-	// should be handled by not logging them at all, or masking in the struct.
-	logging.Info("Application initialized. Ready for connections.")
+	logging.Info("Application initialized. Starting data pipeline...")
 
 	// Graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		pipelineCfg := pipeline.Config{
+			NumWorkers: 2,
+			QueueSize:  10,
+			SaverCfg: saver.Config{
+				NumWorkers: 2,
+				QueueSize:  10,
+				SaveFunc:   saver.NoOpSaveFunc,
+				Logger:     logging.Logger,
+			},
+			Logger: logging.Logger,
+		}
+		_, _ = pipeline.New(ctx, pipelineCfg)
+	}()
 
 	<-sigChan
 	logging.Info("Shutdown signal received. Exiting...")

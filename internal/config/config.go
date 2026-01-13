@@ -1,7 +1,6 @@
 package config
 
 import (
-	"context"
 	"strings"
 
 	"github.com/go-playground/validator/v10"
@@ -13,11 +12,12 @@ import (
 // Load order: System ENV > .env file > Defaults.
 type Config struct {
 	// Environment: "development", "staging", "production"
-	Environment string `mapstructure:"ENV" validate:"required,oneof=development staging production"`
+	ENV string `mapstructure:"ENV" validate:"required,oneof=dev stg prod"`
 
 	// API Keys
-	PolymarketAPIKey string `mapstructure:"POLYMARKET_API_KEY" validate:"required"`
-	OddsAPIKey       string `mapstructure:"ODDS_API_KEY" validate:"required"`
+	//PolymarketAPIKey string `mapstructure:"POLYMARKET_API_KEY" validate:"required"`
+	// OddsAPIKey       string `mapstructure:"ODDS_API_KEY" validate:"required"`
+	SubgraphAPIKey string `mapstructure:"SUBGRAPH_API_KEY" validate:"required"`
 
 	// Database
 	PostgresURL string `mapstructure:"POSTGRES_URL" validate:"required,url"`
@@ -31,7 +31,7 @@ var validate = validator.New()
 
 // Load reads configuration from environment variables and .env file.
 // Priority: System ENV > .env file > Defaults.
-func Load(ctx context.Context) (*Config, error) {
+func Load() (*Config, error) {
 	// Step 1: Load .env file (does NOT overwrite existing system env vars)
 	// Ignore error if .env doesn't exist (common in Docker/CI)
 	_ = godotenv.Load()
@@ -40,15 +40,15 @@ func Load(ctx context.Context) (*Config, error) {
 	v := viper.New()
 
 	// Set defaults
-	v.SetDefault("ENV", "development")
-	v.SetDefault("LOG_LEVEL", "info")
+	v.SetDefault("ENV", "dev")
+	v.SetDefault("LOG_LEVEL", "debug")
 
 	// Step 3: Bind to environment variables (this gives system ENV priority)
 	v.AutomaticEnv()
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	// Explicitly bind keys we care about
-	keys := []string{"ENV", "POLYMARKET_API_KEY", "ODDS_API_KEY", "POSTGRES_URL", "LOG_LEVEL"}
+	keys := []string{"ENV", "SUBGRAPH_API_KEY", "ODDS_API_KEY", "POSTGRES_URL", "LOG_LEVEL"}
 	for _, key := range keys {
 		if err := v.BindEnv(key); err != nil {
 			return nil, &ConfigError{Op: "bind_env", Err: err}
@@ -101,5 +101,5 @@ func formatValidationError(fe validator.FieldError) string {
 
 // IsProduction returns true if running in production environment.
 func (c *Config) IsProduction() bool {
-	return c.Environment == "production"
+	return c.ENV == "prod"
 }
