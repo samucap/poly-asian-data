@@ -66,7 +66,7 @@ func TestFetcher_Submit(t *testing.T) {
 		result, _ := newTestFetcher(ctx, 2, 10)
 		result.cleanup() // Stop the pool
 
-		err := result.fetcher.Submit(&Request{ID: "test", URL: "http://example.com"})
+		err := result.fetcher.Submit(&Request{URL: "http://example.com"})
 		assert.Error(t, err)
 	})
 }
@@ -91,31 +91,27 @@ func TestFetcher_WorkerTask(t *testing.T) {
 
 		// Call WorkerTask directly
 		req := &Request{
-			ID:  "test-1",
 			URL: server.URL,
 		}
-		resp, err := f.WorkerTask(ctx, req)
+		resp, err := f.workerTask(ctx, req)
 		require.NoError(t, err)
 		assert.Equal(t, server.URL, resp.URL)
 		// WorkerTask currently returns mock data, so check that
 		assert.Equal(t, []byte("fetcherSuccess"), resp.Body)
 	})
 
-	t.Run("metadata passes through", func(t *testing.T) {
+	t.Run("basic request works", func(t *testing.T) {
 		ctx := context.Background()
 		f, err := New(ctx, 1, 10)
 		require.NoError(t, err)
 		defer f.Stop()
 
 		req := &Request{
-			ID:       "test-meta",
-			URL:      "http://example.com",
-			Metadata: map[string]any{"source": "test", "index": 42},
+			URL: "http://example.com",
 		}
-		resp, err := f.WorkerTask(ctx, req)
+		resp, err := f.workerTask(ctx, req)
 		require.NoError(t, err)
-		assert.Equal(t, "test", resp.Metadata["source"])
-		assert.Equal(t, 42, resp.Metadata["index"])
+		assert.Equal(t, "http://example.com", resp.URL)
 	})
 }
 

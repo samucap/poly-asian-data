@@ -180,7 +180,6 @@ func (s *Pool) Subscribe(upstream <-chan *processor.Output) {
 				ID:          output.InputID,
 				SourceURL:   output.SourceURL,
 				Data:        output.Data,
-				Metadata:    output.Metadata,
 				FetchedAt:   output.FetchedAt,
 				ProcessedAt: output.ProcessedAt,
 			}
@@ -207,14 +206,11 @@ func (s *Pool) Start(ctx context.Context) error {
 		return errors.New("pool is already running")
 	}
 
-	// Create the worker pool with the correct type parameters
-	pool, err := workerpool.NewPool[*Record, *SaveResult](ctx, "saver", s.config.NumWorkers, s.config.QueueSize)
+	// Create the worker pool with the Save method as the process function
+	pool, err := workerpool.NewPool[*Record, *SaveResult](ctx, "saver", s.config.NumWorkers, s.config.QueueSize, s.logger, s.Save)
 	if err != nil {
 		return err
 	}
-
-	// Set the WorkerTask function
-	pool.WorkerTask = s.Save
 
 	s.pool = pool
 

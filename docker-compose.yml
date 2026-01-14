@@ -1,23 +1,17 @@
-version: '3.8'
-
 services:
   app:
     container_name: poly-asian-data-app
     build:
       context: .
       dockerfile: Dockerfile
-    environment:
-      - ENV=${ENV:-production}
-      - POLYMARKET_API_KEY=${POLYMARKET_API_KEY}
-      - ODDS_API_KEY=${ODDS_API_KEY}
-      - POSTGRES_URL=postgres://polyuser:polypassword@postgres:5432/polydata?sslmode=disable
-      - LOG_LEVEL=${LOG_LEVEL:-info}
+    env_file:
+      - .env
     depends_on:
       postgres:
         condition: service_healthy
     networks:
       - poly-asian-network
-    restart: unless-stopped
+    restart: "on-failure:3"
 
   postgres:
     image: postgres:16-alpine

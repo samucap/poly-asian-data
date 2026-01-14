@@ -37,12 +37,10 @@ type Fetcher struct {
 
 // Request represents a fetch request.
 type Request struct {
-	ID       string
 	URL      string
 	Method   string
 	Headers  map[string]string
 	Body     io.Reader
-	Metadata map[string]any
 }
 
 // Response represents the result of a fetch.
@@ -109,23 +107,19 @@ func New(ctx context.Context, numWorkers, qSize int) (*Fetcher, error) {
 		slog.String("component", "fetcher"),
 	)
 
-	pool, err := workerpool.NewPool[*Request, *Response](ctx, "fetcher", numWorkers, qSize)
-	if err != nil {
-		return nil, err
-	}
-
+	// Create fetcher first so we can pass its method to the pool
 	f := &Fetcher{
-		Pool:       pool,
 		httpClient: newSecureHTTPClient(),
 		logger:     logger,
 	}
 
-	return f, nil
-}
+	pool, err := workerpool.NewPool[*Request, *Response](ctx, "fetcher", numWorkers, qSize, logger, f.workerTask)
+	if err != nil {
+		return nil, err
+	}
 
-// IsRunning returns true if the pool is currently running.
-func (f *Fetcher) IsRunning() bool {
-	return f.Pool != nil && !f.Pool.IsStopped()
+	f.Pool = pool
+	return f, nil
 }
 
 // =============================================================================
@@ -238,13 +232,13 @@ func (f *Fetcher) IsRunning() bool {
 
 func newSecureHTTPClient() *http.Client {
 	tlsConfig := &tls.Config{
-		MinVersion: tls.VersionTLS12,
+		MinVersion: tls.VersionTLS13,
 	}
 
 	transport := &http.Transport{
 		TLSClientConfig: tlsConfig,
 		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
+			Timeout:   5 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		MaxIdleConns:        100,
@@ -256,11 +250,11 @@ func newSecureHTTPClient() *http.Client {
 
 	return &http.Client{
 		Transport: transport,
-		Timeout:   30 * time.Second,
+		Timeout:   2 * time.Second,
 	}
 }
 
-func (f *Fetcher) WorkerTask(ctx context.Context, input *Request) (*Response, error) {
+func (f *Fetcher) workerTask(ctx context.Context, input *Request) (*Response, error) {
 	f.logger.Info("fetching url",
 		slog.String("url", input.URL),
 	)
@@ -271,6 +265,5 @@ func (f *Fetcher) WorkerTask(ctx context.Context, input *Request) (*Response, er
 		Duration: 10 * time.Millisecond,
 		Body:     []byte("fetcherSuccess"),
 		Err:      nil,
-		Metadata: input.Metadata,
 	}, nil
 }

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/samucap/poly-asian-data/internal/fetcher"
 	"github.com/samucap/poly-asian-data/internal/logging"
 	"github.com/samucap/poly-asian-data/internal/workerpool"
 )
@@ -35,7 +36,6 @@ type Input struct {
 	ID        string
 	SourceURL string
 	Data      []byte
-	Metadata  map[string]any
 	FetchedAt time.Time
 }
 
@@ -44,7 +44,6 @@ type Output struct {
 	InputID     string
 	SourceURL   string
 	Data        any
-	Metadata    map[string]any
 	Duration    time.Duration
 	Err         error
 	FetchedAt   time.Time
@@ -88,14 +87,15 @@ func New(ctx context.Context, numWorkers, qSize int) (*Processor, error) {
 		slog.String("component", "processor"),
 	)
 
-	pool, err := workerpool.NewPool[*Input, *Output](ctx, "processor", numWorkers, qSize)
+	// Create processor first so we can pass its method to the pool
+	p := &Processor{}
+
+	pool, err := workerpool.NewPool[*Input, *Output](ctx, "processor", numWorkers, qSize, logger, p.workerTask)
 	if err != nil {
 		return nil, err
 	}
 
-	p := &Processor{
-		Pool: pool,
-	}
+	p.Pool = pool
 
 	logger.Info("processor initialized",
 		slog.Int("workers", numWorkers),
@@ -103,6 +103,33 @@ func New(ctx context.Context, numWorkers, qSize int) (*Processor, error) {
 	)
 
 	return p, nil
+}
+
+// SubscribeToFetcher connects to the fetcher's output channel and transforms
+// fetcher.Response -> processor.Input for processing.
+func (p *Processor) SubscribeToFetcher(ctx context.Context, upstream <-chan workerpool.Result[*fetcher.Response]) {
+	go func() {
+		for {
+			select {
+			case result, ok := <-upstream:
+				if !ok {
+					return // Channel closed
+				}
+				if result.Err != nil {
+					continue // Skip failed fetches
+				}
+				// Transform fetcher.Response to processor.Input
+				input := &Input{
+					SourceURL: result.Value.URL,
+					Data:      result.Value.Body,
+					FetchedAt: time.Now(),
+				}
+				_ = p.SubmitWait(input)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 }
 
 // =============================================================================
@@ -181,7 +208,7 @@ func JSONProcessor(ctx context.Context, input *Input) (any, error) {
 	return input.Data, nil
 }
 
-func (p *Processor) WorkerTask(ctx context.Context, input *Input) (*Output, error) {
+func (p *Processor) workerTask(ctx context.Context, input *Input) (*Output, error) {
 	time.Sleep(10 * time.Millisecond) // Placeholder delay
 	return &Output{
 		InputID:     input.ID,

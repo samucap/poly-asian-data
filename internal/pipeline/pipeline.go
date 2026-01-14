@@ -123,6 +123,9 @@ func New(ctx context.Context, config Config) (*Pipeline, error) {
 		return nil, err
 	}
 
+	// Connect processor to fetcher output (type-safe transformation)
+	processorPool.SubscribeToFetcher(pipelineCtx, fetcherPool.Outputs())
+
 	p := &Pipeline{
 		fetcherPool:   fetcherPool,
 		processorPool: processorPool,
@@ -134,26 +137,26 @@ func New(ctx context.Context, config Config) (*Pipeline, error) {
 		cancel:        cancel,
 	}
 
-	logger.Info("pipeline started",
-		slog.Int("fetcher_workers", config.NumWorkers),
-		slog.Int("processor_workers", config.NumWorkers),
-		slog.Int("saver_workers", config.SaverCfg.NumWorkers),
-	)
-
-	return p, nil
-}
-
-// SubmitURL submits a URL to be fetched.
-func (p *Pipeline) SubmitURL(id, url string, metadata map[string]any) error {
-	if p.stopped.Load() {
-		return ErrPipelineStopped
+	urls := []string{
+		"google.com",
+		"espn.com",
+		"x.com",
 	}
 
-	return p.fetcherPool.Submit(&fetcher.Request{
-		ID:       id,
-		URL:      url,
-		Metadata: metadata,
-	})
+	go func(){
+		for _, url := range urls {
+			p.fetcherPool.SubmitWait(&fetcher.Request{
+				URL: url,
+				Method: "GET",
+				Headers: map[string]string{
+					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+					"Content-Type": "application/json",
+				},
+			})
+		}
+	}()
+
+	return p, nil
 }
 
 // Stats returns current pipeline statistics.
@@ -161,8 +164,8 @@ func (p *Pipeline) Stats() Stats {
 	return Stats{
 		StartedAt:      p.startedAt,
 		UptimeDuration: time.Since(p.startedAt),
-		Fetcher:        p.fetcherPool.Pool.Stats().Snapshot(),
-		Processor:      p.processorPool.Pool.Stats().Snapshot(),
+		Fetcher:        p.fetcherPool.Stats().Snapshot(),
+		Processor:      p.processorPool.Stats().Snapshot(),
 		Saver:          p.saverPool.Stats().Snapshot(),
 	}
 }

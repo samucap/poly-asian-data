@@ -44,7 +44,7 @@ func Load() (*Config, error) {
 	v.SetDefault("LOG_LEVEL", "debug")
 
 	// Step 3: Bind to environment variables (this gives system ENV priority)
-	v.AutomaticEnv()
+	//v.AutomaticEnv()
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	// Explicitly bind keys we care about
