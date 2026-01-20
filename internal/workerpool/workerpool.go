@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 	"fmt"
+	"github.com/google/uuid"
 )
 
 // =============================================================================
@@ -47,6 +48,19 @@ var (
 // =============================================================================
 // Generic Worker Pool
 // =============================================================================
+type Input[T any] struct {
+    // ID is a unique identifier for tracking this input
+    ID string
+    
+    // WorkerID indicates which worker is processing this input
+    WorkerID int
+    
+    // Data is the actual payload to be processed
+    Data T
+    
+    // SubmittedAt is when this input was submitted
+    SubmittedAt time.Time
+}
 
 // Result represents the outcome of processing an item.
 type Result[R any] struct {
@@ -119,7 +133,7 @@ type Pool[T, R any] struct {
 	logger      *slog.Logger
 	numWorkers  int
 	queueSize   int // input queue capacity
-	InputQ      chan T
+	InputQ      chan Input[T]
 	OutputQ     chan Result[R]
 	processFunc func(context.Context, T) (R, error)
 	// Internal synchronization
@@ -133,12 +147,12 @@ type Pool[T, R any] struct {
 type PoolIF[T, R any] interface {
 	Testor()
 	Outputs() chan Result[R]
-	Inputs() chan T
+	Inputs() chan Input[T]
 	Stats() Stats
 	Stop()
 	StopNow()
 	IsRunning() bool
-	SubmitWait(ctx context.Context, input T) (R, error)
+	SubmitWait(ctx context.Context, input Input[T]) error
 }
 
 // NewPool creates a new worker pool with the given configuration.
@@ -159,7 +173,7 @@ func NewPoolWithOutput[T, R any](ctx context.Context, pooltype string, numWorker
 	p := &Pool[T, R]{
 		PoolType:    pooltype,
 		numWorkers:  numWorkers,
-		InputQ:      make(chan T, qSize),
+		InputQ:      make(chan Input[T], qSize),
 		OutputQ:     make(chan Result[R], qSize),
 		processFunc: processFunc,
 		logger:      logger,
@@ -195,6 +209,9 @@ func (p *Pool[T, R]) worker(id int) {
 			if !ok {
 				return
 			}
+			
+			input.WorkerID = id
+			input.ID = uuid.New().String()
 			p.sendResult(p.processItem(input))
 		}
 	}
@@ -217,13 +234,13 @@ func (p *Pool[T, R]) sendResult(result Result[R]) {
 }
 
 // processItem runs the process function on an input item.
-func (p *Pool[T, R]) processItem(input T) Result[R] {
+func (p *Pool[T, R]) processItem(input Input[T]) Result[R] {
 	p.stats.InProgress.Add(1)
 	defer p.stats.InProgress.Add(-1)
 
 	start := time.Now()
 
-	value, err := p.processFunc(p.ctx, input)
+	value, err := p.processFunc(p.ctx, input.Data)
 
 	duration := time.Since(start)
 	p.stats.TotalDuration.Add(int64(duration))
@@ -233,7 +250,6 @@ func (p *Pool[T, R]) processItem(input T) Result[R] {
 		// Include value even on error - caller may have set useful data
 		return Result[R]{
 			Value:    value,
-			Err:      err,
 			Duration: duration,
 		}
 	}
@@ -247,7 +263,7 @@ func (p *Pool[T, R]) processItem(input T) Result[R] {
 
 // Submit adds an input item to the pool's queue for processing.
 // Returns an error if the pool is stopped or the queue is full.
-func (p *Pool[T, R]) Submit(input T) error {
+func (p *Pool[T, R]) Submit(input Input[T]) error {
 	if p.stopped.Load() {
 		return ErrPoolStopped
 	}
@@ -268,7 +284,7 @@ func (p *Pool[T, R]) Submit(input T) error {
 
 // SubmitWait adds an input item, blocking until space is available.
 // Returns an error only if the pool is stopped.
-func (p *Pool[T, R]) SubmitWait(input T) error {
+func (p *Pool[T, R]) SubmitWait(input Input[T]) error {
 	if p.stopped.Load() {
 		return ErrPoolStopped
 	}
@@ -286,7 +302,7 @@ func (p *Pool[T, R]) SubmitWait(input T) error {
 
 // Inputs returns the input channel for direct writing.
 // Use with caution - prefer Submit/SubmitWait for proper stats tracking.
-func (p *Pool[T, R]) Inputs() chan<- T {
+func (p *Pool[T, R]) Inputs() chan<- Input[T] {
 	return p.InputQ
 }
 

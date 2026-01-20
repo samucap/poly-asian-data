@@ -177,10 +177,8 @@ func (s *Pool) Subscribe(upstream <-chan *processor.Output) {
 	go func() {
 		for output := range upstream {
 			s.input <- &Record{
-				ID:          output.InputID,
-				SourceURL:   output.SourceURL,
+				ID:          output.ID,
 				Data:        output.Data,
-				FetchedAt:   output.FetchedAt,
 				ProcessedAt: output.ProcessedAt,
 			}
 		}
@@ -248,7 +246,12 @@ func (s *Pool) listenInput(ctx context.Context) {
 				return
 			}
 			s.stats.RecordsSubmitted.Add(1)
-			if err := s.pool.SubmitWait(record); err != nil {
+			// Wrap record in Input[T]
+			input := workerpool.Input[*Record]{
+				Data:        record,
+				SubmittedAt: time.Now(),
+			}
+			if err := s.pool.SubmitWait(input); err != nil {
 				s.logger.Error("failed to submit record",
 					slog.String("id", record.ID),
 					slog.String("error", err.Error()),

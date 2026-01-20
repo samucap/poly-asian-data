@@ -124,7 +124,7 @@ func New(ctx context.Context, config Config) (*Pipeline, error) {
 	}
 
 	// Connect processor to fetcher output (type-safe transformation)
-	processorPool.SubscribeToFetcher(pipelineCtx, fetcherPool.Outputs())
+	go processorPool.SubscribeToFetcher(pipelineCtx, fetcherPool.Outputs())
 
 	p := &Pipeline{
 		fetcherPool:   fetcherPool,
@@ -145,14 +145,18 @@ func New(ctx context.Context, config Config) (*Pipeline, error) {
 
 	go func(){
 		for _, url := range urls {
-			p.fetcherPool.SubmitWait(&fetcher.Request{
-				URL: url,
-				Method: "GET",
-				Headers: map[string]string{
-					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-					"Content-Type": "application/json",
+			input := workerpool.Input[*fetcher.Request]{
+				Data: &fetcher.Request{
+					URL: url,
+					Method: "GET",
+					Headers: map[string]string{
+						"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+						"Content-Type": "application/json",
+					},
 				},
-			})
+				SubmittedAt: time.Now(),
+			}
+			p.fetcherPool.SubmitWait(input)
 		}
 	}()
 

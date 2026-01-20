@@ -27,26 +27,16 @@ var (
 // Type Definitions
 // =============================================================================
 type Processor struct {
-	*workerpool.Pool[*Input, *Output]
+	*workerpool.Pool[*fetcher.Response, *Output]
 	stats Stats
-}
-
-// Input represents data to be processed.
-type Input struct {
-	ID        string
-	SourceURL string
-	Data      []byte
-	FetchedAt time.Time
 }
 
 // Output represents processed data.
 type Output struct {
-	InputID     string
-	SourceURL   string
+	ID          string
+	WorkerID    int
 	Data        any
 	Duration    time.Duration
-	Err         error
-	FetchedAt   time.Time
 	ProcessedAt time.Time
 }
 
@@ -90,7 +80,7 @@ func New(ctx context.Context, numWorkers, qSize int) (*Processor, error) {
 	// Create processor first so we can pass its method to the pool
 	p := &Processor{}
 
-	pool, err := workerpool.NewPool[*Input, *Output](ctx, "processor", numWorkers, qSize, logger, p.workerTask)
+	pool, err := workerpool.NewPool[*fetcher.Response, *Output](ctx, "processor", numWorkers, qSize, logger, p.workerTask)
 	if err != nil {
 		return nil, err
 	}
@@ -108,28 +98,25 @@ func New(ctx context.Context, numWorkers, qSize int) (*Processor, error) {
 // SubscribeToFetcher connects to the fetcher's output channel and transforms
 // fetcher.Response -> processor.Input for processing.
 func (p *Processor) SubscribeToFetcher(ctx context.Context, upstream <-chan workerpool.Result[*fetcher.Response]) {
-	go func() {
-		for {
-			select {
-			case result, ok := <-upstream:
-				if !ok {
-					return // Channel closed
-				}
-				if result.Err != nil {
-					continue // Skip failed fetches
-				}
-				// Transform fetcher.Response to processor.Input
-				input := &Input{
-					SourceURL: result.Value.URL,
-					Data:      result.Value.Body,
-					FetchedAt: time.Now(),
-				}
-				_ = p.SubmitWait(input)
-			case <-ctx.Done():
-				return
+	for {
+		select {
+		case result, ok := <-upstream:
+			if !ok {
+				return // Channel closed
 			}
+			if result.Err != nil {
+				continue // Skip failed fetches
+			}
+			// Wrap the response in Input[T]
+			input := workerpool.Input[*fetcher.Response]{
+				Data:        result.Value,
+				SubmittedAt: time.Now(),
+			}
+			_ = p.SubmitWait(input)
+		case <-ctx.Done():
+			return
 		}
-	}()
+	}
 }
 
 // =============================================================================
@@ -199,20 +186,18 @@ func (p *Processor) ProcessorStats() *Stats {
 // =============================================================================
 
 // PassthroughProcessor passes data through unchanged.
-func PassthroughProcessor(ctx context.Context, input *Input) (any, error) {
+func PassthroughProcessor(ctx context.Context, input *fetcher.Response) (any, error) {
 	return input.Data, nil
 }
 
 // JSONProcessor is a placeholder for JSON parsing.
-func JSONProcessor(ctx context.Context, input *Input) (any, error) {
+func JSONProcessor(ctx context.Context, input *fetcher.Response) (any, error) {
 	return input.Data, nil
 }
 
-func (p *Processor) workerTask(ctx context.Context, input *Input) (*Output, error) {
+func (p *Processor) workerTask(ctx context.Context, input *fetcher.Response) (*Output, error) {
 	time.Sleep(10 * time.Millisecond) // Placeholder delay
 	return &Output{
-		InputID:     input.ID,
-		SourceURL:   input.SourceURL,
 		Data:        "processorSuccess",
 		ProcessedAt: time.Now(),
 	}, nil
