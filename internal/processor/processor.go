@@ -4,13 +4,18 @@ package processor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/url"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/samucap/poly-asian-data/internal/fetcher"
 	"github.com/samucap/poly-asian-data/internal/logging"
+	"github.com/samucap/poly-asian-data/internal/services"
 	"github.com/samucap/poly-asian-data/internal/workerpool"
 )
 
@@ -21,14 +26,18 @@ import (
 var (
 	ErrPoolStopped   = errors.New("processor pool has been stopped")
 	ErrInvalidConfig = errors.New("invalid processor configuration")
+	ErrUnknownType   = errors.New("unknown response type")
 )
 
 // =============================================================================
 // Type Definitions
 // =============================================================================
+
 type Processor struct {
 	*workerpool.Pool[*fetcher.Response, *Output]
-	stats Stats
+	stats       Stats
+	logger      *slog.Logger
+	fetcherPool *fetcher.Fetcher // Reference to fetcher for pagination
 }
 
 // Output represents processed data.
@@ -36,10 +45,10 @@ type Output struct {
 	ID          string
 	WorkerID    int
 	Data        any
+	ItemCount   int
 	Duration    time.Duration
 	ProcessedAt time.Time
 }
-
 
 // Stats contains atomic counters for processor statistics.
 type Stats struct {
@@ -71,14 +80,16 @@ type StatsSnapshot struct {
 }
 
 // New creates and initializes a processor pool.
-// Validates config and sets up resources (logger, input/output channels).
-func New(ctx context.Context, numWorkers, qSize int) (*Processor, error) {
+func New(ctx context.Context, numWorkers, qSize int, fetcherPool *fetcher.Fetcher) (*Processor, error) {
 	logger := logging.Logger.With(
 		slog.String("component", "processor"),
 	)
 
 	// Create processor first so we can pass its method to the pool
-	p := &Processor{}
+	p := &Processor{
+		logger:      logger,
+		fetcherPool: fetcherPool,
+	}
 
 	pool, err := workerpool.NewPool[*fetcher.Response, *Output](ctx, "processor", numWorkers, qSize, logger, p.workerTask)
 	if err != nil {
@@ -120,85 +131,178 @@ func (p *Processor) SubscribeToFetcher(ctx context.Context, upstream <-chan work
 }
 
 // =============================================================================
-// ProcessorJob Interface - Work Function
+// Worker Task - Type Dispatch and Processing
 // =============================================================================
 
-// Process is the work function that transforms input data.
-// This is the domain-specific operation for the processor stage.
-// func (p *Pool) Process(ctx context.Context, input *Input) (*Output, error) {
-// 	start := time.Now()
+func (p *Processor) workerTask(ctx context.Context, resp *fetcher.Response) (*Output, error) {
+	start := time.Now()
 
-// 	p.logger.Info("processing data",
-// 		slog.String("input_id", input.ID),
-// 		slog.String("url", input.SourceURL),
-// 	)
+	if resp == nil || resp.Request == nil {
+		return nil, errors.New("nil response or request")
+	}
 
-// 	processCtx, cancel := context.WithTimeout(ctx, p.config.ProcessTimeout)
-// 	defer cancel()
+	p.logger.Info("processing response",
+		slog.String("url", resp.URL),
+		slog.Int("bytes", len(resp.Data)),
+	)
 
-// 	result, err := p.config.ProcessFunc(processCtx, input)
+	// Type dispatch based on URL path
+	var data any
+	var itemCount int
+	var err error
 
-// 	duration := time.Since(start)
-// 	p.stats.TotalDuration.Add(int64(duration))
-// 	p.stats.BytesProcessed.Add(int64(len(input.Data)))
+	switch {
+	case strings.Contains(resp.URL, "/sports"):
+		data, itemCount, err = p.processSports(resp.Data)
+	case strings.Contains(resp.URL, "/teams"):
+		data, itemCount, err = p.processTeams(resp.Data)
+	default:
+		// Fallback: just count items if it's a JSON array
+		data, itemCount, err = p.processGenericArray(resp.Data)
+	}
 
-// 	if err != nil {
-// 		p.stats.ItemsFailed.Add(1)
-// 		p.logger.Error("processing failed",
-// 			slog.String("input_id", input.ID),
-// 			slog.String("error", err.Error()),
-// 		)
-// 		return &Output{
-// 			InputID:     input.ID,
-// 			SourceURL:   input.SourceURL,
-// 			Metadata:    input.Metadata,
-// 			Duration:    duration,
-// 			Err:         err,
-// 			FetchedAt:   input.FetchedAt,
-// 			ProcessedAt: time.Now(),
-// 		}, err
-// 	}
+	if err != nil {
+		p.stats.ItemsFailed.Add(1)
+		p.logger.Error("processing failed",
+			slog.String("url", resp.URL),
+			slog.String("error", err.Error()),
+		)
+		return nil, err
+	}
 
-// 	p.stats.ItemsProcessed.Add(1)
-// 	p.logger.Info("processed data",
-// 		slog.String("input_id", input.ID),
-// 		slog.Duration("duration", duration),
-// 	)
+	p.stats.ItemsProcessed.Add(int64(itemCount))
+	p.stats.BytesProcessed.Add(int64(len(resp.Data)))
+	p.stats.TotalDuration.Add(int64(time.Since(start)))
 
-// 	return &Output{
-// 		InputID:     input.ID,
-// 		SourceURL:   input.SourceURL,
-// 		Data:        result,
-// 		Metadata:    input.Metadata,
-// 		Duration:    duration,
-// 		FetchedAt:   input.FetchedAt,
-// 		ProcessedAt: time.Now(),
-// 	}, nil
-// }
+	p.logger.Info("processed response",
+		slog.String("url", resp.URL),
+		slog.Int("itemCount", itemCount),
+		slog.Duration("duration", time.Since(start)),
+	)
+
+	// Handle pagination: if we got a full page, request next page
+	if err := p.handlePagination(ctx, resp, itemCount); err != nil {
+		p.logger.Warn("failed to request next page",
+			slog.String("url", resp.URL),
+			slog.String("error", err.Error()),
+		)
+	}
+
+	return &Output{
+		Data:        data,
+		ItemCount:   itemCount,
+		Duration:    time.Since(start),
+		ProcessedAt: time.Now(),
+	}, nil
+}
+
+// =============================================================================
+// Type-Specific Processors
+// =============================================================================
+
+func (p *Processor) processSports(data []byte) (any, int, error) {
+	var sports []services.PlyMktSport
+	if err := json.Unmarshal(data, &sports); err != nil {
+		return nil, 0, err
+	}
+	return sports, len(sports), nil
+}
+
+func (p *Processor) processTeams(data []byte) (any, int, error) {
+	var teams []services.PlyMktTeam
+	if err := json.Unmarshal(data, &teams); err != nil {
+		return nil, 0, err
+	}
+	return teams, len(teams), nil
+}
+
+func (p *Processor) processGenericArray(data []byte) (any, int, error) {
+	var items []json.RawMessage
+	if err := json.Unmarshal(data, &items); err != nil {
+		// Not an array, treat as single item
+		return data, 1, nil
+	}
+	return items, len(items), nil
+}
+
+// =============================================================================
+// Pagination Handler
+// =============================================================================
+
+func (p *Processor) handlePagination(ctx context.Context, resp *fetcher.Response, itemCount int) error {
+	if resp.Request == nil || resp.Request.Params == nil {
+		return nil
+	}
+
+	// Check if pagination params exist
+	limitStr := resp.Request.Params.Get("limit")
+	offsetStr := resp.Request.Params.Get("offset")
+	if limitStr == "" || offsetStr == "" {
+		return nil // Not a paginated request
+	}
+
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil {
+		return err
+	}
+
+	// If we got fewer items than the limit, we've reached the last page
+	if itemCount < limit {
+		p.logger.Info("reached last page",
+			slog.String("url", resp.URL),
+			slog.Int("itemCount", itemCount),
+			slog.Int("limit", limit),
+		)
+		return nil
+	}
+
+	// Full page - request next page
+	offset, err := strconv.Atoi(offsetStr)
+	if err != nil {
+		return err
+	}
+
+	newOffset := strconv.Itoa(offset + limit)
+
+	// Deep copy Params to avoid mutation issues
+	newParams := make(url.Values)
+	for k, v := range resp.Request.Params {
+		newParams[k] = append([]string{}, v...)
+	}
+	newParams.Set("offset", newOffset)
+
+	// Rebuild URL with new offset
+	parsedURL, err := url.Parse(resp.URL)
+	if err != nil {
+		return err
+	}
+	parsedURL.RawQuery = newParams.Encode()
+
+	nextReq := &fetcher.Request{
+		URL:     parsedURL.String(),
+		Method:  resp.Request.Method,
+		Headers: resp.Request.Headers,
+		Params:  newParams,
+	}
+
+	p.logger.Info("requesting next page",
+		slog.String("url", nextReq.URL),
+		slog.Int("newOffset", offset+limit),
+	)
+
+	// Use non-blocking Submit to avoid deadlock
+	if err := p.fetcherPool.Submit(p.fetcherPool.MakeInputObj(nextReq)); err != nil {
+		if errors.Is(err, workerpool.ErrQueueFull) {
+			// Queue is full, try with wait
+			return p.fetcherPool.SubmitWait(p.fetcherPool.MakeInputObj(nextReq))
+		}
+		return err
+	}
+
+	return nil
+}
 
 // Stats returns statistics.
 func (p *Processor) ProcessorStats() *Stats {
 	return &p.stats
-}
-
-// =============================================================================
-// Placeholder Processors
-// =============================================================================
-
-// PassthroughProcessor passes data through unchanged.
-func PassthroughProcessor(ctx context.Context, input *fetcher.Response) (any, error) {
-	return input.Data, nil
-}
-
-// JSONProcessor is a placeholder for JSON parsing.
-func JSONProcessor(ctx context.Context, input *fetcher.Response) (any, error) {
-	return input.Data, nil
-}
-
-func (p *Processor) workerTask(ctx context.Context, input *fetcher.Response) (*Output, error) {
-	time.Sleep(10 * time.Millisecond) // Placeholder delay
-	return &Output{
-		Data:        "processorSuccess",
-		ProcessedAt: time.Now(),
-	}, nil
 }

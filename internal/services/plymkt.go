@@ -453,27 +453,26 @@ func (ply *PlyMktService) SyncSubgraph(ctx context.Context) (*RespDetails, error
 	// redemptions
 	return nil, nil
 }
-// type plyMktSportTeam struct {
-// 		ID int
-// 		name string
-// 	league string
-// record string
-// logo string
-// abbreviation string
-// alias string
-// providerID int
-// color string
-// }
+type PlyMktTeam struct {
+	ID           int    `json:"id"`
+	Name         string `json:"name"`
+	League       string `json:"league"`
+	Record       string `json:"record"`
+	Logo         string `json:"logo"`
+	Abbreviation string `json:"abbreviation"`
+	Alias        string `json:"alias"`
+	ProviderID   int    `json:"providerID"`
+	Color        string `json:"color"`
+}
 
-// type plyMktSport struct {
-// 		sport string
-// 		teams []plyMktSportTeam
-// 		image string
-// 		resolution string
-// 		ordering string
-// 		tags string
-// 		series string
-// }
+type PlyMktSport struct {
+	Sport      string `json:"sport"`
+	Image      string `json:"image"`
+	Resolution string `json:"resolution"`
+	Ordering   string `json:"ordering"`
+	Tags       string `json:"tags"`
+	Series     string `json:"series"`
+}
 
 type sportsTarget struct {
 	path   string
@@ -493,7 +492,7 @@ func (ply *PlyMktService) GetSportsReqs(ctx context.Context) ([]*fetcher.Request
 		return nil, err
 	}
 
-	defaultLimit := "500"
+	defaultLimit := "10"
 	defaultOffset := "0"
 	targets := map[string]sportsTarget{
 		"sports": {
@@ -522,6 +521,7 @@ func (ply *PlyMktService) GetSportsReqs(ctx context.Context) ([]*fetcher.Request
 			URL:     fullURL.String(),
 			Headers: map[string]string{"Content-Type": "application/json"},
 			Method:  "GET",
+			Params:  fullURL.Query(),
 		}
 		reqs = append(reqs, r)
 	}

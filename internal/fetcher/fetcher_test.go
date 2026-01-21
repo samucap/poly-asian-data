@@ -2,12 +2,16 @@ package fetcher
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/samucap/poly-asian-data/internal/config"
 	"github.com/samucap/poly-asian-data/internal/logging"
 	"github.com/samucap/poly-asian-data/internal/workerpool"
 	"github.com/stretchr/testify/assert"
@@ -32,7 +36,8 @@ type testFetcherResult struct {
 
 // newTestFetcher creates a fetcher for testing.
 func newTestFetcher(ctx context.Context, numWorkers, qSize int) (*testFetcherResult, error) {
-	f, err := New(ctx, numWorkers, qSize)
+	cfg := &config.Config{}
+	f, err := New(ctx, cfg, numWorkers, qSize)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +71,7 @@ func TestFetcher_Submit(t *testing.T) {
 		result, _ := newTestFetcher(ctx, 2, 10)
 		result.cleanup() // Stop the pool
 
-		err := result.fetcher.Submit(&Request{URL: "http://example.com"})
+		err := result.fetcher.Submit(workerpool.Input[*Request]{Data: &Request{URL: "http://example.com"}})
 		assert.Error(t, err)
 	})
 }
@@ -76,7 +81,7 @@ func TestFetcher_Submit(t *testing.T) {
 // =============================================================================
 
 func TestFetcher_WorkerTask(t *testing.T) {
-	t.Run("successful fetch via WorkerTask", func(t *testing.T) {
+	t.Run("successful fetch returns data", func(t *testing.T) {
 		// Create mock server
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
@@ -85,33 +90,91 @@ func TestFetcher_WorkerTask(t *testing.T) {
 		defer server.Close()
 
 		ctx := context.Background()
-		f, err := New(ctx, 2, 10)
+		cfg := &config.Config{}
+		f, err := New(ctx, cfg, 2, 10)
 		require.NoError(t, err)
 		defer f.Stop()
 
-		// Call WorkerTask directly
+		// Call workerTask directly
 		req := &Request{
 			URL: server.URL,
 		}
 		resp, err := f.workerTask(ctx, req)
 		require.NoError(t, err)
 		assert.Equal(t, server.URL, resp.URL)
-		// WorkerTask currently returns mock data, so check that
-		assert.Equal(t, []byte("fetcherSuccess"), resp.Body)
+		assert.Equal(t, []byte(`{"status":"ok"}`), resp.Data)
+		assert.NotNil(t, resp.Request) // Request should be attached to response
 	})
 
-	t.Run("basic request works", func(t *testing.T) {
+	t.Run("response includes original request", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[]`))
+		}))
+		defer server.Close()
+
 		ctx := context.Background()
-		f, err := New(ctx, 1, 10)
+		cfg := &config.Config{}
+		f, err := New(ctx, cfg, 1, 10)
 		require.NoError(t, err)
 		defer f.Stop()
 
+		params := url.Values{}
+		params.Set("limit", "10")
+		params.Set("offset", "0")
+
 		req := &Request{
-			URL: "http://example.com",
+			URL:    server.URL + "?" + params.Encode(),
+			Params: params,
 		}
 		resp, err := f.workerTask(ctx, req)
 		require.NoError(t, err)
-		assert.Equal(t, "http://example.com", resp.URL)
+		assert.NotNil(t, resp.Request)
+		assert.Equal(t, "10", resp.Request.Params.Get("limit"))
+		assert.Equal(t, "0", resp.Request.Params.Get("offset"))
+	})
+}
+
+// =============================================================================
+// Pagination Tests (Now in Processor)
+// =============================================================================
+
+func TestFetcher_FetchDoesNotPaginate(t *testing.T) {
+	t.Run("fetcher no longer handles pagination", func(t *testing.T) {
+		// Mock server that returns a full page (10 items)
+		var requestCount atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requestCount.Add(1)
+			items := make([]map[string]string, 10)
+			for i := range items {
+				items[i] = map[string]string{"id": string(rune('a' + i))}
+			}
+			data, _ := json.Marshal(items)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data)
+		}))
+		defer server.Close()
+
+		ctx := context.Background()
+		cfg := &config.Config{}
+		f, err := New(ctx, cfg, 1, 10)
+		require.NoError(t, err)
+		defer f.Stop()
+
+		params := url.Values{}
+		params.Set("limit", "10")
+		params.Set("offset", "0")
+
+		req := &Request{
+			URL:    server.URL + "?" + params.Encode(),
+			Params: params,
+		}
+		resp, err := f.Fetch(ctx, req)
+		require.NoError(t, err)
+		assert.NotNil(t, resp.Data)
+
+		// Fetcher should only make 1 request (pagination is now in processor)
+		assert.Equal(t, int32(1), requestCount.Load())
 	})
 }
 
@@ -174,7 +237,8 @@ func TestFetcher_IsRunning(t *testing.T) {
 func TestFetcher_Logger(t *testing.T) {
 	t.Run("fetcher has logger", func(t *testing.T) {
 		ctx := context.Background()
-		f, err := New(ctx, 1, 10)
+		cfg := &config.Config{}
+		f, err := New(ctx, cfg, 1, 10)
 		require.NoError(t, err)
 		defer f.Stop()
 

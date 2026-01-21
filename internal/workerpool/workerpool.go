@@ -23,7 +23,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"fmt"
 	"github.com/google/uuid"
 )
 
@@ -219,8 +218,6 @@ func (p *Pool[T, R]) worker(id int) {
 
 func (p *Pool[T, R]) sendResult(result Result[R]) {
 	p.logger.Info("sending result",
-		slog.String("result", fmt.Sprintf("%v", result.Value)),
-		slog.String("type", p.PoolType),
 		slog.Int64("in_progress", p.stats.InProgress.Load()),
 		slog.Int64("submitted", p.stats.Submitted.Load()),
 		slog.Int64("completed", p.stats.Completed.Load()),

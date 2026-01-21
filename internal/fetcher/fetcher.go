@@ -6,17 +6,17 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"time"
-	"fmt"
 
+	"github.com/samucap/poly-asian-data/internal/config"
 	"github.com/samucap/poly-asian-data/internal/logging"
 	"github.com/samucap/poly-asian-data/internal/workerpool"
-	"github.com/samucap/poly-asian-data/internal/config"
 )
 
 // =============================================================================
@@ -45,7 +45,7 @@ type Request struct {
 	Method   string
 	Headers  map[string]string
 	Body     io.Reader
-	Params url.Values
+	Params   url.Values
 }
 
 // Response represents the result of a fetch.
@@ -54,6 +54,7 @@ type Response struct {
 	Data     []byte
 	Duration time.Duration
 	Err      error
+	Request  *Request // Original request (for processor to handle pagination)
 }
 
 // =============================================================================
@@ -142,12 +143,9 @@ func newSecureHTTPClient() *http.Client {
 	}
 }
 
-// =============================================================================
-// FetcherJob Interface - Work Function
-// =============================================================================
-
 // Fetch is the work function that fetches data from a URL.
 // This is the domain-specific operation for the fetcher stage.
+// Note: Pagination logic has been moved to the processor.
 func (f *Fetcher) Fetch(ctx context.Context, inputReqDetails *Request) (*Response, error) {
 	const (
 		maxRetries = 3
@@ -160,10 +158,6 @@ func (f *Fetcher) Fetch(ctx context.Context, inputReqDetails *Request) (*Respons
 		method = http.MethodGet
 	}
 
-	f.logger.Info("fetching url",
-		slog.String("url", inputReqDetails.URL),
-	)
-
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
@@ -174,12 +168,13 @@ func (f *Fetcher) Fetch(ctx context.Context, inputReqDetails *Request) (*Respons
 					URL:      inputReqDetails.URL,
 					Duration: time.Since(start),
 					Err:      ctx.Err(),
+					Request:  inputReqDetails,
 				}, ctx.Err()
 			case <-time.After(delay):
 			}
 		}
 
-		httpReq, err := http.NewRequestWithContext(ctx, inputReqDetails.Method, inputReqDetails.URL, inputReqDetails.Body)
+		httpReq, err := http.NewRequestWithContext(ctx, method, inputReqDetails.URL, inputReqDetails.Body)
 		if err != nil {
 			return nil, fmt.Errorf("creating http request: %w", err)
 		}
@@ -190,12 +185,15 @@ func (f *Fetcher) Fetch(ctx context.Context, inputReqDetails *Request) (*Respons
 
 		resp, err := f.doRequest(ctx, httpReq)
 		if err == nil {
+			resp.URL = inputReqDetails.URL
 			resp.Duration = time.Since(start)
+			resp.Request = inputReqDetails
 
 			f.logger.Info("fetch completed",
 				slog.String("url", inputReqDetails.URL),
 				slog.Int("bytes", len(resp.Data)),
 			)
+
 			return resp, nil
 		}
 		lastErr = err
@@ -212,5 +210,6 @@ func (f *Fetcher) Fetch(ctx context.Context, inputReqDetails *Request) (*Respons
 		URL:      inputReqDetails.URL,
 		Duration: duration,
 		Err:      fmt.Errorf("%w: %v", ErrRequestFailed, lastErr),
+		Request:  inputReqDetails,
 	}, lastErr
 }

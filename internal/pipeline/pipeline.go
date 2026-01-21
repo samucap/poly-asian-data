@@ -78,7 +78,7 @@ func New(ctx context.Context, cfg *config.Config) (*Pipeline, error) {
 		return nil, err
 	}
 
-	processorPool, err := processor.New(pipelineCtx, cfg.ProcessorCfg.NumWorkers, cfg.ProcessorCfg.Qsize)
+	processorPool, err := processor.New(pipelineCtx, cfg.ProcessorCfg.NumWorkers, cfg.ProcessorCfg.Qsize, fetcherPool)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -120,11 +120,12 @@ func (p *Pipeline) SyncPlyMkt() {
 
 	reqs, err := plyMktSvc.GetSportsReqs(p.ctx)
 	if err != nil {
-		p.logger.Error("failed to get sports reqs", err)
+		p.logger.Error("failed to get sports reqs", slog.Any("error", err))
 		return
 	}
 
 	for _, req := range reqs {
+		// TODO: review this. Is this the best way to do this?
 		input := p.fetcherPool.MakeInputObj(req)
 		if err := p.fetcherPool.SubmitWait(input); err != nil {
 			p.logger.Error("failed to submit req", slog.Any("error", err))

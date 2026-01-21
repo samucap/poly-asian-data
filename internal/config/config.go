@@ -35,7 +35,7 @@ type SvcProvider struct {
 	PlyMkt *PlyMktSvc
 }
 
-type workerConfig struct {
+type PoolCfg struct {
 	NumWorkers int
 	Qsize      int
 }
@@ -57,8 +57,8 @@ type Config struct {
 
 	// Pipeline
 	//SaverCfg   saver.Config
-	FetcherCfg workerConfig
-	ProcessorCfg workerConfig
+	FetcherCfg   PoolCfg
+	ProcessorCfg PoolCfg
 }
 
 // validate is the singleton validator instance.
