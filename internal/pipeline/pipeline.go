@@ -9,10 +9,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/samucap/poly-asian-data/internal/config"
 	"github.com/samucap/poly-asian-data/internal/fetcher"
+	"github.com/samucap/poly-asian-data/internal/logging"
 	"github.com/samucap/poly-asian-data/internal/processor"
 	"github.com/samucap/poly-asian-data/internal/saver"
 	"github.com/samucap/poly-asian-data/internal/workerpool"
+	"github.com/samucap/poly-asian-data/internal/services"
 )
 
 // =============================================================================
@@ -25,35 +28,6 @@ var (
 )
 
 // =============================================================================
-// Configuration
-// =============================================================================
-
-// Config holds the configuration for the pipeline.
-type Config struct {
-	NumWorkers int
-	QueueSize  int
-	SaverCfg   saver.Config
-	Logger     *slog.Logger
-}
-
-// Validate checks the configuration.
-func (c *Config) Validate() error {
-	if c.NumWorkers < 1 {
-		return errors.New("NumWorkers must be >= 1")
-	}
-	if c.QueueSize < 1 {
-		return errors.New("QueueSize must be >= 1")
-	}
-	if err := c.SaverCfg.Validate(); err != nil {
-		return err
-	}
-	if c.Logger == nil {
-		c.Logger = slog.Default()
-	}
-	return nil
-}
-
-// =============================================================================
 // Stats Types
 // =============================================================================
 
@@ -64,13 +38,6 @@ type Stats struct {
 	Fetcher        workerpool.StatsSnapshot
 	Processor      workerpool.StatsSnapshot
 	Saver          saver.StatsSnapshot
-}
-
-// WorkerCounts contains worker counts for each stage.
-type WorkerCounts struct {
-	Fetcher   int
-	Processor int
-	Saver     int
 }
 
 // =============================================================================
@@ -86,7 +53,7 @@ type Pipeline struct {
 	saverPool     *saver.Pool
 	logger        *slog.Logger
 	startedAt     time.Time
-	numWorkers    int
+	cfg           *config.Config
 
 	// Lifecycle
 	ctx     context.Context
@@ -95,72 +62,75 @@ type Pipeline struct {
 }
 
 // New creates a new pipeline with the given configuration.
-func New(ctx context.Context, config Config) (*Pipeline, error) {
-	if err := config.Validate(); err != nil {
+func New(ctx context.Context, cfg *config.Config) (*Pipeline, error) {
+	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
 	pipelineCtx, cancel := context.WithCancel(ctx)
-	logger := config.Logger.With(slog.String("component", "pipeline"))
+	logger := logging.Logger.With(slog.String("component", "pipeline"))
 	logger.Info("Initializing Pipeline...")
 
 	// Create all stages
-	fetcherPool, err := fetcher.New(pipelineCtx, config.NumWorkers, config.QueueSize)
+	fetcherPool, err := fetcher.New(pipelineCtx, cfg, cfg.FetcherCfg.NumWorkers, cfg.FetcherCfg.Qsize)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 
-	processorPool, err := processor.New(pipelineCtx, config.NumWorkers, config.QueueSize)
+	processorPool, err := processor.New(pipelineCtx, cfg.ProcessorCfg.NumWorkers, cfg.ProcessorCfg.Qsize)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 
-	saverPool, err := saver.New(pipelineCtx, config.SaverCfg)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
+	// TODO: Re-enable saver when implemented
+	//saverPool, err := saver.New(pipelineCtx, cfg.SaverCfg)
+	//if err != nil {
+	//	cancel()
+	//	return nil, err
+	//}
 
 	// Connect processor to fetcher output (type-safe transformation)
 	go processorPool.SubscribeToFetcher(pipelineCtx, fetcherPool.Outputs())
 
-	p := &Pipeline{
+	return &Pipeline{
 		fetcherPool:   fetcherPool,
 		processorPool: processorPool,
-		saverPool:     saverPool,
+		// saverPool:     saverPool,
 		logger:        logger,
 		startedAt:     time.Now(),
-		numWorkers:    config.NumWorkers,
+		cfg:           cfg,
 		ctx:           pipelineCtx,
 		cancel:        cancel,
+	}, nil
+}
+
+// SyncPlyMkt starts the pipeline and waits for it to complete.
+func (p *Pipeline) SyncPlyMkt() {
+	p.logger.Info("Starting PolyMarket Sync...")
+	
+	// TODO: Instantiate PlyMktService properly
+	// For now, just log that we're starting
+	plyMktSvc := &services.PlyMktService{
+		Cfg: p.cfg,
+		Logger: p.logger,
+		Ctx: p.ctx,
 	}
 
-	urls := []string{
-		"google.com",
-		"espn.com",
-		"x.com",
+	reqs, err := plyMktSvc.GetSportsReqs(p.ctx)
+	if err != nil {
+		p.logger.Error("failed to get sports reqs", err)
+		return
 	}
 
-	go func(){
-		for _, url := range urls {
-			input := workerpool.Input[*fetcher.Request]{
-				Data: &fetcher.Request{
-					URL: url,
-					Method: "GET",
-					Headers: map[string]string{
-						"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-						"Content-Type": "application/json",
-					},
-				},
-				SubmittedAt: time.Now(),
-			}
-			p.fetcherPool.SubmitWait(input)
+	for _, req := range reqs {
+		input := p.fetcherPool.MakeInputObj(req)
+		if err := p.fetcherPool.SubmitWait(input); err != nil {
+			p.logger.Error("failed to submit req", slog.Any("error", err))
+			return
 		}
-	}()
-
-	return p, nil
+	}
 }
 
 // Stats returns current pipeline statistics.
@@ -170,16 +140,7 @@ func (p *Pipeline) Stats() Stats {
 		UptimeDuration: time.Since(p.startedAt),
 		Fetcher:        p.fetcherPool.Stats().Snapshot(),
 		Processor:      p.processorPool.Stats().Snapshot(),
-		Saver:          p.saverPool.Stats().Snapshot(),
-	}
-}
-
-// WorkerCounts returns worker counts.
-func (p *Pipeline) WorkerCounts() WorkerCounts {
-	return WorkerCounts{
-		Fetcher:   p.numWorkers,
-		Processor: p.numWorkers,
-		Saver:     p.saverPool.NumWorkers(),
+		// Saver:          p.saverPool.Stats().Snapshot(),
 	}
 }
 
@@ -199,14 +160,14 @@ func (p *Pipeline) Stop() {
 	// Stop in order: fetcher -> processor -> saver
 	p.fetcherPool.Stop()
 	p.processorPool.Stop()
-	_ = p.saverPool.Stop()
+	// _ = p.saverPool.Stop()
 	p.cancel()
 
 	stats := p.Stats()
 	p.logger.Info("pipeline stopped",
 		slog.Int64("fetched", stats.Fetcher.Completed),
 		slog.Int64("processed", stats.Processor.Completed),
-		slog.Int64("saved", stats.Saver.RecordsSaved),
+		// slog.Int64("saved", stats.Saver.RecordsSaved),
 		slog.Duration("uptime", stats.UptimeDuration),
 	)
 }
@@ -220,5 +181,5 @@ func (p *Pipeline) StopNow() {
 	p.cancel()
 	p.fetcherPool.StopNow()
 	p.processorPool.StopNow()
-	p.saverPool.StopNow()
+	// p.saverPool.StopNow()
 }

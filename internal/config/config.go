@@ -2,14 +2,44 @@ package config
 
 import (
 	"strings"
+	"time"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/joho/godotenv"
 	"github.com/spf13/viper"
 )
 
+// DefaultEndpoints contains the default Polymarket API endpoints.
+var DefaultEndpoints = map[string]any{
+	"gamma": "https://gamma-api.polymarket.com",      // Market discovery, metadata, events
+	"clob":  "https://clob.polymarket.com",           // Order management, prices, orderbooks
+	"data":  "https://data-api.polymarket.com",       // User positions, activity, history
+	"webSockets": map[string]string{
+		"sports": "wss://sports-api.polymarket.com/ws",
+		"clob":   "wss://ws-subscriptions-clob.polymarket.com/ws", // Orderbook updates, order status
+		"rtds":   "wss://ws-live-data.polymarket.com",             // Low-latency crypto prices, comments
+	},
+}
+
 // Config holds the application configuration with strict typing.
 // Load order: System ENV > .env file > Defaults.
+
+type PlyMktSvc struct {
+	Endpoints      map[string]any `mapstructure:"ENDPOINTS" validate:"required"`
+	SubgraphAPIKey string `mapstructure:"SUBGRAPH_API_KEY" validate:"required"`
+	MaxRetries int
+	RetryDelay time.Duration
+}
+
+type SvcProvider struct {
+	PlyMkt *PlyMktSvc
+}
+
+type workerConfig struct {
+	NumWorkers int
+	Qsize      int
+}
+
 type Config struct {
 	// Environment: "development", "staging", "production"
 	ENV string `mapstructure:"ENV" validate:"required,oneof=dev stg prod"`
@@ -17,13 +47,18 @@ type Config struct {
 	// API Keys
 	//PolymarketAPIKey string `mapstructure:"POLYMARKET_API_KEY" validate:"required"`
 	// OddsAPIKey       string `mapstructure:"ODDS_API_KEY" validate:"required"`
-	SubgraphAPIKey string `mapstructure:"SUBGRAPH_API_KEY" validate:"required"`
 
 	// Database
 	PostgresURL string `mapstructure:"POSTGRES_URL" validate:"required,url"`
 
 	// Logging
 	LogLevel string `mapstructure:"LOG_LEVEL" validate:"omitempty,oneof=debug info warn error"`
+	Services map[string]SvcProvider
+
+	// Pipeline
+	//SaverCfg   saver.Config
+	FetcherCfg workerConfig
+	ProcessorCfg workerConfig
 }
 
 // validate is the singleton validator instance.
@@ -42,6 +77,13 @@ func Load() (*Config, error) {
 	// Set defaults
 	v.SetDefault("ENV", "dev")
 	v.SetDefault("LOG_LEVEL", "debug")
+	v.SetDefault("Services.PlyMkt.Endpoints", DefaultEndpoints)
+	v.SetDefault("Services.PlyMkt.MaxRetries", 3)
+	v.SetDefault("Services.PlyMkt.RetryDelay", 1*time.Second)
+	v.SetDefault("FetcherCfg.NumWorkers", 2)
+	v.SetDefault("FetcherCfg.Qsize", 10)
+	v.SetDefault("ProcessorCfg.NumWorkers", 2)
+	v.SetDefault("ProcessorCfg.Qsize", 10)
 
 	// Step 3: Bind to environment variables (this gives system ENV priority)
 	//v.AutomaticEnv()

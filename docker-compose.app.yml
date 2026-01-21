@@ -1,0 +1,16 @@
+services:
+  app:
+    container_name: poly-asian-data-app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    networks:
+      - poly-asian-network
+    restart: "on-failure:3"
+
+networks:
+  poly-asian-network:
+    name: poly-asian-network
+    external: true

@@ -300,6 +300,12 @@ func (p *Pool[T, R]) SubmitWait(input Input[T]) error {
 	}
 }
 
+func (p *Pool[T, R]) MakeInputObj(data T) Input[T] {
+	return Input[T]{
+		Data: data,
+	}
+}
+
 // Inputs returns the input channel for direct writing.
 // Use with caution - prefer Submit/SubmitWait for proper stats tracking.
 func (p *Pool[T, R]) Inputs() chan<- Input[T] {

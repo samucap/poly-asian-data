@@ -2,9 +2,11 @@
 
 BINARY_NAME=poly-asian-data
 DOCKER_COMPOSE_FILE=docker-compose.yml
+DOCKER_COMPOSE_POSTGRES=docker-compose.postgres.yml
+DOCKER_COMPOSE_APP=docker-compose.app.yml
 MAIN_PATH=cmd/main.go
 
-.PHONY: all build clean test coverage lint run dev audit sec docker-up docker-down
+.PHONY: all build clean test coverage lint run dev audit sec docker-up docker-down db-up db-down app-up app-down
 
 all: build
 
@@ -59,21 +61,89 @@ lint:
 		echo "golangci-lint not installed. Install: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest"; \
 	fi
 
-# Run locally
+# Run locally (requires postgres to be running)
 run:
 	@echo "Running locally..."
 	go run $(MAIN_PATH)
 
-# Development mode with hot-reload (requires Air)
+# =============================================================================
+# Database Commands
+# =============================================================================
+
+# Start postgres in background (detached)
+db-up:
+	@echo "Starting Postgres..."
+	docker-compose -f $(DOCKER_COMPOSE_POSTGRES) up -d
+	@echo "Postgres is running. Connect via: localhost:5432"
+
+# Stop postgres
+db-down:
+	@echo "Stopping Postgres..."
+	docker-compose -f $(DOCKER_COMPOSE_POSTGRES) down
+
+# View postgres logs
+db-logs:
+	docker-compose -f $(DOCKER_COMPOSE_POSTGRES) logs -f
+
+# =============================================================================
+# App Commands
+# =============================================================================
+
+# Start app container (requires postgres to be running)
+app-up:
+	@echo "Building and starting app..."
+	docker-compose -f $(DOCKER_COMPOSE_APP) up --build
+
+# Start app in background
+app-up-d:
+	@echo "Building and starting app (detached)..."
+	docker-compose -f $(DOCKER_COMPOSE_APP) up --build -d
+
+# Stop app container
+app-down:
+	@echo "Stopping app..."
+	docker-compose -f $(DOCKER_COMPOSE_APP) down
+
+# View app logs
+app-logs:
+	docker-compose -f $(DOCKER_COMPOSE_APP) logs -f
+
+# =============================================================================
+# Development Mode
+# =============================================================================
+
+# Development mode with hot-reload (requires Air) or falls back to app container
 dev:
 	@echo "Starting development mode..."
 	@if command -v air >/dev/null 2>&1; then \
 		air; \
 	else \
 		echo "Air not installed. Install: go install github.com/air-verse/air@latest"; \
-		echo "Falling back to docker-compose..."; \
-		docker-compose -f $(DOCKER_COMPOSE_FILE) up --build; \
+		echo "Falling back to docker app container..."; \
+		docker-compose -f $(DOCKER_COMPOSE_APP) up --build; \
 	fi
+
+# =============================================================================
+# Full Stack Commands
+# =============================================================================
+
+# Start everything (postgres + app)
+docker-up:
+	@echo "Starting full Docker environment..."
+	docker-compose -f $(DOCKER_COMPOSE_POSTGRES) up -d
+	@echo "Waiting for Postgres to be healthy..."
+	@sleep 3
+	docker-compose -f $(DOCKER_COMPOSE_APP) up --build
+
+# Stop everything
+docker-down:
+	@echo "Stopping all containers..."
+	docker-compose -f $(DOCKER_COMPOSE_APP) down
+	docker-compose -f $(DOCKER_COMPOSE_POSTGRES) down
+
+# =============================================================================
+# Security Commands
+# =============================================================================
 
 # Security audit - Go vulnerability database
 audit:
@@ -93,10 +163,9 @@ sec:
 		echo "gosec not installed. Install: go install github.com/securego/gosec/v2/cmd/gosec@latest"; \
 	fi
 
-# Docker commands
-docker-up:
-	@echo "Starting Docker environment..."
-	docker-compose -f $(DOCKER_COMPOSE_FILE) up --build
+# =============================================================================
+# Tools Installation
+# =============================================================================
 
 # Install development tools
 tools:

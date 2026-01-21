@@ -2,17 +2,20 @@ package services
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
+	"net/url"
 	"sync/atomic"
 	"time"
+
+	"github.com/samucap/poly-asian-data/internal/config"
+	"github.com/samucap/poly-asian-data/internal/fetcher"
 )
 
+// orderFilledEvents.maker and taker are addresses of users who made(added liquidity) and took (removed liquidity) from the market
 type PlyMktMarket struct {
 	ID                           string          `json:"id"`
 	Question                     string          `json:"question"`
@@ -401,25 +404,23 @@ var (
 	ErrRequestFailed = errors.New("request failed")
 )
 
-// Request represents an HTTP request.
-type Request struct {
-	ID       string
+type ReqDetails struct {
 	URL      string
 	Method   string
 	Headers  map[string]string
 	Body     io.Reader
-	Metadata map[string]any
+	Params   url.Values
+	Paginated bool
 }
 
 // Response represents an HTTP response.
-type Response struct {
+type RespDetails struct {
 	URL        string
 	StatusCode int
 	Body       []byte
 	Headers    http.Header
 	Duration   time.Duration
 	Err        error
-	Metadata   map[string]any
 }
 
 // Stats tracks request statistics.
@@ -431,148 +432,167 @@ type Stats struct {
 	RetryCount        atomic.Int64
 }
 
-// Config holds service configuration.
-type Config struct {
-	MaxRetries int
-	RetryDelay time.Duration
-}
-
 type PlyMktService struct {
-	logger *slog.Logger
-	config *Config
-	stats  *Stats
+	Logger *slog.Logger
+	Cfg    *config.Config
+	Stats  *Stats
+	Ctx    context.Context
 }
 
-func (ply *PlyMktService) DoRequest(ctx context.Context, req *Request, method string) (*Response, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, method, req.URL, req.Body)
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
-	}
+func (ply *PlyMktService) SyncSubgraph(ctx context.Context) (*RespDetails, error) {
+	// Group 1: Clob/Orderbook-Centric Strategies
+	// 	(Latency Arb, Market Making, Asymmetric Scalp, Maker Rebates)
+	// ordersMatchedEvents
+	// enrichedOrderFilleds
 
-	for k, v := range req.Headers {
-		httpReq.Header.Set(k, v)
-	}
+	// Group 3: Transaction/Position-Centric Strategies
+	//	(Copy Trading, Stat Arb, Wallet Basket, Merges/Splits/Redemptions)
+	// marketProfits
+	// merges
+	// splits
+	// redemptions
+	return nil, nil
+}
+// type plyMktSportTeam struct {
+// 		ID int
+// 		name string
+// 	league string
+// record string
+// logo string
+// abbreviation string
+// alias string
+// providerID int
+// color string
+// }
 
-	// TODO: 1 per host, prolly need to abstract this out
-	httpClient := newSecureHTTPClient()
-	httpResp, err := httpClient.Do(httpReq)
+// type plyMktSport struct {
+// 		sport string
+// 		teams []plyMktSportTeam
+// 		image string
+// 		resolution string
+// 		ordering string
+// 		tags string
+// 		series string
+// }
+
+type sportsTarget struct {
+	path   string
+	params map[string]string
+}
+
+func (ply *PlyMktService) GetSportsReqs(ctx context.Context) ([]*fetcher.Request, error) {
+	// gamma/sports
+	// gamma/teams
+	// limit, offset, league []string, name []string
+	gammaEndpoint, ok := config.DefaultEndpoints["gamma"].(string)
+	if !ok {
+		return nil, fmt.Errorf("gamma endpoint not configured")
+	}
+	baseUrl, err := url.Parse(gammaEndpoint)
 	if err != nil {
 		return nil, err
 	}
-	defer httpResp.Body.Close()
 
-	body, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
+	defaultLimit := "500"
+	defaultOffset := "0"
+	targets := map[string]sportsTarget{
+		"sports": {
+			path: "/sports",
+		},
+		"teams": {
+			path: "/teams",
+			params: map[string]string{
+				"limit":  defaultLimit,
+				"offset": defaultOffset,
+			},
+		},
 	}
 
-	if httpResp.StatusCode >= 500 {
-		return nil, fmt.Errorf("server error: %d", httpResp.StatusCode)
-	}
+	var reqs []*fetcher.Request
 
-	return &Response{
-		URL:        req.URL,
-		StatusCode: httpResp.StatusCode,
-		Body:       body,
-		Headers:    httpResp.Header,
-		Metadata:   req.Metadata,
-	}, nil
-}
-
-// =============================================================================
-// HTTP Client
-// =============================================================================
-
-func newSecureHTTPClient() *http.Client {
-	tlsConfig := &tls.Config{
-		MinVersion: tls.VersionTLS13,
-	}
-
-	transport := &http.Transport{
-		TLSClientConfig: tlsConfig,
-		DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 100,
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
-		ForceAttemptHTTP2:   true,
-	}
-
-	return &http.Client{
-		Transport: transport,
-		Timeout:   2 * time.Second,
-	}
-}
-
-// =============================================================================
-// FetcherJob Interface - Work Function
-// =============================================================================
-
-// Fetch is the work function that fetches data from a URL.
-// This is the domain-specific operation for the fetcher stage.
-func (ply *PlyMktService) Fetch(ctx context.Context, req *Request) (*Response, error) {
-	start := time.Now()
-	method := req.Method
-	if method == "" {
-		method = http.MethodGet
-	}
-
-	ply.logger.Info("fetching url",
-		slog.String("request_id", req.ID),
-		slog.String("url", req.URL),
-	)
-
-	var lastErr error
-	for attempt := 0; attempt <= ply.config.MaxRetries; attempt++ {
-		if attempt > 0 {
-			ply.stats.RetryCount.Add(1)
-			delay := ply.config.RetryDelay * time.Duration(1<<(attempt-1))
-			select {
-			case <-ctx.Done():
-				return &Response{
-					URL:      req.URL,
-					Duration: time.Since(start),
-					Err:      ctx.Err(),
-					Metadata: req.Metadata,
-				}, ctx.Err()
-			case <-time.After(delay):
-			}
+	for _, target := range targets {
+		currQuery := url.Values{}
+		for param, val := range target.params {
+			currQuery.Add(param, val)
 		}
+		fullURL := baseUrl.JoinPath(target.path)
+		fullURL.RawQuery = currQuery.Encode()
 
-		resp, err := ply.DoRequest(ctx, req, method)
-		if err == nil {
-			resp.Duration = time.Since(start)
-			ply.stats.RequestsCompleted.Add(1)
-			ply.stats.BytesFetched.Add(int64(len(resp.Body)))
-			ply.stats.TotalDuration.Add(int64(resp.Duration))
-
-			ply.logger.Info("fetched from url",
-				slog.String("request_id", req.ID),
-				slog.String("url", req.URL),
-				slog.Int("status", resp.StatusCode),
-			)
-			return resp, nil
+		r := &fetcher.Request{
+			URL:     fullURL.String(),
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Method:  "GET",
 		}
-		lastErr = err
+		reqs = append(reqs, r)
 	}
 
-	duration := time.Since(start)
-	ply.stats.RequestsFailed.Add(1)
-	ply.stats.TotalDuration.Add(int64(duration))
-
-	ply.logger.Error("fetch failed",
-		slog.String("request_id", req.ID),
-		slog.String("url", req.URL),
-		slog.String("error", lastErr.Error()),
-	)
-
-	return &Response{
-		URL:      req.URL,
-		Duration: duration,
-		Err:      fmt.Errorf("%w: %v", ErrRequestFailed, lastErr),
-		Metadata: req.Metadata,
-	}, lastErr
+	return reqs, nil
 }
+
+
+// query := `query FetchClobData($first: Int = 10, $skip: Int = 0) {
+//   ordersMatchedEvents(
+//     first: $first
+//     skip: $skip
+//     orderBy: timestamp
+//     orderDirection: asc
+//   ) {
+//     id
+//     takerAmountFilled
+//     makerAmountFilled
+//     makerAssetID
+//     takerAssetID
+//   }
+//   orderbooks(first: $first, skip: $skip) {
+//     id
+//     sellsQuantity
+//     tradesQuantity
+//     buysQuantity
+//     collateralVolume
+//     collateralSellVolume
+//     collateralBuyVolume
+//   }
+//   transactions(
+//     orderBy: timestamp
+//     orderDirection: desc
+//     first: $first
+//     skip: $skip
+//   ) {
+//     feeAmount
+//     id
+//     market {
+//       id
+//     }
+//     outcomeIndex
+//     outcomeTokensAmount
+//     tradeAmount
+//     type
+//     timestamp
+//   }
+//   enrichedOrderFilleds(
+//     first: $first
+//     skip: $skip
+//     orderBy: timestamp
+//     orderDirection: desc
+//   ) {
+//     id
+//     timestamp
+//     maker {
+//       id
+//     }
+//     taker {
+//       id
+//     }
+//     price
+//     side
+//     size
+//   }
+// accounts(first: 5, skip: 0, orderBy: scaledProfit, orderDirection: desc) {
+//   id
+//   creationTimestamp
+//   lastTradedTimestamp
+//   numTrades
+//   scaledCollateralVolume
+//   scaledProfit
+//   collateralVolume
+// }`

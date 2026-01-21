@@ -10,7 +10,6 @@ import (
 	"github.com/samucap/poly-asian-data/internal/config"
 	"github.com/samucap/poly-asian-data/internal/logging"
 	"github.com/samucap/poly-asian-data/internal/pipeline"
-	"github.com/samucap/poly-asian-data/internal/saver"
 )
 
 func main() {
@@ -49,18 +48,12 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		pipelineCfg := pipeline.Config{
-			NumWorkers: 2,
-			QueueSize:  10,
-			SaverCfg: saver.Config{
-				NumWorkers: 2,
-				QueueSize:  10,
-				SaveFunc:   saver.NoOpSaveFunc,
-				Logger:     logging.Logger,
-			},
-			Logger: logging.Logger,
+		plyMktPipeline, err := pipeline.New(ctx, cfg)
+		if err != nil {
+			logging.Error("Failed to create pipeline", slog.Any("error", err))
+			os.Exit(1)
 		}
-		_, _ = pipeline.New(ctx, pipelineCfg)
+		plyMktPipeline.SyncPlyMkt()
 	}()
 
 	<-sigChan
