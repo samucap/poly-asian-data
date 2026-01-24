@@ -40,6 +40,11 @@ type PoolCfg struct {
 	Qsize      int
 }
 
+type SaverCfg struct {
+	NumWorkers int
+	Qsize      int
+}
+
 type Config struct {
 	// Environment: "development", "staging", "production"
 	ENV string `mapstructure:"ENV" validate:"required,oneof=dev stg prod"`
@@ -56,7 +61,7 @@ type Config struct {
 	Services map[string]SvcProvider
 
 	// Pipeline
-	//SaverCfg   saver.Config
+	SaverCfg     SaverCfg
 	FetcherCfg   PoolCfg
 	ProcessorCfg PoolCfg
 }
@@ -84,6 +89,8 @@ func Load() (*Config, error) {
 	v.SetDefault("FetcherCfg.Qsize", 10)
 	v.SetDefault("ProcessorCfg.NumWorkers", 2)
 	v.SetDefault("ProcessorCfg.Qsize", 10)
+	v.SetDefault("SaverCfg.NumWorkers", 2)
+	v.SetDefault("SaverCfg.Qsize", 10)
 
 	// Step 3: Bind to environment variables (this gives system ENV priority)
 	//v.AutomaticEnv()

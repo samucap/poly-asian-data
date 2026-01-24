@@ -306,6 +306,7 @@ func (p *Pool[T, R]) SubmitAndThenWait(data T) error {
 		}
 		return err
 	}
+	return nil
 }
 
 func (p *Pool[T, R]) MakeInputObj(data T) Input[T] {

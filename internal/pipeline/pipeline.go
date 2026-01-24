@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -50,7 +51,7 @@ type Stats struct {
 type Pipeline struct {
 	fetcherPool   *fetcher.Fetcher
 	processorPool *processor.Processor
-	saverPool     *saver.Pool
+	saverPool     *saver.Saver
 	logger        *slog.Logger
 	startedAt     time.Time
 	cfg           *config.Config
@@ -84,16 +85,16 @@ func New(ctx context.Context, cfg *config.Config) (*Pipeline, error) {
 		return nil, err
 	}
 
-	// saverPool, err := saver.New(pipelineCtx, cfg.SaverCfg)
-	//if err != nil {
-	//	cancel()
-	//	return nil, err
-	//}
+	saverPool, err := saver.New(pipelineCtx, cfg, cfg.SaverCfg.NumWorkers, cfg.SaverCfg.Qsize)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 
 	p := &Pipeline{
 		fetcherPool:   fetcherPool,
 		processorPool: processorPool,
-		// saverPool:     saverPool,
+		saverPool:     saverPool,
 		logger:        logger,
 		startedAt:     time.Now(),
 		cfg:           cfg,
@@ -148,8 +149,17 @@ func (p *Pipeline) routeProcessorOutput(ctx context.Context) {
 			}
 			output := result.Value
 
-			// TODO: Route to saver when enabled
-			// saverInput <- output
+			// Route to saver
+			record := &saver.Record{
+				ID:          output.ID,
+				TableName:   p.resolveTableName(output),
+				Data:        output.Data,
+				ItemCount:   output.ItemCount,
+				ProcessedAt: output.ProcessedAt,
+			}
+			if err := p.saverPool.SubmitAndThenWait(record); err != nil {
+				p.logger.Warn("failed to submit to saver", slog.String("error", err.Error()))
+			}
 
 			// Check if pagination should continue (fetcher handles the logic)
 			if nextReq := p.fetcherPool.BuildNextPageRequest(output.OriginalRequest, output.ItemCount); nextReq != nil {
@@ -173,7 +183,7 @@ func (p *Pipeline) Stats() Stats {
 		UptimeDuration: time.Since(p.startedAt),
 		Fetcher:        p.fetcherPool.Stats().Snapshot(),
 		Processor:      p.processorPool.Stats().Snapshot(),
-		// Saver:          p.saverPool.Stats().Snapshot(),
+		Saver:          p.saverPool.SaverStats().Snapshot(),
 	}
 }
 
@@ -193,14 +203,15 @@ func (p *Pipeline) Stop() {
 	// Stop in order: fetcher -> processor -> saver
 	p.fetcherPool.Stop()
 	p.processorPool.Stop()
-	// _ = p.saverPool.Stop()
+	p.saverPool.Stop()
+	p.saverPool.Close()
 	p.cancel()
 
 	stats := p.Stats()
 	p.logger.Info("pipeline stopped",
 		slog.Int64("fetched", stats.Fetcher.Completed),
 		slog.Int64("processed", stats.Processor.Completed),
-		// slog.Int64("saved", stats.Saver.RecordsSaved),
+		slog.Int64("saved", stats.Saver.RecordsSaved),
 		slog.Duration("uptime", stats.UptimeDuration),
 	)
 }
@@ -214,5 +225,22 @@ func (p *Pipeline) StopNow() {
 	p.cancel()
 	p.fetcherPool.StopNow()
 	p.processorPool.StopNow()
-	// p.saverPool.StopNow()
+	p.saverPool.StopNow()
+	p.saverPool.Close()
+}
+
+// resolveTableName determines the table name from processor output.
+func (p *Pipeline) resolveTableName(output *processor.Output) string {
+	if output == nil || output.OriginalRequest == nil {
+		return ""
+	}
+	url := output.OriginalRequest.URL
+	switch {
+	case strings.Contains(url, "/sports"):
+		return "sport"
+	case strings.Contains(url, "/teams"):
+		return "team"
+	default:
+		return ""
+	}
 }

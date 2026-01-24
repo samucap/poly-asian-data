@@ -115,7 +115,7 @@ type PlyMktMarket struct {
 	IconOptimized                *ImageOptimized `json:"iconOptimized"`
 	Events                       []PlyMktEvent   `json:"events"`
 	Categories                   []Category      `json:"categories"`
-	Tags                         []Tag           `json:"tags"`
+	Tags                         []PlyMktTag     `json:"tags"`
 	Creator                      string          `json:"creator"`
 	Ready                        bool            `json:"ready"`
 	Funded                       bool            `json:"funded"`
@@ -207,7 +207,7 @@ type Series struct {
 	Events            []PlyMktEvent `json:"events"`
 	Collections       []Collection `json:"collections"`
 	Categories        []Category   `json:"categories"`
-	Tags              []Tag        `json:"tags"`
+	Tags              []PlyMktTag `json:"tags"`
 	CommentCount      int          `json:"commentCount"`
 	Chats             []Chat       `json:"chats"`
 }
@@ -264,11 +264,11 @@ type PlyMktEvent struct {
 	IconOptimized                ImageOptimized      `json:"iconOptimized"`
 	FeaturedImageOptimized       ImageOptimized      `json:"featuredImageOptimized"`
 	SubEvents                    []string            `json:"subEvents"`
-	Markets                      []PlyMktMarket      `json:"markets"`
-	Series                       []Series            `json:"series"`
-	Categories                   []Category          `json:"categories"`
-	Collections                  []Collection        `json:"collections"`
-	Tags                         []Tag               `json:"tags"`
+	Markets                      []*PlyMktMarket      `json:"markets"`
+	Series                       []*Series            `json:"series"`
+	Categories                   []*Category          `json:"categories"`
+	Collections                  []*Collection        `json:"collections"`
+	Tags                         []*PlyMktTag         `json:"tags"`
 	Cyom                         bool                `json:"cyom"`
 	ClosedTime                   time.Time           `json:"closedTime"`
 	ShowAllOutcomes              bool                `json:"showAllOutcomes"`
@@ -287,14 +287,14 @@ type PlyMktEvent struct {
 	Ended                        bool                `json:"ended"`
 	FinishedTimestamp            time.Time           `json:"finishedTimestamp"`
 	GmpChartMode                 string              `json:"gmpChartMode"`
-	EventCreators                []EventCreator      `json:"eventCreators"`
+	EventCreators                []*EventCreator      `json:"eventCreators"`
 	TweetCount                   int                 `json:"tweetCount"`
-	Chats                        []Chat              `json:"chats"`
+	Chats                        []*Chat              `json:"chats"`
 	FeaturedOrder                int                 `json:"featuredOrder"`
 	EstimateValue                bool                `json:"estimateValue"`
 	CantEstimate                 bool                `json:"cantEstimate"`
 	EstimatedValue               string              `json:"estimatedValue"`
-	Templates                    []Template          `json:"templates"`
+	Templates                    []*Template          `json:"templates"`
 	SpreadsMainLine              float64             `json:"spreadsMainLine"`
 	TotalsMainLine               float64             `json:"totalsMainLine"`
 	CarouselMap                  string              `json:"carouselMap"`
@@ -350,7 +350,7 @@ type Category struct {
 	CreatedAt      time.Time `json:"createdAt"`
 	UpdatedAt      time.Time `json:"updatedAt"`
 }
-type Tag struct {
+type PlyMktTag struct {
 	ID          string    `json:"id"`
 	Label       string    `json:"label"`
 	Slug        string    `json:"slug"`
@@ -358,10 +358,9 @@ type Tag struct {
 	PublishedAt string    `json:"publishedAt"`
 	CreatedBy   int       `json:"createdBy"`
 	UpdatedBy   int       `json:"updatedBy"`
-	CreatedAt   time.Time `json:"createdAt"`
-	UpdatedAt   time.Time `json:"updatedAt"`
+	CreatedAtPly time.Time `json:"createdAt"`
+	UpdatedAtPly time.Time `json:"updatedAt"`
 	ForceHide   bool      `json:"forceHide"`
-	IsCarousel  bool      `json:"isCarousel"`
 }
 
 type Collection struct {
@@ -463,6 +462,10 @@ type PlyMktTeam struct {
 	Alias        string `json:"alias"`
 	ProviderID   int    `json:"providerID"`
 	Color        string `json:"color"`
+	CreatedAtPly string `json:"createdAt"`
+	UpdatedAtPly string `json:"updatedAt"`
+	Sport        string `json:"sport"`
+	SportID      string `json:"sportID"`
 }
 
 type PlyMktSport struct {
@@ -480,9 +483,23 @@ type sportsTarget struct {
 }
 
 func (ply *PlyMktService) GetSportsReqs(ctx context.Context) ([]*fetcher.Request, error) {
-	// gamma/sports
-	// gamma/teams
-	// limit, offset, league []string, name []string
+	//sportsCats := map[string]int {
+	//	"football": 0,
+	//	"basketball": 0,
+	//	"hockey": 0,
+	//	"tennis": 0,
+	//	"esports": 0,
+	//	"baseball": 0,
+	//	"soccer": 0,
+	//	"cricket": 0,
+	//	"rugby": 0,
+	//	"golf": 0,
+	//	"ufc": 0,
+	//	"f1": 0,
+	//	"chess": 0,
+	//	"boxing": 0,
+	//	"pickleball": 0
+	//}
 	gammaEndpoint, ok := config.DefaultEndpoints["gamma"].(string)
 	if !ok {
 		return nil, fmt.Errorf("gamma endpoint not configured")
