@@ -78,23 +78,19 @@ func New(ctx context.Context, cfg *config.Config) (*Pipeline, error) {
 		return nil, err
 	}
 
-	processorPool, err := processor.New(pipelineCtx, cfg.ProcessorCfg.NumWorkers, cfg.ProcessorCfg.Qsize, fetcherPool)
+	processorPool, err := processor.New(pipelineCtx, cfg.ProcessorCfg.NumWorkers, cfg.ProcessorCfg.Qsize)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 
-	// TODO: Re-enable saver when implemented
-	//saverPool, err := saver.New(pipelineCtx, cfg.SaverCfg)
+	// saverPool, err := saver.New(pipelineCtx, cfg.SaverCfg)
 	//if err != nil {
 	//	cancel()
 	//	return nil, err
 	//}
 
-	// Connect processor to fetcher output (type-safe transformation)
-	go processorPool.SubscribeToFetcher(pipelineCtx, fetcherPool.Outputs())
-
-	return &Pipeline{
+	p := &Pipeline{
 		fetcherPool:   fetcherPool,
 		processorPool: processorPool,
 		// saverPool:     saverPool,
@@ -103,15 +99,21 @@ func New(ctx context.Context, cfg *config.Config) (*Pipeline, error) {
 		cfg:           cfg,
 		ctx:           pipelineCtx,
 		cancel:        cancel,
-	}, nil
+	}
+
+	// Connect stages:
+	// - Processor subscribes to fetcher output
+	// - Pipeline routes processor output to saver and handles pagination
+	go processorPool.SubscribeToFetcher(pipelineCtx, fetcherPool.Outputs())
+	go p.routeProcessorOutput(pipelineCtx)
+
+	return p, nil
 }
 
 // SyncPlyMkt starts the pipeline and waits for it to complete.
 func (p *Pipeline) SyncPlyMkt() {
 	p.logger.Info("Starting PolyMarket Sync...")
 	
-	// TODO: Instantiate PlyMktService properly
-	// For now, just log that we're starting
 	plyMktSvc := &services.PlyMktService{
 		Cfg: p.cfg,
 		Logger: p.logger,
@@ -125,10 +127,40 @@ func (p *Pipeline) SyncPlyMkt() {
 	}
 
 	for _, req := range reqs {
-		// TODO: review this. Is this the best way to do this?
-		input := p.fetcherPool.MakeInputObj(req)
-		if err := p.fetcherPool.SubmitWait(input); err != nil {
+		if err := p.fetcherPool.SubmitAndThenWait(req); err != nil {
 			p.logger.Error("failed to submit req", slog.Any("error", err))
+			return
+		}
+	}
+}
+
+// routeProcessorOutput reads from processor output and routes data to saver
+// and pagination requests back to fetcher.
+func (p *Pipeline) routeProcessorOutput(ctx context.Context) {
+	for {
+		select {
+		case result, ok := <-p.processorPool.Outputs():
+			if !ok {
+				return // Channel closed
+			}
+			if result.Err != nil {
+				continue // Skip failed processing
+			}
+			output := result.Value
+
+			// TODO: Route to saver when enabled
+			// saverInput <- output
+
+			// Check if pagination should continue (fetcher handles the logic)
+			if nextReq := p.fetcherPool.BuildNextPageRequest(output.OriginalRequest, output.ItemCount); nextReq != nil {
+				if err := p.fetcherPool.SubmitAndThenWait(nextReq); err != nil {
+					p.logger.Warn("failed to submit next page request",
+						slog.String("url", nextReq.URL),
+						slog.String("error", err.Error()),
+					)
+				}
+			}
+		case <-ctx.Done():
 			return
 		}
 	}

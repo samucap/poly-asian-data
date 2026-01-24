@@ -7,8 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"net/url"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -35,19 +33,19 @@ var (
 
 type Processor struct {
 	*workerpool.Pool[*fetcher.Response, *Output]
-	stats       Stats
-	logger      *slog.Logger
-	fetcherPool *fetcher.Fetcher // Reference to fetcher for pagination
+	stats  Stats
+	logger *slog.Logger
 }
 
 // Output represents processed data.
 type Output struct {
-	ID          string
-	WorkerID    int
-	Data        any
-	ItemCount   int
-	Duration    time.Duration
-	ProcessedAt time.Time
+	ID              string
+	WorkerID        int
+	Data            any
+	ItemCount       int
+	Duration        time.Duration
+	ProcessedAt     time.Time
+	OriginalRequest *fetcher.Request // for pagination handling by fetcher
 }
 
 // Stats contains atomic counters for processor statistics.
@@ -80,15 +78,14 @@ type StatsSnapshot struct {
 }
 
 // New creates and initializes a processor pool.
-func New(ctx context.Context, numWorkers, qSize int, fetcherPool *fetcher.Fetcher) (*Processor, error) {
+func New(ctx context.Context, numWorkers, qSize int) (*Processor, error) {
 	logger := logging.Logger.With(
 		slog.String("component", "processor"),
 	)
 
 	// Create processor first so we can pass its method to the pool
 	p := &Processor{
-		logger:      logger,
-		fetcherPool: fetcherPool,
+		logger: logger,
 	}
 
 	pool, err := workerpool.NewPool[*fetcher.Response, *Output](ctx, "processor", numWorkers, qSize, logger, p.workerTask)
@@ -118,12 +115,8 @@ func (p *Processor) SubscribeToFetcher(ctx context.Context, upstream <-chan work
 			if result.Err != nil {
 				continue // Skip failed fetches
 			}
-			// Wrap the response in Input[T]
-			input := workerpool.Input[*fetcher.Response]{
-				Data:        result.Value,
-				SubmittedAt: time.Now(),
-			}
-			_ = p.SubmitWait(input)
+			// Submit the response directly - SubmitWait wraps it internally
+			_ = p.SubmitWait(result.Value)
 		case <-ctx.Done():
 			return
 		}
@@ -180,19 +173,12 @@ func (p *Processor) workerTask(ctx context.Context, resp *fetcher.Response) (*Ou
 		slog.Duration("duration", time.Since(start)),
 	)
 
-	// Handle pagination: if we got a full page, request next page
-	if err := p.handlePagination(ctx, resp, itemCount); err != nil {
-		p.logger.Warn("failed to request next page",
-			slog.String("url", resp.URL),
-			slog.String("error", err.Error()),
-		)
-	}
-
 	return &Output{
-		Data:        data,
-		ItemCount:   itemCount,
-		Duration:    time.Since(start),
-		ProcessedAt: time.Now(),
+		Data:            data,
+		ItemCount:       itemCount,
+		Duration:        time.Since(start),
+		ProcessedAt:     time.Now(),
+		OriginalRequest: resp.Request,
 	}, nil
 }
 
@@ -225,82 +211,6 @@ func (p *Processor) processGenericArray(data []byte) (any, int, error) {
 	return items, len(items), nil
 }
 
-// =============================================================================
-// Pagination Handler
-// =============================================================================
-
-func (p *Processor) handlePagination(ctx context.Context, resp *fetcher.Response, itemCount int) error {
-	if resp.Request == nil || resp.Request.Params == nil {
-		return nil
-	}
-
-	// Check if pagination params exist
-	limitStr := resp.Request.Params.Get("limit")
-	offsetStr := resp.Request.Params.Get("offset")
-	if limitStr == "" || offsetStr == "" {
-		return nil // Not a paginated request
-	}
-
-	limit, err := strconv.Atoi(limitStr)
-	if err != nil {
-		return err
-	}
-
-	// If we got fewer items than the limit, we've reached the last page
-	if itemCount < limit {
-		p.logger.Info("reached last page",
-			slog.String("url", resp.URL),
-			slog.Int("itemCount", itemCount),
-			slog.Int("limit", limit),
-		)
-		return nil
-	}
-
-	// Full page - request next page
-	offset, err := strconv.Atoi(offsetStr)
-	if err != nil {
-		return err
-	}
-
-	newOffset := strconv.Itoa(offset + limit)
-
-	// Deep copy Params to avoid mutation issues
-	newParams := make(url.Values)
-	for k, v := range resp.Request.Params {
-		newParams[k] = append([]string{}, v...)
-	}
-	newParams.Set("offset", newOffset)
-
-	// Rebuild URL with new offset
-	parsedURL, err := url.Parse(resp.URL)
-	if err != nil {
-		return err
-	}
-	parsedURL.RawQuery = newParams.Encode()
-
-	nextReq := &fetcher.Request{
-		URL:     parsedURL.String(),
-		Method:  resp.Request.Method,
-		Headers: resp.Request.Headers,
-		Params:  newParams,
-	}
-
-	p.logger.Info("requesting next page",
-		slog.String("url", nextReq.URL),
-		slog.Int("newOffset", offset+limit),
-	)
-
-	// Use non-blocking Submit to avoid deadlock
-	if err := p.fetcherPool.Submit(p.fetcherPool.MakeInputObj(nextReq)); err != nil {
-		if errors.Is(err, workerpool.ErrQueueFull) {
-			// Queue is full, try with wait
-			return p.fetcherPool.SubmitWait(p.fetcherPool.MakeInputObj(nextReq))
-		}
-		return err
-	}
-
-	return nil
-}
 
 // Stats returns statistics.
 func (p *Processor) ProcessorStats() *Stats {

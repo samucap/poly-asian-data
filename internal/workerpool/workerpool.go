@@ -144,14 +144,15 @@ type Pool[T, R any] struct {
 }
 
 type PoolIF[T, R any] interface {
-	Testor()
 	Outputs() chan Result[R]
 	Inputs() chan Input[T]
 	Stats() Stats
 	Stop()
 	StopNow()
 	IsRunning() bool
-	SubmitWait(ctx context.Context, input Input[T]) error
+	SubmitWait(ctx context.Context, data T) error
+	Submit(ctx context.Context, data T) error
+	SubmitAndThenWait(ctx context.Context, data T) error
 }
 
 // NewPool creates a new worker pool with the given configuration.
@@ -210,7 +211,6 @@ func (p *Pool[T, R]) worker(id int) {
 			}
 			
 			input.WorkerID = id
-			input.ID = uuid.New().String()
 			p.sendResult(p.processItem(input))
 		}
 	}
@@ -260,11 +260,12 @@ func (p *Pool[T, R]) processItem(input Input[T]) Result[R] {
 
 // Submit adds an input item to the pool's queue for processing.
 // Returns an error if the pool is stopped or the queue is full.
-func (p *Pool[T, R]) Submit(input Input[T]) error {
+func (p *Pool[T, R]) Submit(data T) error {
 	if p.stopped.Load() {
 		return ErrPoolStopped
 	}
 
+	input := p.MakeInputObj(data)
 	p.stats.Submitted.Add(1)
 
 	select {
@@ -281,11 +282,12 @@ func (p *Pool[T, R]) Submit(input Input[T]) error {
 
 // SubmitWait adds an input item, blocking until space is available.
 // Returns an error only if the pool is stopped.
-func (p *Pool[T, R]) SubmitWait(input Input[T]) error {
+func (p *Pool[T, R]) SubmitWait(data T) error {
 	if p.stopped.Load() {
 		return ErrPoolStopped
 	}
 
+	input := p.MakeInputObj(data)
 	p.stats.Submitted.Add(1)
 
 	select {
@@ -297,8 +299,18 @@ func (p *Pool[T, R]) SubmitWait(input Input[T]) error {
 	}
 }
 
+func (p *Pool[T, R]) SubmitAndThenWait(data T) error {
+	if err := p.Submit(data); err != nil {
+		if err == ErrQueueFull {
+			return p.SubmitWait(data)
+		}
+		return err
+	}
+}
+
 func (p *Pool[T, R]) MakeInputObj(data T) Input[T] {
 	return Input[T]{
+		ID: uuid.New().String(),
 		Data: data,
 	}
 }
@@ -366,10 +378,6 @@ func (p *Pool[T, R]) StopNow() {
 // IsRunning returns true if the pool is currently running.
 func (p *Pool[T, R]) IsRunning() bool {
 	return p.IsStopped() == false
-}
-
-func (p *Pool[T, R]) Testor() {
-	p.logger.Info("Testing Testing ==================================")
 }
 
 // =============================================================================

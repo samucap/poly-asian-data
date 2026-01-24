@@ -2,12 +2,10 @@ package fetcher
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,7 +69,7 @@ func TestFetcher_Submit(t *testing.T) {
 		result, _ := newTestFetcher(ctx, 2, 10)
 		result.cleanup() // Stop the pool
 
-		err := result.fetcher.Submit(workerpool.Input[*Request]{Data: &Request{URL: "http://example.com"}})
+		err := result.fetcher.Submit(&Request{URL: "http://example.com"})
 		assert.Error(t, err)
 	})
 }
@@ -136,25 +134,11 @@ func TestFetcher_WorkerTask(t *testing.T) {
 }
 
 // =============================================================================
-// Pagination Tests (Now in Processor)
+// Pagination Tests
 // =============================================================================
 
-func TestFetcher_FetchDoesNotPaginate(t *testing.T) {
-	t.Run("fetcher no longer handles pagination", func(t *testing.T) {
-		// Mock server that returns a full page (10 items)
-		var requestCount atomic.Int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			requestCount.Add(1)
-			items := make([]map[string]string, 10)
-			for i := range items {
-				items[i] = map[string]string{"id": string(rune('a' + i))}
-			}
-			data, _ := json.Marshal(items)
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(data)
-		}))
-		defer server.Close()
-
+func TestFetcher_BuildNextPageRequest(t *testing.T) {
+	t.Run("returns next request when full page", func(t *testing.T) {
 		ctx := context.Background()
 		cfg := &config.Config{}
 		f, err := New(ctx, cfg, 1, 10)
@@ -166,15 +150,78 @@ func TestFetcher_FetchDoesNotPaginate(t *testing.T) {
 		params.Set("offset", "0")
 
 		req := &Request{
-			URL:    server.URL + "?" + params.Encode(),
+			URL:    "http://example.com/teams?" + params.Encode(),
 			Params: params,
 		}
-		resp, err := f.Fetch(ctx, req)
-		require.NoError(t, err)
-		assert.NotNil(t, resp.Data)
 
-		// Fetcher should only make 1 request (pagination is now in processor)
-		assert.Equal(t, int32(1), requestCount.Load())
+		// Full page (10 items = limit)
+		nextReq := f.BuildNextPageRequest(req, 10)
+
+		require.NotNil(t, nextReq)
+		assert.Contains(t, nextReq.URL, "offset=10")
+		assert.Equal(t, "10", nextReq.Params.Get("offset"))
+		assert.Equal(t, "10", nextReq.Params.Get("limit"))
+	})
+
+	t.Run("returns nil when partial page (last page)", func(t *testing.T) {
+		ctx := context.Background()
+		cfg := &config.Config{}
+		f, err := New(ctx, cfg, 1, 10)
+		require.NoError(t, err)
+		defer f.Stop()
+
+		params := url.Values{}
+		params.Set("limit", "10")
+		params.Set("offset", "50")
+
+		req := &Request{
+			URL:    "http://example.com/teams?" + params.Encode(),
+			Params: params,
+		}
+
+		// Partial page (7 items < limit of 10)
+		nextReq := f.BuildNextPageRequest(req, 7)
+
+		assert.Nil(t, nextReq)
+	})
+
+	t.Run("correctly increments offset", func(t *testing.T) {
+		ctx := context.Background()
+		cfg := &config.Config{}
+		f, err := New(ctx, cfg, 1, 10)
+		require.NoError(t, err)
+		defer f.Stop()
+
+		params := url.Values{}
+		params.Set("limit", "10")
+		params.Set("offset", "100")
+
+		req := &Request{
+			URL:    "http://example.com/teams?" + params.Encode(),
+			Params: params,
+		}
+
+		// Full page at offset 100
+		nextReq := f.BuildNextPageRequest(req, 10)
+
+		require.NotNil(t, nextReq)
+		assert.Contains(t, nextReq.URL, "offset=110")
+		assert.Equal(t, "110", nextReq.Params.Get("offset"))
+	})
+
+	t.Run("returns nil for non-paginated request", func(t *testing.T) {
+		ctx := context.Background()
+		cfg := &config.Config{}
+		f, err := New(ctx, cfg, 1, 10)
+		require.NoError(t, err)
+		defer f.Stop()
+
+		req := &Request{
+			URL: "http://example.com/teams",
+		}
+
+		nextReq := f.BuildNextPageRequest(req, 10)
+		assert.Nil(t, nextReq)
 	})
 }
 

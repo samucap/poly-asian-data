@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/samucap/poly-asian-data/internal/config"
@@ -212,4 +213,75 @@ func (f *Fetcher) Fetch(ctx context.Context, inputReqDetails *Request) (*Respons
 		Err:      fmt.Errorf("%w: %v", ErrRequestFailed, lastErr),
 		Request:  inputReqDetails,
 	}, lastErr
+}
+
+// =============================================================================
+// Pagination
+// =============================================================================
+
+// BuildNextPageRequest returns the next page request if pagination should continue,
+// or nil if we've reached the last page. The itemCount is needed to determine
+// if the current page was full (more pages) or partial (last page).
+func (f *Fetcher) BuildNextPageRequest(req *Request, itemCount int) *Request {
+	if req == nil || req.Params == nil {
+		return nil
+	}
+
+	// Check if pagination params exist
+	limitStr := req.Params.Get("limit")
+	offsetStr := req.Params.Get("offset")
+	if limitStr == "" || offsetStr == "" {
+		return nil // Not a paginated request
+	}
+
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil {
+		return nil
+	}
+
+	// If we got fewer items than the limit, we've reached the last page
+	if itemCount < limit {
+		f.logger.Info("reached last page",
+			slog.String("url", req.URL),
+			slog.Int("itemCount", itemCount),
+			slog.Int("limit", limit),
+		)
+		return nil
+	}
+
+	// Full page - build next page request
+	offset, err := strconv.Atoi(offsetStr)
+	if err != nil {
+		return nil
+	}
+
+	newOffset := strconv.Itoa(offset + limit)
+
+	// Deep copy Params to avoid mutation issues
+	newParams := make(url.Values)
+	for k, v := range req.Params {
+		newParams[k] = append([]string{}, v...)
+	}
+	newParams.Set("offset", newOffset)
+
+	// Rebuild URL with new offset
+	parsedURL, err := url.Parse(req.URL)
+	if err != nil {
+		return nil
+	}
+	parsedURL.RawQuery = newParams.Encode()
+
+	nextReq := &Request{
+		URL:     parsedURL.String(),
+		Method:  req.Method,
+		Headers: req.Headers,
+		Params:  newParams,
+	}
+
+	f.logger.Info("built next page request",
+		slog.String("url", nextReq.URL),
+		slog.Int("newOffset", offset+limit),
+	)
+
+	return nextReq
 }
