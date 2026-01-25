@@ -49,7 +49,7 @@ func Init(env string) {
 	if isProduction {
 		handler = slog.NewJSONHandler(os.Stdout, opts)
 	} else {
-		handler = slog.NewTextHandler(os.Stdout, opts)
+		handler = NewPrettyHandler(os.Stdout, opts)
 	}
 
 	Logger = slog.New(handler)

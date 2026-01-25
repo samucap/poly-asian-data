@@ -361,8 +361,9 @@ type PlyMktTag struct {
 	CreatedAtPly time.Time `json:"createdAt"`
 	UpdatedAtPly time.Time `json:"updatedAt"`
 	ForceHide   bool      `json:"forceHide"`
-	SportID     string
 	ParentTagID string
+	SportSlug   string
+	SportID     string
 }
 
 type Collection struct {
@@ -466,8 +467,8 @@ type PlyMktTeam struct {
 	Color        string `json:"color"`
 	CreatedAtPly string `json:"createdAt"`
 	UpdatedAtPly string `json:"updatedAt"`
-	Sport        string `json:"sport"`
-	SportID      string `json:"sportID"`
+	SportSlug    string `json:"sportSlug"`
+	SportID      string
 }
 
 type PlyMktSport struct {
@@ -477,7 +478,8 @@ type PlyMktSport struct {
 	Ordering   string `json:"ordering"`
 	Tags       string `json:"tags"`
 	Series     string `json:"series"`
-	SportID    string // Internal Link to Sport Category
+	Slug       string `json:"slug"`
+	SportID    string
 }
 
 type sportsTarget struct {
@@ -549,7 +551,10 @@ func (ply *PlyMktService) GetSportsReqs(ctx context.Context) ([]*fetcher.Request
 	return reqs, nil
 }
 
+// TODO: need to implement this sports sync using the pipeline, but need to
+// verify pagination tests if existent
 
+// TODO: need to implement a pipeline to fetch all this subgraph stuff
 // query := `query FetchClobData($first: Int = 10, $skip: Int = 0) {
 //   ordersMatchedEvents(
 //     first: $first
@@ -563,15 +568,21 @@ func (ply *PlyMktService) GetSportsReqs(ctx context.Context) ([]*fetcher.Request
 //     makerAssetID
 //     takerAssetID
 //   }
-//   orderbooks(first: $first, skip: $skip) {
-//     id
-//     sellsQuantity
-//     tradesQuantity
-//     buysQuantity
-//     collateralVolume
-//     collateralSellVolume
-//     collateralBuyVolume
-//   }
+//{
+// orderbooks(first: 10, orderBy: id, orderDirection: desc) {
+//   id
+//   buysQuantity
+//   collateralVolume
+//   scaledCollateralVolume
+//   sellsQuantity
+//   tradesQuantity
+//   lastActiveDay
+//   scaledCollateralSellVolume
+//   scaledCollateralBuyVolume
+//   collateralBuyVolume
+//   collateralSellVolume	
+// }
+//}
 //   transactions(
 //     orderBy: timestamp
 //     orderDirection: desc
@@ -607,12 +618,123 @@ func (ply *PlyMktService) GetSportsReqs(ctx context.Context) ([]*fetcher.Request
 //     side
 //     size
 //   }
-// accounts(first: 5, skip: 0, orderBy: scaledProfit, orderDirection: desc) {
-//   id
-//   creationTimestamp
-//   lastTradedTimestamp
-//   numTrades
-//   scaledCollateralVolume
-//   scaledProfit
-//   collateralVolume
-// }`
+//{
+//  accounts {
+//    id
+//    creationTimestamp
+//    lastSeenTimestamp
+//    collateralVolume
+//    lastTradedTimestamp
+//    numTrades
+//    profit
+//    scaledCollateralVolume
+//    scaledProfit
+//  }
+//}
+//	
+//{
+//  orderFilledEvents(first: 10, orderBy: id, orderDirection: asc, skip: 10) {
+//    fee
+//    id
+//    makerAssetId
+//    makerAmountFilled
+//    takerAmountFilled
+//    takerAssetId
+//    timestamp
+//  }
+//}
+
+//{
+//  ordersMatchedEvents(first: 10, skip: 10, orderBy: id, orderDirection: asc) {
+//    id
+//    makerAmountFilled
+//    makerAssetID
+//    takerAmountFilled
+//    takerAssetID
+//    timestamp
+//  }
+//}
+
+//query FetchPLData($first: Int = 10, $skip: Int = 0) {
+//	marketProfits
+//	merges
+//	splits
+//	redemptions
+//	transactions
+//}
+//{
+//{
+//  conditions {
+//    id
+//    payouts
+//    questionId
+//    resolutionTimestamp
+//  }
+//}
+// activity subgraph https://gateway.thegraph.com/api/[api-key]/subgraphs/id/4LkKSgkqijUccYMYMYUPtjXswrdK3xipPMfs3fa7gfef
+//{
+//  fixedProductMarketMakers(first: 10, orderBy: id, orderDirection: asc, skip: 10) {
+//    id
+//  }
+//}
+
+//
+//{
+//  merges(first: 5, orderBy: id, orderDirection: asc, skip: 10) {
+//    id
+//    timestamp
+//    stakeholder
+//    condition
+//    amount
+//  }
+//}
+
+//
+//{
+//  negRiskConversions(first: 10, orderBy: id, orderDirection: asc, skip: 10) {
+//    amount
+//    id
+//    indexSet
+//    negRiskMarketId
+//    questionCount
+//    stakeholder
+//    timestamp
+//  }
+//}
+
+//
+//{
+//  negRiskEvents(first: 10, orderBy: id, orderDirection: asc, skip: 10) {
+//    id
+//  }
+//}
+//
+//{
+//  positions(first: 10, orderBy: id, orderDirection: asc) {
+//    id
+//    condition
+//    outcomeIndex
+//  }
+//}
+
+//
+//{
+//  redemptions {
+//    id
+//    condition
+//    indexSets
+//    payout
+//    redeemer
+//    timestamp
+//  }
+//}
+//
+//{	
+//  splits {
+//    id
+//    timestamp
+//    stakeholder
+//    condition
+//    amount
+//  }
+//}	
