@@ -361,6 +361,8 @@ type PlyMktTag struct {
 	CreatedAtPly time.Time `json:"createdAt"`
 	UpdatedAtPly time.Time `json:"updatedAt"`
 	ForceHide   bool      `json:"forceHide"`
+	SportID     string
+	ParentTagID string
 }
 
 type Collection struct {
@@ -475,6 +477,7 @@ type PlyMktSport struct {
 	Ordering   string `json:"ordering"`
 	Tags       string `json:"tags"`
 	Series     string `json:"series"`
+	SportID    string // Internal Link to Sport Category
 }
 
 type sportsTarget struct {
