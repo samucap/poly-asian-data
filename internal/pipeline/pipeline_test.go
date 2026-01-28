@@ -94,3 +94,29 @@ func TestPipeline_Stats(t *testing.T) {
 	assert.False(t, stats.StartedAt.IsZero())
 	assert.GreaterOrEqual(t, stats.UptimeDuration, time.Duration(0))
 }
+
+func TestPipeline_WaitUntilIdle(t *testing.T) {
+	ctx := context.Background()
+	cfg := createTestConfig()
+	p, err := New(ctx, cfg)
+	// If DB connection fails,skip test (common in envs without DB)
+	if err != nil {
+		t.Skip("Skipping WaitUntilIdle test due to missing DB connection")
+	}
+	require.NoError(t, err)
+	defer p.Stop()
+
+	// Should return almost immediately for an idle pipeline
+	done := make(chan struct{})
+	go func() {
+		p.WaitUntilIdle(ctx, 100*time.Millisecond)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitUntilIdle timed out on idle pipeline")
+	}
+}

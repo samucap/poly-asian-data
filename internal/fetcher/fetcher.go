@@ -47,6 +47,7 @@ type Request struct {
 	Headers  map[string]string
 	Body     io.Reader
 	Params   url.Values
+	Metadata map[string]string // Context for processor (e.g. SportSlug)
 }
 
 // Response represents the result of a fetch.
@@ -267,15 +268,18 @@ func (f *Fetcher) BuildNextPageRequest(req *Request, itemCount int) *Request {
 	// Rebuild URL with new offset
 	parsedURL, err := url.Parse(req.URL)
 	if err != nil {
+		f.logger.Error("failed to parse pagination url", slog.String("url", req.URL), slog.String("error", err.Error()))
 		return nil
 	}
 	parsedURL.RawQuery = newParams.Encode()
-
+	
+	// Create next request
 	nextReq := &Request{
-		URL:     parsedURL.String(),
-		Method:  req.Method,
-		Headers: req.Headers,
-		Params:  newParams,
+		URL:      parsedURL.String(),
+		Method:   req.Method,
+		Headers:  req.Headers,
+		Params:   newParams,
+		Metadata: req.Metadata, // Propagate metadata
 	}
 
 	f.logger.Info("built next page request",

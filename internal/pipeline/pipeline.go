@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -107,12 +106,20 @@ func New(ctx context.Context, cfg *config.Config) (*Pipeline, error) {
 	// - Pipeline routes processor output to saver and handles pagination
 	go processorPool.SubscribeToFetcher(pipelineCtx, fetcherPool.Outputs())
 	go p.routeProcessorOutput(pipelineCtx)
+	
+	// - Drain Saver output to prevent deadlock (workers block on full output queue)
+	go func() {
+		for range saverPool.Outputs() {
+			// discard results, maybe log errors if needed?
+			// The saver worker logs failures already.
+		}
+	}()
 
 	return p, nil
 }
 
-// SyncPlyMkt starts the pipeline and waits for it to complete.
-func (p *Pipeline) SyncPlyMkt() {
+// RunSportsTagsSync starts the pipeline and submits initial requests.
+func (p *Pipeline) RunSportsTagsSync() {
 	p.logger.Info("Starting PolyMarket Sync...")
 	
 	plyMktSvc := &services.PlyMktService{
@@ -127,12 +134,92 @@ func (p *Pipeline) SyncPlyMkt() {
 		return
 	}
 
-	for _, req := range reqs {
+	p.logger.Info("DEBUG: Submitting initial requests...")
+	for i, req := range reqs {
+		p.logger.Info("DEBUG: Submitting request", slog.Int("index", i), slog.String("url", req.URL))
 		if err := p.fetcherPool.SubmitAndThenWait(req); err != nil {
 			p.logger.Error("failed to submit req", slog.Any("error", err))
 			return
 		}
 	}
+
+	p.logger.Info("Initial requests submitted. Waiting for pipeline completion...")
+	// Revert to 5s for debugging, 60s is too long for feedback loop
+	p.WaitUntilIdle(p.ctx, 5*time.Second)
+	p.logger.Info("DEBUG: WaitUntilIdle returned. Printing final report...")
+	p.PrintFinalReport()
+	p.StopNow()
+}
+
+// WaitUntilIdle blocks until the pipeline is idle for the specified duration.
+func (p *Pipeline) WaitUntilIdle(ctx context.Context, stableDuration time.Duration) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	stableSince := time.Time{}
+	isStable := false
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			//p.logger.Info("DEBUG: Ticker fired. Checking idle status...")
+			stats := p.Stats()
+			
+			// Check if all stages are idle (Submitted == Completed + Failed)
+			// Note: We check Pending (Implied)
+			// Fetcher
+			fPending := stats.Fetcher.Submitted - (stats.Fetcher.Completed + stats.Fetcher.Failed)
+			// Processor
+			pPending := stats.Processor.Submitted - (stats.Processor.Completed + stats.Processor.Failed)
+			// Saver
+			sPending := stats.Saver.RecordsSubmitted - (stats.Saver.RecordsSaved + stats.Saver.RecordsFailed)
+
+			idle := fPending == 0 && pPending == 0 && sPending == 0
+
+			if idle {
+				if !isStable {
+					stableSince = time.Now()
+					isStable = true
+				} else {
+					if time.Since(stableSince) >= stableDuration {
+						p.cancel()
+						p.StopNow()
+						return
+					}
+				}
+			} else {
+				isStable = false
+			}
+		}
+	}
+}
+
+// PrintFinalReport logs a summary of the pipeline execution.
+func (p *Pipeline) PrintFinalReport() {
+	stats := p.Stats()
+	p.logger.Info("==================================================")
+	p.logger.Info("           PIPELINE END REPORT                  ")
+	p.logger.Info("==================================================")
+	p.logger.Info("Execution Time", slog.Duration("duration", stats.UptimeDuration))
+	p.logger.Info("--------------------------------------------------")
+	p.logger.Info("Fetcher Stats:")
+	p.logger.Info("  Submitted :", slog.Int64("count", stats.Fetcher.Submitted))
+	p.logger.Info("  Completed :", slog.Int64("count", stats.Fetcher.Completed))
+	p.logger.Info("  Failed    :", slog.Int64("count", stats.Fetcher.Failed))
+	p.logger.Info("--------------------------------------------------")
+	p.logger.Info("Processor Stats:")
+	p.logger.Info("  Submitted :", slog.Int64("count", stats.Processor.Submitted))
+	p.logger.Info("  Completed :", slog.Int64("count", stats.Processor.Completed))
+	p.logger.Info("  Failed    :", slog.Int64("count", stats.Processor.Failed))
+	p.logger.Info("--------------------------------------------------")
+	p.logger.Info("Saver Stats:")
+	p.logger.Info("  Submitted :", slog.Int64("count", stats.Saver.RecordsSubmitted))
+	p.logger.Info("  Saved     :", slog.Int64("count", stats.Saver.RecordsSaved))
+	p.logger.Info("  Failed    :", slog.Int64("count", stats.Saver.RecordsFailed))
+	p.logger.Info("  Rows      :", slog.Int64("count", stats.Saver.RowsAffected))
+	p.logger.Info("==================================================")
 }
 
 // routeProcessorOutput reads from processor output and routes data to saver
@@ -149,26 +236,55 @@ func (p *Pipeline) routeProcessorOutput(ctx context.Context) {
 			}
 			output := result.Value
 
-			// Route to saver
-			record := &saver.Record{
-				ID:          output.ID,
-				TableName:   p.resolveTableName(output),
-				Data:        output.Data,
-				ItemCount:   output.ItemCount,
-				ProcessedAt: output.ProcessedAt,
-			}
-			if err := p.saverPool.SubmitAndThenWait(record); err != nil {
-				p.logger.Warn("failed to submit to saver", slog.String("error", err.Error()))
+			// 1. Route Saver Payloads
+			for _, payload := range output.SaverPayloads {
+				record := &saver.Record{
+					ID:          output.ID, // Use original ID or generate new? Using batch ID is fine.
+					TableName:   payload.TableName,
+					Data:        payload.Data,
+					// ItemCount is for the whole batch, but here we split. 
+					// Ideally we track count per payload but let's use batch count for approximation or 0.
+					ItemCount:   output.ItemCount, 
+					ProcessedAt: output.ProcessedAt,
+				}
+				
+				// If queue full or other error, handle async to avoid blocking the reader
+				// Log warning if it's not just queue full? 
+				// workerpool.Submit returns ErrQueueFull.
+				go func() {
+					payloadCopy := record // Escape closure capture issue
+					if err := p.saverPool.SubmitAndThenWait(payloadCopy); err != nil {
+						p.logger.Warn("failed to submit to saver (async)", slog.String("error", err.Error()))
+					}
+				}()
 			}
 
-			// Check if pagination should continue (fetcher handles the logic)
+			// 2. Route Derived Requests (e.g. Events for Sports)
+			for _, req := range output.DerivedRequests {
+				reqCopy := req
+				// Launch in goroutine to avoid blocking the router loop (deadlock prevention)
+				go func(r *fetcher.Request) {
+					if err := p.fetcherPool.SubmitAndThenWait(r); err != nil {
+						p.logger.Warn("failed to submit derived request (async)", 
+							slog.String("url", r.URL),
+							slog.String("error", err.Error()),
+						)
+					}
+				}(reqCopy)
+			}
+
+			// 3. Check if pagination should continue (fetcher handles the logic)
+			// Only for the Original Request
 			if nextReq := p.fetcherPool.BuildNextPageRequest(output.OriginalRequest, output.ItemCount); nextReq != nil {
-				if err := p.fetcherPool.SubmitAndThenWait(nextReq); err != nil {
-					p.logger.Warn("failed to submit next page request",
-						slog.String("url", nextReq.URL),
-						slog.String("error", err.Error()),
-					)
-				}
+				// Launch in goroutine
+				go func(r *fetcher.Request) {
+					if err := p.fetcherPool.SubmitAndThenWait(r); err != nil {
+						p.logger.Warn("failed to submit next page request (async)",
+							slog.String("url", r.URL),
+							slog.String("error", err.Error()),
+						)
+					}
+				}(nextReq)
 			}
 		case <-ctx.Done():
 			return
@@ -227,20 +343,4 @@ func (p *Pipeline) StopNow() {
 	p.processorPool.StopNow()
 	p.saverPool.StopNow()
 	p.saverPool.Close()
-}
-
-// resolveTableName determines the table name from processor output.
-func (p *Pipeline) resolveTableName(output *processor.Output) string {
-	if output == nil || output.OriginalRequest == nil {
-		return ""
-	}
-	url := output.OriginalRequest.URL
-	switch {
-	case strings.Contains(url, "/sports"):
-		return "sport"
-	case strings.Contains(url, "/teams"):
-		return "team"
-	default:
-		return ""
-	}
 }

@@ -27,3 +27,6 @@ coverage.out
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+gocache
+.cache

@@ -471,6 +471,7 @@ type PlyMktTeam struct {
 	SportID      string
 }
 
+// PlyMktSport represents an item from the /sports API (Leagues)
 type PlyMktSport struct {
 	Sport      string `json:"sport"`
 	Image      string `json:"image"`
@@ -479,7 +480,15 @@ type PlyMktSport struct {
 	Tags       string `json:"tags"`
 	Series     string `json:"series"`
 	Slug       string `json:"slug"`
+	SportSlug  string // The parent Sport Category Slug
 	SportID    string
+}
+
+// PlyMktSportCategory represents a row in the 'sports' table (Categories like Football, Basketball)
+type PlyMktSportCategory struct {
+	Slug         string
+	PrimaryTagID string
+	ID           string
 }
 
 type sportsTarget struct {
@@ -514,18 +523,17 @@ func (ply *PlyMktService) GetSportsReqs(ctx context.Context) ([]*fetcher.Request
 		return nil, err
 	}
 
-	defaultLimit := "10"
-	defaultOffset := "0"
+	limit := 500
+	defaultOffset := 0
 	targets := map[string]sportsTarget{
+		"tags": {
+			path: "/tags",
+		},
 		"sports": {
 			path: "/sports",
 		},
 		"teams": {
 			path: "/teams",
-			params: map[string]string{
-				"limit":  defaultLimit,
-				"offset": defaultOffset,
-			},
 		},
 	}
 
@@ -533,9 +541,14 @@ func (ply *PlyMktService) GetSportsReqs(ctx context.Context) ([]*fetcher.Request
 
 	for _, target := range targets {
 		currQuery := url.Values{}
-		for param, val := range target.params {
-			currQuery.Add(param, val)
+		if target.path == "/tags" {
+			limit = 300
+		} else if target.path == "/teams" {
+			limit = 500
 		}
+
+		currQuery.Add("limit", fmt.Sprintf("%d", limit))
+		currQuery.Add("offset", fmt.Sprintf("%d", defaultOffset))
 		fullURL := baseUrl.JoinPath(target.path)
 		fullURL.RawQuery = currQuery.Encode()
 
@@ -546,6 +559,7 @@ func (ply *PlyMktService) GetSportsReqs(ctx context.Context) ([]*fetcher.Request
 			Params:  fullURL.Query(),
 		}
 		reqs = append(reqs, r)
+		defaultOffset += limit
 	}
 
 	return reqs, nil

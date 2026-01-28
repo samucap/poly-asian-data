@@ -47,15 +47,17 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	go func() {
-		plyMktPipeline, err := pipeline.New(ctx, cfg)
-		if err != nil {
-			logging.Error("Failed to create pipeline", slog.Any("error", err))
-			os.Exit(1)
-		}
-		plyMktPipeline.SyncPlyMkt()
-	}()
+	go sportsTagsSync(ctx, cfg)
 
 	<-sigChan
 	logging.Info("Shutdown signal received. Exiting...")
+}
+
+func sportsTagsSync(ctx context.Context, cfg *config.Config) {
+	plyMktPipeline, err := pipeline.New(ctx, cfg)
+	if err != nil {
+		logging.Error("Failed to create pipeline", slog.Any("error", err))
+		os.Exit(1)
+	}
+	plyMktPipeline.RunSportsTagsSync()
 }
