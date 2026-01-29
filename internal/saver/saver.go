@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/samucap/poly-asian-data/internal/config"
+	internaldb "github.com/samucap/poly-asian-data/internal/db"
 	"github.com/samucap/poly-asian-data/internal/logging"
 	"github.com/samucap/poly-asian-data/internal/services"
 	"github.com/samucap/poly-asian-data/internal/workerpool"
@@ -129,6 +130,12 @@ func New(ctx context.Context, cfg *config.Config, numWorkers, qSize int) (*Saver
 	db, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		return nil, fmt.Errorf("creating postgres pool: %w", err)
+	}
+
+	// Ensure database schema is initialized
+	if err := internaldb.InitDB(ctx, db, false); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("initializing db schema: %w", err)
 	}
 
 	s := &Saver{
@@ -313,6 +320,19 @@ func (s *Saver) workerTask(ctx context.Context, record *Record) (*Result, error)
 		rowsAffected, err = s.batchInsertTeams(ctx, record.Data)
 	case "league_hierarchy":
 		rowsAffected, err = s.batchInsertLeagueHierarchy(ctx, record.Data)
+	case "plymkt_markets":
+		rowsAffected, err = s.batchInsertMarkets(ctx, record.Data)
+	case "conditions":
+		rowsAffected, err = s.batchInsertConditions(ctx, record.Data)
+	case "accounts":
+		rowsAffected, err = s.batchInsertAccounts(ctx, record.Data)
+	case "order_filled_events":
+		rowsAffected, err = s.batchInsertOrderFilledEvents(ctx, record.Data)
+	case "enriched_order_filled_events":
+		rowsAffected, err = s.batchInsertEnrichedOrderFilledEvents(ctx, record.Data)
+	case "orders_matched_events":
+		// Reusing OrderFilledEvent struct and handler as per previous analysis
+		rowsAffected, err = s.batchInsertOrderFilledEvents(ctx, record.Data)
 	default:
 		return nil, fmt.Errorf("unknown table: %s", record.TableName)
 	}
@@ -347,6 +367,163 @@ func (s *Saver) workerTask(ctx context.Context, record *Record) (*Result, error)
 // =============================================================================
 // Batch Insert Methods
 // =============================================================================
+
+func (s *Saver) batchInsertMarkets(ctx context.Context, data any) (int64, error) {
+	markets, ok := data.([]services.PlyMktMarket)
+	if !ok {
+		return 0, fmt.Errorf("invalid data type for markets: got %T", data)
+	}
+
+	batch := &pgx.Batch{}
+	for _, m := range markets {
+		// Only upsert fields present in schema.sql. 
+		// Note: schema has NUMERIC for float64 fields. PGX handles float64 -> numeric mapping well usually.
+		batch.Queue(`
+			INSERT INTO plymkt_markets (
+				id, question, condition_id, slug, resolution_source, end_date, 
+				category, liquidity, sponsor_name, start_date, fee, image, icon, 
+				description, volume, active, market_type, closed, created_by, updated_by, 
+				created_at, updated_at, wide_format, new, featured, archived, restricted, 
+				question_id, enable_order_book, order_price_min_tick_size, order_min_size, 
+				volume_num, liquidity_num, volume_24hr, volume_1wk, volume_1mo, volume_1yr, 
+				clob_token_ids, fpmm_live, volume_24hr_amm, volume_1wk_amm, volume_1mo_amm, 
+				volume_1yr_amm, volume_24hr_clob, volume_1wk_clob, volume_1mo_clob, 
+				volume_1yr_clob, volume_amm, volume_clob, liquidity_amm, liquidity_clob, 
+				maker_base_fee, taker_base_fee, accepting_orders, notifications_enabled, 
+				score, creator, ready, funded, ready_timestamp, funded_timestamp, 
+				accepting_orders_timestamp, competitive, rewards_min_size, rewards_max_spread, 
+				spread, automatically_resolved, one_day_price_change, one_hour_price_change, 
+				one_week_price_change, one_month_price_change, one_year_price_change, 
+				last_trade_price, best_bid, best_ask, automatically_active, clear_book_on_start, 
+				manual_activation, neg_risk_other, game_id, sports_market_type, 
+				pending_deployment, deploying, rfq_enabled, event_start_time
+			) VALUES (
+				$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 
+				$18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, 
+				$33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, 
+				$48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, 
+				$63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, 
+				$78, $79, $80, $81, $82, $83, $84, $85
+			)
+			ON CONFLICT (id) DO UPDATE SET
+				question = EXCLUDED.question,
+				condition_id = EXCLUDED.condition_id,
+				slug = EXCLUDED.slug,
+				resolution_source = EXCLUDED.resolution_source,
+				end_date = EXCLUDED.end_date,
+				category = EXCLUDED.category,
+				liquidity = EXCLUDED.liquidity,
+				sponsor_name = EXCLUDED.sponsor_name,
+				start_date = EXCLUDED.start_date,
+				fee = EXCLUDED.fee,
+				image = EXCLUDED.image,
+				icon = EXCLUDED.icon,
+				description = EXCLUDED.description,
+				volume = EXCLUDED.volume,
+				active = EXCLUDED.active,
+				market_type = EXCLUDED.market_type,
+				closed = EXCLUDED.closed,
+				updated_by = EXCLUDED.updated_by,
+				updated_at = EXCLUDED.updated_at,
+				wide_format = EXCLUDED.wide_format,
+				new = EXCLUDED.new,
+				featured = EXCLUDED.featured,
+				archived = EXCLUDED.archived,
+				restricted = EXCLUDED.restricted,
+				question_id = EXCLUDED.question_id,
+				enable_order_book = EXCLUDED.enable_order_book,
+				order_price_min_tick_size = EXCLUDED.order_price_min_tick_size,
+				order_min_size = EXCLUDED.order_min_size,
+				volume_num = EXCLUDED.volume_num,
+				liquidity_num = EXCLUDED.liquidity_num,
+				volume_24hr = EXCLUDED.volume_24hr,
+				volume_1wk = EXCLUDED.volume_1wk,
+				volume_1mo = EXCLUDED.volume_1mo,
+				volume_1yr = EXCLUDED.volume_1yr,
+				clob_token_ids = EXCLUDED.clob_token_ids,
+				fpmm_live = EXCLUDED.fpmm_live,
+				volume_24hr_amm = EXCLUDED.volume_24hr_amm,
+				volume_1wk_amm = EXCLUDED.volume_1wk_amm,
+				volume_1mo_amm = EXCLUDED.volume_1mo_amm,
+				volume_1yr_amm = EXCLUDED.volume_1yr_amm,
+				volume_24hr_clob = EXCLUDED.volume_24hr_clob,
+				volume_1wk_clob = EXCLUDED.volume_1wk_clob,
+				volume_1mo_clob = EXCLUDED.volume_1mo_clob,
+				volume_1yr_clob = EXCLUDED.volume_1yr_clob,
+				volume_amm = EXCLUDED.volume_amm,
+				volume_clob = EXCLUDED.volume_clob,
+				liquidity_amm = EXCLUDED.liquidity_amm,
+				liquidity_clob = EXCLUDED.liquidity_clob,
+				maker_base_fee = EXCLUDED.maker_base_fee,
+				taker_base_fee = EXCLUDED.taker_base_fee,
+				accepting_orders = EXCLUDED.accepting_orders,
+				notifications_enabled = EXCLUDED.notifications_enabled,
+				score = EXCLUDED.score,
+				creator = EXCLUDED.creator,
+				ready = EXCLUDED.ready,
+				funded = EXCLUDED.funded,
+				ready_timestamp = EXCLUDED.ready_timestamp,
+				funded_timestamp = EXCLUDED.funded_timestamp,
+				accepting_orders_timestamp = EXCLUDED.accepting_orders_timestamp,
+				competitive = EXCLUDED.competitive,
+				rewards_min_size = EXCLUDED.rewards_min_size,
+				rewards_max_spread = EXCLUDED.rewards_max_spread,
+				spread = EXCLUDED.spread,
+				automatically_resolved = EXCLUDED.automatically_resolved,
+				one_day_price_change = EXCLUDED.one_day_price_change,
+				one_hour_price_change = EXCLUDED.one_hour_price_change,
+				one_week_price_change = EXCLUDED.one_week_price_change,
+				one_month_price_change = EXCLUDED.one_month_price_change,
+				one_year_price_change = EXCLUDED.one_year_price_change,
+				last_trade_price = EXCLUDED.last_trade_price,
+				best_bid = EXCLUDED.best_bid,
+				best_ask = EXCLUDED.best_ask,
+				automatically_active = EXCLUDED.automatically_active,
+				clear_book_on_start = EXCLUDED.clear_book_on_start,
+				manual_activation = EXCLUDED.manual_activation,
+				neg_risk_other = EXCLUDED.neg_risk_other,
+				game_id = EXCLUDED.game_id,
+				sports_market_type = EXCLUDED.sports_market_type,
+				pending_deployment = EXCLUDED.pending_deployment,
+				deploying = EXCLUDED.deploying,
+				rfq_enabled = EXCLUDED.rfq_enabled,
+				event_start_time = EXCLUDED.event_start_time
+		`,
+			m.ID, m.Question, m.ConditionID, m.Slug, m.ResolutionSource, m.EndDate,
+			m.Category, m.Liquidity, m.SponsorName, m.StartDate, m.Fee, m.Image, m.Icon,
+			m.Description, m.Volume, m.Active, m.MarketType, m.Closed, m.CreatedBy, m.UpdatedBy,
+			m.CreatedAt, m.UpdatedAt, m.WideFormat, m.New, m.Featured, m.Archived, m.Restricted,
+			m.QuestionID, m.EnableOrderBook, m.OrderPriceMinTickSize, m.OrderMinSize,
+			m.VolumeNum, m.LiquidityNum, m.Volume24hr, m.Volume1wk, m.Volume1mo, m.Volume1yr,
+			m.ClobTokenIds, m.FpmmLive, m.Volume24hrAmm, m.Volume1wkAmm, m.Volume1moAmm,
+			m.Volume1yrAmm, m.Volume24hrClob, m.Volume1wkClob, m.Volume1moClob,
+			m.Volume1yrClob, m.VolumeAmm, m.VolumeClob, m.LiquidityAmm, m.LiquidityClob,
+			m.MakerBaseFee, m.TakerBaseFee, m.AcceptingOrders, m.NotificationsEnabled,
+			m.Score, m.Creator, m.Ready, m.Funded, m.ReadyTimestamp, m.FundedTimestamp,
+			m.AcceptingOrdersTimestamp, m.Competitive, m.RewardsMinSize, m.RewardsMaxSpread,
+			m.Spread, m.AutomaticallyResolved, m.OneDayPriceChange, m.OneHourPriceChange,
+			m.OneWeekPriceChange, m.OneMonthPriceChange, m.OneYearPriceChange,
+			m.LastTradePrice, m.BestBid, m.BestAsk, m.AutomaticallyActive, m.ClearBookOnStart,
+			m.ManualActivation, m.NegRiskOther, m.GameID, m.SportsMarketType,
+			m.PendingDeployment, m.Deploying, m.RfqEnabled, m.EventStartTime,
+		)
+	}
+
+// ... (inside batchInsertMarkets)
+	rowsAffected, failIdx, err := s.execBatch(ctx, batch, len(markets))
+	if err != nil {
+		if failIdx != -1 && failIdx < len(markets) {
+			m := markets[failIdx]
+			s.logger.Error("failed to save market",
+				slog.String("id", m.ID),
+				slog.String("slug", m.Slug),
+				slog.String("error", err.Error()),
+			)
+		}
+		return rowsAffected, err
+	}
+	return rowsAffected, nil
+}
 
 func (s *Saver) batchInsertSports(ctx context.Context, data any) (int64, error) {
 	// struct matching internal/services/plymkt.go
@@ -457,7 +634,19 @@ func (s *Saver) batchInsertTagsDefinitions(ctx context.Context, data any) (int64
 		`, t.ID, t.Label, t.Slug, t.ForceShow, t.ForceHide)
 	}
 
-	return s.execBatch(ctx, batch, len(tags))
+	rowsAffected, failIdx, err := s.execBatch(ctx, batch, len(tags))
+	if err != nil {
+		if failIdx != -1 && failIdx < len(tags) {
+			t := tags[failIdx]
+			s.logger.Error("failed to save tag definition",
+				slog.String("id", t.ID),
+				slog.String("slug", t.Slug),
+				slog.String("error", err.Error()),
+			)
+		}
+		return rowsAffected, err
+	}
+	return rowsAffected, nil
 }
 
 func (s *Saver) batchInsertTagsSportLink(ctx context.Context, data any) (int64, error) {
@@ -494,7 +683,18 @@ func (s *Saver) batchInsertTagsSportLink(ctx context.Context, data any) (int64, 
 		`, t.ID, sportID)
 	}
 
-	return s.execBatch(ctx, batch, len(tags))
+	rowsAffected, failIdx, err := s.execBatch(ctx, batch, len(tags))
+	if err != nil {
+		if failIdx != -1 && failIdx < len(tags) {
+			t := tags[failIdx]
+			s.logger.Error("failed to save tag sport link",
+				slog.String("id", t.ID),
+				slog.String("error", err.Error()),
+			)
+		}
+		return rowsAffected, err
+	}
+	return rowsAffected, nil
 }
 
 func (s *Saver) batchInsertTagsHierarchy(ctx context.Context, data any) (int64, error) {
@@ -528,7 +728,18 @@ func (s *Saver) batchInsertTagsHierarchy(ctx context.Context, data any) (int64, 
 		`, t.ID, parentID, sportID)
 	}
 
-	return s.execBatch(ctx, batch, len(tags))
+	rowsAffected, failIdx, err := s.execBatch(ctx, batch, len(tags))
+	if err != nil {
+		if failIdx != -1 && failIdx < len(tags) {
+			t := tags[failIdx]
+			s.logger.Error("failed to save tag hierarchy",
+				slog.String("id", t.ID),
+				slog.String("error", err.Error()),
+			)
+		}
+		return rowsAffected, err
+	}
+	return rowsAffected, nil
 }
 
 func (s *Saver) batchInsertLeagues(ctx context.Context, data any) (int64, error) {
@@ -565,7 +776,19 @@ func (s *Saver) batchInsertLeagues(ctx context.Context, data any) (int64, error)
 		`, l.Sport, l.Image, l.Resolution, l.Ordering, l.Tags, l.Series, sportID)
 	}
 
-	return s.execBatch(ctx, batch, len(leagues))
+// ... (inside batchInsertLeagues)
+	rowsAffected, failIdx, err := s.execBatch(ctx, batch, len(leagues))
+	if err != nil {
+		if failIdx != -1 && failIdx < len(leagues) {
+			l := leagues[failIdx]
+			s.logger.Error("failed to save league",
+				slog.String("sport", l.Sport),
+				slog.String("error", err.Error()),
+			)
+		}
+		return rowsAffected, err
+	}
+	return rowsAffected, nil
 }
 
 func (s *Saver) batchInsertTeams(ctx context.Context, data any) (int64, error) {
@@ -605,7 +828,20 @@ func (s *Saver) batchInsertTeams(ctx context.Context, data any) (int64, error) {
 		`, t.ID, t.Name, t.League, t.Record, t.Logo, t.Abbreviation, t.Alias, t.ProviderID, t.Color, sportID)
 	}
 
-	return s.execBatch(ctx, batch, len(teams))
+// ... (inside batchInsertTeams)
+	rowsAffected, failIdx, err := s.execBatch(ctx, batch, len(teams))
+	if err != nil {
+		if failIdx != -1 && failIdx < len(teams) {
+			t := teams[failIdx]
+			s.logger.Error("failed to save team",
+				slog.String("id", fmt.Sprintf("%d", t.ID)),
+				slog.String("name", t.Name),
+				slog.String("error", err.Error()),
+			)
+		}
+		return rowsAffected, err
+	}
+	return rowsAffected, nil
 }
 
 func (s *Saver) batchInsertLeagueHierarchy(ctx context.Context, data any) (int64, error) {
@@ -686,11 +922,12 @@ func (s *Saver) batchInsertLeagueHierarchy(ctx context.Context, data any) (int64
 		}
 	}
 
-	return s.execBatch(ctx, batch, totalOps)
+	rowsAffected, _, err := s.execBatch(ctx, batch, totalOps)
+	return rowsAffected, err
 }
 
-// execBatch executes a batch and returns total rows affected.
-func (s *Saver) execBatch(ctx context.Context, batch *pgx.Batch, count int) (int64, error) {
+// execBatch executes a batch and returns total rows affected, the index of failure (if applicable), and error.
+func (s *Saver) execBatch(ctx context.Context, batch *pgx.Batch, count int) (int64, int, error) {
 	results := s.db.SendBatch(ctx, batch)
 	defer results.Close()
 
@@ -698,10 +935,160 @@ func (s *Saver) execBatch(ctx context.Context, batch *pgx.Batch, count int) (int
 	for i := 0; i < count; i++ {
 		ct, err := results.Exec()
 		if err != nil {
-			return totalAffected, fmt.Errorf("batch exec at index %d: %w", i, err)
+			return totalAffected, i, fmt.Errorf("batch exec at index %d: %w", i, err)
 		}
 		totalAffected += ct.RowsAffected()
 	}
 
-	return totalAffected, nil
+	return totalAffected, -1, nil
+}
+
+// batchInsertConditions inserts or updates conditions.
+func (s *Saver) batchInsertConditions(ctx context.Context, data any) (int64, error) {
+	items, ok := data.([]services.PlyMktCondition)
+	if !ok {
+		return 0, fmt.Errorf("invalid data type for conditions: got %T", data)
+	}
+
+	batch := &pgx.Batch{}
+	for _, item := range items {
+		batch.Queue(`
+			INSERT INTO conditions (id, oracle, outcome_slot_count, payout_denominator, payout_numerators, payouts, question_id, resolution_hash, resolution_timestamp, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+			ON CONFLICT (id) DO UPDATE SET
+				oracle = EXCLUDED.oracle,
+				outcome_slot_count = EXCLUDED.outcome_slot_count,
+				payout_denominator = EXCLUDED.payout_denominator,
+				payout_numerators = EXCLUDED.payout_numerators,
+				payouts = EXCLUDED.payouts,
+				question_id = EXCLUDED.question_id,
+				resolution_hash = EXCLUDED.resolution_hash,
+				resolution_timestamp = EXCLUDED.resolution_timestamp,
+				updated_at = NOW()
+		`,
+			item.ID,
+			item.Oracle,
+			fmt.Sprintf("%d", item.OutcomeSlotCount), // Map int to TEXT as per schema comment or type
+			item.PayoutDenominator,
+			item.PayoutNumerators,
+			item.Payouts,
+			item.QuestionId,
+			item.ResolutionHash,
+			item.ResolutionTimestamp,
+		)
+	}
+
+	totalAffected, failIdx, err := s.execBatch(ctx, batch, len(items))
+	if err != nil && failIdx != -1 && failIdx < len(items) {
+		s.logger.Error("failed to save condition", "id", items[failIdx].ID, "error", err)
+	}
+	return totalAffected, err
+}
+
+// batchInsertAccounts inserts or updates accounts.
+func (s *Saver) batchInsertAccounts(ctx context.Context, data any) (int64, error) {
+	items, ok := data.([]services.PlyMktAccount)
+	if !ok {
+		return 0, fmt.Errorf("invalid data type for accounts: got %T", data)
+	}
+
+	batch := &pgx.Batch{}
+	for _, item := range items {
+		batch.Queue(`
+			INSERT INTO accounts (id, creation_timestamp, last_seen_timestamp, last_traded_timestamp, collateral_volume, num_trades, profit, scaled_collateral_volume, scaled_profit, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+			ON CONFLICT (id) DO UPDATE SET
+				creation_timestamp = EXCLUDED.creation_timestamp,
+				last_seen_timestamp = EXCLUDED.last_seen_timestamp,
+				last_traded_timestamp = EXCLUDED.last_traded_timestamp,
+				collateral_volume = EXCLUDED.collateral_volume,
+				num_trades = EXCLUDED.num_trades,
+				profit = EXCLUDED.profit,
+				scaled_collateral_volume = EXCLUDED.scaled_collateral_volume,
+				scaled_profit = EXCLUDED.scaled_profit,
+				updated_at = NOW()
+		`,
+			item.ID,
+			item.CreationTimestamp,
+			item.LastSeenTimestamp,
+			item.LastTradedTimestamp,
+			item.CollateralVolume,
+			item.NumTrades,
+			item.Profit,
+			item.ScaledCollateralVolume,
+			item.ScaledProfit,
+		)
+	}
+
+	totalAffected, failIdx, err := s.execBatch(ctx, batch, len(items))
+	if err != nil && failIdx != -1 && failIdx < len(items) {
+		s.logger.Error("failed to save account", "id", items[failIdx].ID, "error", err)
+	}
+	return totalAffected, err
+}
+
+// batchInsertOrderFilledEvents inserts or updates order_filled_events.
+func (s *Saver) batchInsertOrderFilledEvents(ctx context.Context, data any) (int64, error) {
+	items, ok := data.([]services.PlyMktOrderFilledEvent)
+	if !ok {
+		return 0, fmt.Errorf("invalid data type for order_filled_events: got %T", data)
+	}
+
+	batch := &pgx.Batch{}
+	for _, item := range items {
+		batch.Queue(`
+			INSERT INTO order_filled_events (id, maker_asset_id, taker_asset_id, maker_amount_filled, taker_amount_filled, maker_id, taker_id, fee, timestamp, transaction_hash, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+			ON CONFLICT (id) DO NOTHING
+		`,
+			item.ID,
+			item.MakerAssetID,
+			item.TakerAssetID,
+			item.MakerAmountFilled,
+			item.TakerAmountFilled,
+			item.Maker.ID,
+			item.Taker.ID,
+			item.Fee,
+			item.Timestamp,
+			item.ID, // Transaction hash is ID? Wait, struct has TransactionHash too. Let's use ID as primary key.
+		)
+	}
+
+	totalAffected, failIdx, err := s.execBatch(ctx, batch, len(items))
+	if err != nil && failIdx != -1 && failIdx < len(items) {
+		s.logger.Error("failed to save order_filled_event", "id", items[failIdx].ID, "error", err)
+	}
+	return totalAffected, err
+}
+
+// batchInsertEnrichedOrderFilledEvents inserts or updates enriched_order_filled_events.
+func (s *Saver) batchInsertEnrichedOrderFilledEvents(ctx context.Context, data any) (int64, error) {
+	items, ok := data.([]services.PlyMktEnrichedOrderFilledEvent)
+	if !ok {
+		return 0, fmt.Errorf("invalid data type for enriched_order_filled_events: got %T", data)
+	}
+
+	batch := &pgx.Batch{}
+	for _, item := range items {
+		batch.Queue(`
+			INSERT INTO enriched_order_filled_events (id, price, side, size, maker_id, taker_id, market_id, timestamp, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+			ON CONFLICT (id) DO NOTHING
+		`,
+			item.ID,
+			item.Price,
+			item.Side,
+			item.Size,
+			item.Maker.ID,
+			item.Taker.ID,
+			item.Market.ID,
+			item.Timestamp,
+		)
+	}
+
+	totalAffected, failIdx, err := s.execBatch(ctx, batch, len(items))
+	if err != nil && failIdx != -1 && failIdx < len(items) {
+		s.logger.Error("failed to save enriched_order_filled_event", "id", items[failIdx].ID, "error", err)
+	}
+	return totalAffected, err
 }

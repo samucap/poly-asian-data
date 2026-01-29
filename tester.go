@@ -52,7 +52,7 @@ func main() {
 
 	// 2. Fetch All Data first
 	start := time.Now()
-	
+
 	// Define Sport Categories
 	slugs := []string{
 		"football", "basketball", "hockey", "tennis", "esports", "baseball",
@@ -268,7 +268,7 @@ func main() {
 			for _, t := range sport.RelatedTags {
 				t.SportID = id
 			}
-			// Note: related tags in 'tagsMap' share pointers with 'sport.RelatedTags', 
+			// Note: related tags in 'tagsMap' share pointers with 'sport.RelatedTags',
 			// so they are effectively updated too.
 		} else {
 			fmt.Printf("Warning: Sport %s not found in DB after upsert?\n", slug)
@@ -290,7 +290,7 @@ func main() {
 			pid := t.ParentTagID
 			parentID = &pid
 		}
-		
+
 		batch.Queue(`
 			INSERT INTO tags (id, label, slug, force_show, force_hide, sport_id, parent_tag_id)
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -363,7 +363,7 @@ func main() {
 
 	fmt.Printf("Phase 3: Queueing %d dependent operations (Tags, Leagues, Teams). Executing batch...\n", batch.Len())
 	br := tx.SendBatch(ctx, batch)
-	
+
 	for i := 0; i < batch.Len(); i++ {
 		_, err := br.Exec()
 		if err != nil {
@@ -462,7 +462,7 @@ func createTables(ctx context.Context, db *pgxpool.Pool, drop bool) error {
 		// 3. Triggers
 		`DROP TRIGGER IF EXISTS update_sports_updated_at ON sports;`,
 		`CREATE TRIGGER update_sports_updated_at BEFORE UPDATE ON sports FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();`,
-		
+
 		`DROP TRIGGER IF EXISTS update_tags_updated_at ON tags;`,
 		`CREATE TRIGGER update_tags_updated_at BEFORE UPDATE ON tags FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();`,
 
@@ -675,7 +675,7 @@ func fetchEvents(tagID string) ([]*services.PlyMktEvent, error) {
 		// API usually supports offset.
 		off, _ := strconv.Atoi(params.Get("offset"))
 		params.Set("offset", strconv.Itoa(off+limit))
-		
+
 		// Safety break for testing if too many?
 		// remove break for production-like behavior
 	}

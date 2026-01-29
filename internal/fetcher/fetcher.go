@@ -3,8 +3,10 @@
 package fetcher
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -83,21 +85,31 @@ func New(ctx context.Context, config *config.Config, numWorkers, qSize int) (*Fe
 	}
 
 	f.Pool = pool
+
 	return f, nil
 }
 
 func (f *Fetcher) workerTask(ctx context.Context, req *Request) (*Response, error) {
-	f.logger.Info("fetching url",
+	logAttrs := []any{
 		slog.String("url", req.URL),
-	)
+	}
+	if req.Metadata != nil {
+		if entity, ok := req.Metadata["Entity"]; ok {
+			logAttrs = append(logAttrs, slog.String("entity", entity))
+		}
+		if typ, ok := req.Metadata["Type"]; ok {
+			logAttrs = append(logAttrs, slog.String("type", typ))
+		}
+	}
+
+	f.logger.Info("fetching url", logAttrs...)
 
 	return f.Fetch(ctx, req)
 }
 
 func (f *Fetcher) doRequest(ctx context.Context, httpReq *http.Request) (*Response, error) {
-	// TODO: 1 per host, prolly need to abstract this out
-	httpClient := newSecureHTTPClient()
-	httpResp, err := httpClient.Do(httpReq)
+	// Use the shared http client. The Transport handles connection pooling per host.
+	httpResp, err := f.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, err
 	}
@@ -173,6 +185,13 @@ func (f *Fetcher) Fetch(ctx context.Context, inputReqDetails *Request) (*Respons
 					Request:  inputReqDetails,
 				}, ctx.Err()
 			case <-time.After(delay):
+			}
+
+			// Rewind body if possible for retry
+			if inputReqDetails.Body != nil {
+				if seeker, ok := inputReqDetails.Body.(io.Seeker); ok {
+					seeker.Seek(0, io.SeekStart)
+				}
 			}
 		}
 
@@ -265,13 +284,42 @@ func (f *Fetcher) BuildNextPageRequest(req *Request, itemCount int) *Request {
 	}
 	newParams.Set("offset", newOffset)
 
-	// Rebuild URL with new offset
 	parsedURL, err := url.Parse(req.URL)
 	if err != nil {
 		f.logger.Error("failed to parse pagination url", slog.String("url", req.URL), slog.String("error", err.Error()))
 		return nil
 	}
-	parsedURL.RawQuery = newParams.Encode()
+
+	var newBody io.Reader
+	// If it's a GraphQL request (indicated by GraphqlQuery metadata), regenerate the body
+	// And crucially, DO NOT append query params to the URL (keep it clean)
+	if query, ok := req.Metadata["GraphqlQuery"]; ok {
+		// Construct JSON body with variables
+		bodyData := map[string]any{
+			"query": query,
+			"variables": map[string]int{
+				"first": limit,
+				"skip":  offset + limit,
+			},
+		}
+		b, err := json.Marshal(bodyData)
+		if err == nil {
+			newBody = bytes.NewReader(b)
+		} else {
+            f.logger.Error("failed to marshal graphql body", slog.String("error", err.Error()))
+            return nil
+        }
+	} else {
+		// For standard REST requests, update the URL query params
+		parsedURL.RawQuery = newParams.Encode()
+	}
+		// For standard requests, we might need to reset the body if it was read?
+		// But usually GET params handle pagination.
+		// If it's a POST with a body that stays static, we'd need to re-read it.
+		// `req.Body` is an io.Reader. If it was consumed, we can't reuse it easily unless we buffered it.
+		// However, for standard REST pagination (GET), Body is usually nil.
+		// If we are here, and it's NOT a GraphQL template, we assume standard GET or body is irrelevant/static?
+		// Let's assume standard GET behavior for now unless template is present.
 	
 	// Create next request
 	nextReq := &Request{
@@ -280,6 +328,7 @@ func (f *Fetcher) BuildNextPageRequest(req *Request, itemCount int) *Request {
 		Headers:  req.Headers,
 		Params:   newParams,
 		Metadata: req.Metadata, // Propagate metadata
+		Body:     newBody,
 	}
 
 	f.logger.Info("built next page request",

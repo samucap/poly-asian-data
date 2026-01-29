@@ -6,6 +6,7 @@
 
 # Environment Variables
 .env
+.env_test
 
 # Go
 vendor/

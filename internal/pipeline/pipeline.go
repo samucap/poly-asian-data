@@ -78,7 +78,7 @@ func New(ctx context.Context, cfg *config.Config) (*Pipeline, error) {
 		return nil, err
 	}
 
-	processorPool, err := processor.New(pipelineCtx, cfg.ProcessorCfg.NumWorkers, cfg.ProcessorCfg.Qsize)
+	processorPool, err := processor.New(pipelineCtx, cfg, cfg.ProcessorCfg.NumWorkers, cfg.ProcessorCfg.Qsize)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -151,13 +151,53 @@ func (p *Pipeline) RunSportsTagsSync() {
 	p.StopNow()
 }
 
+// RunSubgraphSync starts the pipeline for subgraph data sync.
+func (p *Pipeline) RunSubgraphSync() {
+	p.logger.Info("Starting Subgraph Sync...")
+
+	plyMktSvc := &services.PlyMktService{
+		Cfg:    p.cfg,
+		Logger: p.logger,
+		Ctx:    p.ctx,
+	}
+
+	reqs, err := plyMktSvc.GetSubgraphReqs(p.ctx)
+	if err != nil {
+		p.logger.Error("failed to get subgraph reqs", slog.Any("error", err))
+		return
+	}
+
+	p.logger.Info("DEBUG: Submitting initial subgraph requests...")
+	for i, req := range reqs {
+		p.logger.Info("DEBUG: Submitting request", slog.Int("index", i), slog.String("url", req.URL))
+		if err := p.fetcherPool.SubmitAndThenWait(req); err != nil {
+			p.logger.Error("failed to submit req", slog.Any("error", err))
+			return
+		}
+	}
+
+	p.logger.Info("Initial subgraph requests submitted. Waiting for pipeline completion...")
+	// Wait responsibly
+	p.WaitUntilIdle(p.ctx, 5*time.Second)
+	p.logger.Info("DEBUG: WaitUntilIdle returned. Printing final report...")
+	p.PrintFinalReport()
+	p.StopNow()
+}
+
 // WaitUntilIdle blocks until the pipeline is idle for the specified duration.
 func (p *Pipeline) WaitUntilIdle(ctx context.Context, stableDuration time.Duration) {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	stableSince := time.Time{}
 	isStable := false
+
+	// Strategic Logging:
+	// 1. Log when entering IDLE state.
+	// 2. Log when leaving IDLE state (Reset).
+	// 3. Log periodically (e.g. every 60s) if active, to show progress.
+	lastLogTime := time.Time{}
+	logInterval := 60 * time.Second
 
 	for {
 		select {
@@ -167,29 +207,71 @@ func (p *Pipeline) WaitUntilIdle(ctx context.Context, stableDuration time.Durati
 			//p.logger.Info("DEBUG: Ticker fired. Checking idle status...")
 			stats := p.Stats()
 			
+			// We must use the WorkerPool stats for Saver pending count, 
+			// because stats.Saver uses custom stats where Saved tracks rows vs Submitted tracks batches (mismatch).
+			// p.saverPool.Stats() returns the underlying workerpool stats (batches).
+			saverStats := p.saverPool.Stats().Snapshot()
+
 			// Check if all stages are idle (Submitted == Completed + Failed)
-			// Note: We check Pending (Implied)
-			// Fetcher
 			fPending := stats.Fetcher.Submitted - (stats.Fetcher.Completed + stats.Fetcher.Failed)
-			// Processor
 			pPending := stats.Processor.Submitted - (stats.Processor.Completed + stats.Processor.Failed)
-			// Saver
-			sPending := stats.Saver.RecordsSubmitted - (stats.Saver.RecordsSaved + stats.Saver.RecordsFailed)
+			sPending := saverStats.Submitted - (saverStats.Completed + saverStats.Failed)
 
 			idle := fPending == 0 && pPending == 0 && sPending == 0
 
+			// Determine if we should log
+			shouldLog := false
+			
+			if idle && !isStable {
+				// Transition to IDLE
+				shouldLog = true
+			} else if !idle && isStable {
+				// Transition to ACTIVE (Reset)
+				shouldLog = true
+			} else if !idle && time.Since(lastLogTime) >= logInterval {
+				// Heartbeat while active
+				shouldLog = true
+			}
+
+			if shouldLog {
+				p.logger.Info("Pipeline Status",
+					// Fetcher
+					slog.Int64("fetcher_submitted", stats.Fetcher.Submitted),
+					slog.Int64("fetcher_completed", stats.Fetcher.Completed),
+					slog.Int64("fetcher_failed", stats.Fetcher.Failed),
+					slog.Int64("fetcher_pending", fPending),
+					// Processor
+					slog.Int64("processor_submitted", stats.Processor.Submitted),
+					slog.Int64("processor_completed", stats.Processor.Completed),
+					slog.Int64("processor_failed", stats.Processor.Failed),
+					slog.Int64("processor_pending", pPending),
+					// Saver
+					slog.Int64("saver_submitted", saverStats.Submitted),
+					slog.Int64("saver_completed", saverStats.Completed),
+					slog.Int64("saver_failed", saverStats.Failed),
+					slog.Int64("saver_pending", sPending),
+					// State
+					slog.Bool("idle", idle),
+					slog.Bool("stable", isStable),
+					slog.Duration("stable_duration", time.Since(stableSince)),
+				)
+				lastLogTime = time.Now()
+			}
+
 			if idle {
 				if !isStable {
+					p.logger.Info("Pipeline state became IDLE. Starting stability timer.")
 					stableSince = time.Now()
 					isStable = true
 				} else {
 					if time.Since(stableSince) >= stableDuration {
-						p.cancel()
-						p.StopNow()
-						return
+						return // Stable for required duration
 					}
 				}
 			} else {
+				if isStable {
+					p.logger.Info("Pipeline stability RESET. Activity detected.")
+				}
 				isStable = false
 			}
 		}
@@ -235,32 +317,42 @@ func (p *Pipeline) routeProcessorOutput(ctx context.Context) {
 				continue // Skip failed processing
 			}
 			output := result.Value
+			if output == nil {
+				p.logger.Warn("processor returned nil output with no error")
+				continue
+			}
 
-			// 1. Route Saver Payloads
-			for _, payload := range output.SaverPayloads {
-				record := &saver.Record{
-					ID:          output.ID, // Use original ID or generate new? Using batch ID is fine.
-					TableName:   payload.TableName,
-					Data:        payload.Data,
-					// ItemCount is for the whole batch, but here we split. 
-					// Ideally we track count per payload but let's use batch count for approximation or 0.
-					ItemCount:   output.ItemCount, 
-					ProcessedAt: output.ProcessedAt,
-				}
-				
-				// If queue full or other error, handle async to avoid blocking the reader
-				// Log warning if it's not just queue full? 
-				// workerpool.Submit returns ErrQueueFull.
-				go func() {
-					payloadCopy := record // Escape closure capture issue
-					if err := p.saverPool.SubmitAndThenWait(payloadCopy); err != nil {
-						p.logger.Warn("failed to submit to saver (async)", slog.String("error", err.Error()))
+			if output.SaverPayloads != nil {
+				// 1. Route Saver Payloads
+				for _, payload := range output.SaverPayloads {
+					record := &saver.Record{
+						ID:          output.ID, // Use original ID or generate new? Using batch ID is fine.
+						TableName:   payload.TableName,
+						Data:        payload.Data,
+						// ItemCount is for the whole batch, but here we split. 
+						// Ideally we track count per payload but let's use batch count for approximation or 0.
+						ItemCount:   output.ItemCount, 
+						ProcessedAt: output.ProcessedAt,
 					}
-				}()
+					
+					// If queue full or other error, handle async to avoid blocking the reader
+					// Log warning if it's not just queue full? 
+					// workerpool.Submit returns ErrQueueFull.
+					go func() {
+						payloadCopy := record // Escape closure capture issue
+						if err := p.saverPool.SubmitAndThenWait(payloadCopy); err != nil {
+							p.logger.Warn("failed to submit to saver (async)", slog.String("error", err.Error()))
+						}
+					}()
+				}
 			}
 
 			// 2. Route Derived Requests (e.g. Events for Sports)
 			for _, req := range output.DerivedRequests {
+				if req == nil {
+					p.logger.Warn("processor returned nil derived request")
+					continue
+				}
 				reqCopy := req
 				// Launch in goroutine to avoid blocking the router loop (deadlock prevention)
 				go func(r *fetcher.Request) {
@@ -273,9 +365,15 @@ func (p *Pipeline) routeProcessorOutput(ctx context.Context) {
 				}(reqCopy)
 			}
 
-			// 3. Check if pagination should continue (fetcher handles the logic)
-			// Only for the Original Request
-			if nextReq := p.fetcherPool.BuildNextPageRequest(output.OriginalRequest, output.ItemCount); nextReq != nil {
+			// 3. Check if pagination should continue
+			var nextReq *fetcher.Request
+			if output.NextPageRequest != nil {
+				nextReq = output.NextPageRequest
+			} else {
+				nextReq = p.fetcherPool.BuildNextPageRequest(output.OriginalRequest, output.ItemCount)
+			}
+
+			if nextReq != nil {
 				// Launch in goroutine
 				go func(r *fetcher.Request) {
 					if err := p.fetcherPool.SubmitAndThenWait(r); err != nil {

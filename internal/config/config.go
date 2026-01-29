@@ -1,6 +1,7 @@
 package config
 
 import (
+	"runtime"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ var DefaultEndpoints = map[string]any{
 		"clob":   "wss://ws-subscriptions-clob.polymarket.com/ws", // Orderbook updates, order status
 		"rtds":   "wss://ws-live-data.polymarket.com",             // Low-latency crypto prices, comments
 	},
+	"subgraph": "https://gateway.thegraph.com/api/subgraphs/id",
 }
 
 // Config holds the application configuration with strict typing.
@@ -58,12 +60,13 @@ type Config struct {
 
 	// Logging
 	LogLevel string `mapstructure:"LOG_LEVEL" validate:"omitempty,oneof=debug info warn error"`
-	Services map[string]SvcProvider
+	Services SvcProvider
 
 	// Pipeline
 	SaverCfg     SaverCfg
 	FetcherCfg   PoolCfg
 	ProcessorCfg PoolCfg
+	SubgraphAPIKey string `mapstructure:"SUBGRAPH_API_KEY" validate:"omitempty"` // Optional or required? User has it in .env
 }
 
 // validate is the singleton validator instance.
@@ -85,12 +88,36 @@ func Load() (*Config, error) {
 	v.SetDefault("Services.PlyMkt.Endpoints", DefaultEndpoints)
 	v.SetDefault("Services.PlyMkt.MaxRetries", 3)
 	v.SetDefault("Services.PlyMkt.RetryDelay", 1*time.Second)
-	v.SetDefault("FetcherCfg.NumWorkers", 2)
-	v.SetDefault("FetcherCfg.Qsize", 10)
-	v.SetDefault("ProcessorCfg.NumWorkers", 2)
-	v.SetDefault("ProcessorCfg.Qsize", 10)
-	v.SetDefault("SaverCfg.NumWorkers", 2)
-	v.SetDefault("SaverCfg.Qsize", 10)
+	// Calculate optimal defaults based on system resources
+	numCPU := runtime.NumCPU()
+
+	// Fetcher: I/O bound (HTTP requests). Can handle high concurrency.
+	// Recommended: 4x Cores. Min: 4.
+	fetcherWorkers := numCPU * 4
+	if fetcherWorkers < 4 {
+		fetcherWorkers = 4
+	}
+
+	// Processor: CPU bound (JSON parsing, logic).
+	// Recommended: 1x Cores. Min: 2.
+	processorWorkers := numCPU
+	if processorWorkers < 2 {
+		processorWorkers = 2
+	}
+
+	// Saver: I/O bound (Database writes), but limited by connection pool often.
+	// Recommended: 2x Cores. Min: 2.
+	saverWorkers := numCPU * 2
+	if saverWorkers < 2 {
+		saverWorkers = 2
+	}
+
+	v.SetDefault("FetcherCfg.NumWorkers", fetcherWorkers)
+	v.SetDefault("FetcherCfg.Qsize", fetcherWorkers*5) // Queue buffer 5x workers
+	v.SetDefault("ProcessorCfg.NumWorkers", processorWorkers)
+	v.SetDefault("ProcessorCfg.Qsize", processorWorkers*5)
+	v.SetDefault("SaverCfg.NumWorkers", saverWorkers)
+	v.SetDefault("SaverCfg.Qsize", saverWorkers*5)
 
 	// Step 3: Bind to environment variables (this gives system ENV priority)
 	//v.AutomaticEnv()
@@ -103,6 +130,10 @@ func Load() (*Config, error) {
 			return nil, &ConfigError{Op: "bind_env", Err: err}
 		}
 	}
+    // Bind nested keys
+    if err := v.BindEnv("Services.PlyMkt.SUBGRAPH_API_KEY", "SUBGRAPH_API_KEY"); err != nil {
+        return nil, &ConfigError{Op: "bind_env_nested", Err: err}
+    }
 
 	// Step 4: Unmarshal into struct
 	var cfg Config

@@ -23,7 +23,7 @@ func main() {
 	}
 	logging.Init(env)
 
-	logging.Info("Starting Poly Asian Data Pipeline...")
+	logging.Info("Starting Poly Asian Data Pipeline (Subgraph Sync)...")
 
 	// Load configuration
 	cfg, err := config.Load()
@@ -35,29 +35,29 @@ func main() {
 	// Re-initialize logger with proper environment from config
 	logging.Init(cfg.ENV)
 
-	// Log startup info (demonstrating redaction)
+	// Log startup info
 	logging.Info("Configuration loaded successfully",
 		slog.String("environment", cfg.ENV),
 		slog.String("log level", cfg.LogLevel),
 	)
 
-	logging.Info("Application initialized. Starting data pipeline...")
+	logging.Info("Application initialized. Starting subgraph sync pipeline...")
 
 	// Graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	go sportsTagsSync(ctx, cfg)
+	go subgraphSync(ctx, cfg)
 
 	<-sigChan
 	logging.Info("Shutdown signal received. Exiting...")
 }
 
-func sportsTagsSync(ctx context.Context, cfg *config.Config) {
+func subgraphSync(ctx context.Context, cfg *config.Config) {
 	plyMktPipeline, err := pipeline.New(ctx, cfg)
 	if err != nil {
 		logging.Error("Failed to create pipeline", slog.Any("error", err))
 		os.Exit(1)
 	}
-	plyMktPipeline.RunSportsTagsSync()
+	plyMktPipeline.RunSubgraphSync()
 }
