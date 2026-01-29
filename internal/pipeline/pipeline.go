@@ -151,6 +151,148 @@ func (p *Pipeline) RunSportsTagsSync() {
 	p.StopNow()
 }
 
+// RunWhaleSync starts the pipeline for the whale tracking sync loop.
+func (p *Pipeline) RunWhaleSync(ctx context.Context) {
+	p.logger.Info("Starting Whale Sync Pipeline...")
+
+	plyMktSvc := &services.PlyMktService{
+		Cfg:    p.cfg,
+		Logger: p.logger,
+		Ctx:    p.ctx,
+	}
+
+	// Tickers
+	discoveryTicker := time.NewTicker(5 * time.Minute)
+	fillsTicker := time.NewTicker(1 * time.Minute)
+	positionsTicker := time.NewTicker(3 * time.Minute) // Every 3 min
+	liveDataTicker := time.NewTicker(1 * time.Minute)
+
+	defer func() {
+		discoveryTicker.Stop()
+		fillsTicker.Stop()
+		positionsTicker.Stop()
+		liveDataTicker.Stop()
+	}()
+
+	// 1. Initial Discovery Run
+	p.runDiscovery(plyMktSvc)
+
+	// Main Loop
+	for {
+		select {
+		case <-ctx.Done():
+			p.logger.Info("Whale Sync context done, stopping...")
+			return
+
+		case <-discoveryTicker.C:
+			p.runDiscovery(plyMktSvc)
+
+		case <-fillsTicker.C:
+			p.runFillsSync(plyMktSvc)
+
+		case <-positionsTicker.C:
+			p.runWhalePositionsSync(plyMktSvc)
+
+		case <-liveDataTicker.C:
+			p.runLiveDataSync(plyMktSvc)
+		}
+	}
+}
+
+func (p *Pipeline) runDiscovery(svc *services.PlyMktService) {
+	p.logger.Info("Running Discovery Phase...")
+	
+	// 1. Fetch Active Events (Discovery)
+	reqs, err := svc.GetDiscoveryReqs(p.ctx)
+	if err != nil {
+		p.logger.Error("failed to get discovery reqs", slog.Any("error", err))
+		return
+	}
+
+	p.logger.Info("Dispatched Discovery requests (Assignments)", slog.Int("count", len(reqs)))
+	for _, req := range reqs {
+		if err := p.fetcherPool.SubmitAndThenWait(req); err != nil {
+			p.logger.Error("failed to submit discovery req", slog.String("url", req.URL), slog.Any("error", err))
+		}
+	}
+}
+
+func (p *Pipeline) runFillsSync(svc *services.PlyMktService) {
+	p.logger.Info("Running Fills Sync Phase...")
+	
+	// Fetch EnrichedOrderFilleds (Global Sync for now)
+	targets := []string{"enrichedOrderFilleds"}
+	reqs, err := svc.GetSubgraphReqs(p.ctx, targets)
+	if err != nil {
+		p.logger.Error("failed to get fills sync reqs", slog.Any("error", err))
+		return
+	}
+
+	p.logger.Info("Dispatched Fills Sync requests", slog.Int("count", len(reqs)))
+	for _, req := range reqs {
+		if err := p.fetcherPool.SubmitAndThenWait(req); err != nil {
+			p.logger.Error("failed to submit fills req", slog.String("url", req.URL), slog.Any("error", err))
+		}
+	}
+}
+
+func (p *Pipeline) runWhalePositionsSync(svc *services.PlyMktService) {
+	p.logger.Info("Running Whale Positions Sync Phase...")
+	// TODO: Filter by specific whale addresses in a real scenario
+	// For now, sync all user positions or a subset to discover whales
+	targets := []string{"userPositions"}
+	reqs, err := svc.GetSubgraphReqs(p.ctx, targets)
+	if err != nil {
+		p.logger.Error("failed to get position sync reqs", slog.Any("error", err))
+		return
+	}
+
+	p.logger.Info("Dispatched Whale Positions requests", slog.Int("count", len(reqs)))
+	for _, req := range reqs {
+		if err := p.fetcherPool.SubmitAndThenWait(req); err != nil {
+			p.logger.Error("failed to submit position req", slog.String("url", req.URL), slog.Any("error", err))
+		}
+	}
+}
+
+func (p *Pipeline) runLiveDataSync(svc *services.PlyMktService) {
+	p.logger.Info("Running Live Data Sync Phase (Prices History)")
+
+	// 1. Get Active Tokens
+	tokenIDs, err := p.saverPool.GetActiveTokenIDs(p.ctx)
+	if err != nil {
+		p.logger.Error("failed to get active active token IDs", slog.Any("error", err))
+		return
+	}
+	// Limit just in case
+	if len(tokenIDs) > 200 {
+		tokenIDs = tokenIDs[:200]
+	}
+
+	p.logger.Info("fetching price history for tokens", slog.Int("count", len(tokenIDs)))
+
+	// 2. Fetch History for each
+	for _, tokenID := range tokenIDs {
+		// Fidelity 1 (1 min), StartTs 0 (full history or rely on API default/limit)
+		// Optimization: Check last fetch time? For now, nice to have, but simple loop first.
+		req, err := svc.GetPriceHistoryReq(tokenID, 1, 0)
+		if err != nil {
+			p.logger.Error("failed to build price history req", slog.String("tokenID", tokenID), slog.Any("error", err))
+			continue
+		}
+
+		if err := p.fetcherPool.SubmitAndThenWait(req); err != nil {
+			// Don't log error if queue full, generic submit logs it? 
+			// SubmitAndThenWait might return error.
+			// Just log warning to avoid spamming error level if it's transient
+			p.logger.Warn("failed to submit price history req", slog.String("tokenID", tokenID), slog.Any("error", err))
+		}
+		
+		// Rate limit spacing
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 // RunSubgraphSync starts the pipeline for subgraph data sync.
 func (p *Pipeline) RunSubgraphSync(ctx context.Context) {
 	p.logger.Info("Starting Subgraph Sync...")

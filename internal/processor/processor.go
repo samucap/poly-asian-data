@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -189,6 +190,10 @@ func (p *Processor) workerTask(ctx context.Context, resp *fetcher.Response) (*Ou
 		output, err = p.processMarkets(resp)
 	case strings.Contains(urlPath, "/teams"):
 		output, err = p.processTeams(resp)
+	case strings.Contains(urlPath, "/book"):
+		output, err = p.processOrderbook(resp)
+	case strings.Contains(urlPath, "/prices-history"):
+		output, err = p.processPricesHistory(resp)
 	default:
 		// Fallback for unexpected URLs
 		output = &Output{
@@ -331,6 +336,8 @@ func (p *Processor) processEvents(resp *fetcher.Response) (*Output, error) {
 	// But let's rely on Metdata first.
 	// Actually, gamesTag logic requires analyzing event tags.
 
+	var derivedReqs []*fetcher.Request
+	var marketsToSave []services.PlyMktMarket
 	var tagsToUpdate []services.PlyMktTag
 
 	for _, ev := range events {
@@ -341,6 +348,82 @@ func (p *Processor) processEvents(resp *fetcher.Response) (*Output, error) {
 			effectiveSlug = getSportFromEvTags(ev.Tags, sportSlugs)
 		}
 
+		// Save Markets and Generate CLOB Requests
+		for _, m := range ev.Markets {
+			if m == nil {
+				continue
+			}
+			// Enrich market with event ID if needed (usually relation handled by DB)
+			m.EventID = ev.ID // Ensure link
+			marketsToSave = append(marketsToSave, *m)
+			
+			// Generate Derived Requests
+			// 1. Orderbook
+			clobAPI, _ := p.cfg.Services.PlyMkt.Endpoints["clob"].(string) 
+			if clobAPI != "" {
+				// CLOB /book usually takes token_id.
+				// Gamma Market usually has "clobTokenIds" or we use the asset_id (tokenID).
+				// Let's assume m.AssetID is the token ID or m.ID or m.ClobTokenID (if exists)
+				// Checking PlayMktMarket struct: TokenID string `json:"clobTokenId"`
+				// Actually I need to check the struct field name.
+				// Based on common knowledge, CLOB uses Token ID.
+				// Let's use m.TokenID (if available) or m.ID?
+				// User's py-clob-client uses token_id.
+				
+				// Using m.ID as placeholder if TokenID not clear, but likely m.ID for Gamma markets map to CLOB?
+				// Wait, Gamma market ID != CLOB Token ID sometimes.
+				// Let's assume m.ID for now or check if we have a specialized field.
+				
+				// From previous view: no explicit ClobTokenId field seen in logs, but let's check code view if needed.
+				// Assuming m.ID is usable or we constructed it.
+				
+				// Parse ClobTokenIds once for orderbooks and price history
+				var tokenIds []string
+				if m.ClobTokenIds != "" {
+					if err := json.Unmarshal([]byte(m.ClobTokenIds), &tokenIds); err != nil {
+						tokenIds = strings.Split(m.ClobTokenIds, ",")
+					}
+				}
+
+				// Orderbook Requests - one per token
+				for _, tid := range tokenIds {
+					tid = strings.TrimSpace(tid)
+					if tid == "" {
+						continue
+					}
+					derivedReqs = append(derivedReqs, &fetcher.Request{
+						URL: fmt.Sprintf("%s/book?token_id=%s", clobAPI, tid),
+						Method: "GET",
+						Headers: map[string]string{"Content-Type": "application/json"},
+						Metadata: map[string]string{
+							"MarketID": m.ID,
+							"TokenID": tid,
+							"Type": "orderbook",
+						},
+					})
+				}
+				
+				// Price History Requests - one per token
+				for _, tid := range tokenIds {
+					tid = strings.TrimSpace(tid)
+					if tid == "" {
+						continue
+					}
+					histReq := &fetcher.Request{
+						URL: fmt.Sprintf("%s/prices-history?interval=1m&market=%s&fidelity=60", clobAPI, tid),
+						Method: "GET",
+						Headers: map[string]string{"Content-Type": "application/json"},
+						Metadata: map[string]string{
+							"MarketID": m.ID,
+							"TokenID": tid,
+							"Type": "price_history",
+						},
+					}
+					derivedReqs = append(derivedReqs, histReq)
+				}
+			}
+		}
+
 		if effectiveSlug == "" {
 			continue
 		}
@@ -349,10 +432,6 @@ func (p *Processor) processEvents(resp *fetcher.Response) (*Output, error) {
 			if t.ID == "1" || t.ID == gamesTagID {
 				continue
 			}
-			// Update tag info
-			// We create a copy to avoid mutating if shared (though unlikely here)
-			// But wait, ev.Tags are pointers in PlyMktEvent?
-			// Yes []*PlyMktTag.
 			tCopy := *t
 			tCopy.SportSlug = effectiveSlug
 			tagsToUpdate = append(tagsToUpdate, tCopy)
@@ -361,14 +440,50 @@ func (p *Processor) processEvents(resp *fetcher.Response) (*Output, error) {
 
 	payloads := []SaverPayload{}
 	if len(tagsToUpdate) > 0 {
-		// Linking tags to sports
 		payloads = append(payloads, SaverPayload{TableName: "tags_sport_link", Data: tagsToUpdate})
+	}
+	if len(marketsToSave) > 0 {
+		payloads = append(payloads, SaverPayload{TableName: "plymkt_markets", Data: marketsToSave})
+	}
+
+	// Pagination Logic
+	var nextReq *fetcher.Request
+	if len(events) > 0 {
+		// Parse current URL to get offset/limit
+		u, err := url.Parse(resp.Request.URL)
+		if err == nil {
+			q := u.Query()
+			limitStr := q.Get("limit")
+			offsetStr := q.Get("offset")
+			
+			if limitStr != "" && offsetStr != "" {
+				limit, _ := strconv.Atoi(limitStr)
+				offset, _ := strconv.Atoi(offsetStr)
+				newOffset := offset + limit
+				q.Set("offset", fmt.Sprintf("%d", newOffset))
+				u.RawQuery = q.Encode()
+				
+				nextReq = &fetcher.Request{
+					URL:      u.String(),
+					Method:   resp.Request.Method,
+					Headers:  resp.Request.Headers,
+					Metadata: resp.Request.Metadata,
+				}
+				p.logger.Info("built next page request", 
+					slog.String("component", "processor"), 
+					slog.String("url", nextReq.URL),
+					slog.Int("newOffset", newOffset),
+				)
+			}
+		}
 	}
 
 	return &Output{
 		SaverPayloads:   payloads,
+		DerivedRequests: derivedReqs,
 		ItemCount:       len(events),
 		OriginalRequest: resp.Request,
+		NextPageRequest: nextReq,
 	}, nil
 }
 
@@ -510,7 +625,66 @@ func (p *Processor) processSubgraph(resp *fetcher.Response) (*Output, error) {
 		if itemCount > 0 {
 			lastID = items[itemCount-1].ID
 		}
+		
+		// 1. Save Fills
 		payloads = append(payloads, SaverPayload{TableName: "enriched_order_filled_events", Data: items})
+
+		// 2. Aggregate Account Stats (In-Memory)
+		type AccAgg struct {
+			ID string
+			Vol float64
+			Trades int64
+			LastTraded int64
+		}
+		accStats := make(map[string]*AccAgg)
+		
+		updateAcc := func(id string, vol float64, ts int64) {
+			if _, exists := accStats[id]; !exists {
+				accStats[id] = &AccAgg{
+					ID: id,
+					Vol: 0,
+					Trades: 0,
+				}
+			}
+			accStats[id].Vol += vol
+			accStats[id].Trades++
+			if ts > accStats[id].LastTraded {
+				accStats[id].LastTraded = ts
+			}
+		}
+
+		for _, item := range items {
+			price, _ := strconv.ParseFloat(item.Price, 64)
+			size, _ := strconv.ParseFloat(item.Size, 64)
+			vol := price * size
+			
+			// Parse timestamp (usually string seconds)
+			tsLine, _ := strconv.ParseInt(item.Timestamp, 10, 64)
+			
+			if item.Maker.ID != "" {
+				updateAcc(item.Maker.ID, vol, tsLine)
+			}
+			if item.Taker.ID != "" {
+				updateAcc(item.Taker.ID, vol, tsLine)
+			}
+		}
+
+		// Convert to PlyMktAccount (stringified) for Saver
+		// We use "accounts_increment" virtual table to tell Saver to ADD values
+		var accs []services.PlyMktAccount
+		for _, agg := range accStats {
+			accs = append(accs, services.PlyMktAccount{
+				ID: agg.ID,
+				CollateralVolume: fmt.Sprintf("%f", agg.Vol),
+				NumTrades: fmt.Sprintf("%d", agg.Trades),
+				LastTradedTimestamp: fmt.Sprintf("%d", agg.LastTraded),
+				// Other fields empty, Saver should handle incomplete structs for increment
+			})
+		}
+		
+		if len(accs) > 0 {
+			payloads = append(payloads, SaverPayload{TableName: "accounts_increment", Data: accs})
+		}
 
 	case "ordersMatchedEvents":
 		var items []services.PlyMktOrderFilledEvent // Reusing struct as fields match closely
@@ -590,6 +764,18 @@ func (p *Processor) processSubgraph(resp *fetcher.Response) (*Output, error) {
 
 	case "plymkt_markets":
 		return p.processMarkets(resp)
+
+	case "userPositions":
+		var items []services.PlyMktUserPosition
+		if err := extract("userPositions", &items); err != nil {
+			return nil, err
+		}
+		itemCount = len(items)
+		if itemCount > 0 {
+			lastID = items[itemCount-1].ID
+		}
+		// Use custom handler for computation logic
+		return p.processUserPositions(resp, items)
 	}
 
 	// Debug log if result is empty but no error
@@ -730,3 +916,145 @@ func findSportSlugForTeam(t *services.PlyMktTeam) string {
 	}
 	return "" // Simplified
 }
+
+// processOrderbook handles /book response.
+func (p *Processor) processOrderbook(resp *fetcher.Response) (*Output, error) {
+	var book services.PlyMktOrderbook
+	if err := json.Unmarshal(resp.Data, &book); err != nil {
+		return nil, err
+	}
+
+	// Enrich from metadata
+	if book.TokenID == "" && resp.Request.Metadata != nil {
+		book.TokenID = resp.Request.Metadata["MarketID"] // Using MarketID as TokenID proxy if needed
+	}
+
+	// Compute Spread
+	// Need to parse string prices to float for calculation?
+	// services.PlyMktOrderbook definitions: Price is string.
+	// calculations.CalculateSpread takes floats.
+	// Let's parse best bid/ask
+	var bestBid, bestAsk float64
+	if len(book.Bids) > 0 {
+		bestBid, _ = strconv.ParseFloat(book.Bids[0].Price, 64)
+	}
+	if len(book.Asks) > 0 {
+		bestAsk, _ = strconv.ParseFloat(book.Asks[0].Price, 64)
+	}
+	book.Spread = CalculateSpread(bestBid, bestAsk)
+
+	payloads := []SaverPayload{
+		{TableName: "orderbooks", Data: book},
+	}
+
+	return &Output{
+		SaverPayloads:   payloads,
+		ItemCount:       1,
+		OriginalRequest: resp.Request,
+	}, nil
+}
+
+// processPricesHistory handles /prices-history response.
+func (p *Processor) processPricesHistory(resp *fetcher.Response) (*Output, error) {
+	// CLOB API response for history is usually: { "history": [...] } or direct array.
+	type HistoryResponse struct {
+		History []services.PlyMktPricePoint `json:"history"`
+	}
+	
+	var points []services.PlyMktPricePoint
+	
+	// properties from metadata
+	marketID := ""
+	tokenID := ""
+	if resp.Request.Metadata != nil {
+		marketID = resp.Request.Metadata["MarketID"]
+		tokenID = resp.Request.Metadata["TokenID"]
+	}
+	if tokenID == "" {
+		tokenID = marketID // Fallback
+	}
+
+	// Try Object format first (includes empty history cases like {"history":[]})
+	var objResp HistoryResponse
+	if err := json.Unmarshal(resp.Data, &objResp); err == nil {
+		points = objResp.History // May be empty, that's OK
+	} else {
+		// Check if it's an error response
+		type ErrorResp struct {
+			Error string `json:"error"`
+		}
+		var errResp ErrorResp
+		if json.Unmarshal(resp.Data, &errResp) == nil && errResp.Error != "" {
+			p.logger.Warn("price history API error", slog.String("url", resp.URL), slog.String("error", errResp.Error))
+			return &Output{ItemCount: 0, OriginalRequest: resp.Request}, nil
+		}
+		
+		// Try Array format
+		if err := json.Unmarshal(resp.Data, &points); err != nil {
+			// If both fail, and data isn't empty, it's an error.
+			if len(resp.Data) > 0 {
+				str := string(resp.Data)
+				if str != "[]" && str != "{}" && str != "{\"history\":[]}" {
+					p.logger.Warn("failed to unmarshal price history", slog.String("url", resp.URL), slog.String("err", err.Error()))
+					return nil, err
+				}
+			}
+		}
+	}
+
+	// Convert points to standardized struct for Saver
+	// Using PlyMktPriceHistory as the common carrier or SaverPayloads
+	// The Saver expects `prices_history` table payload.
+	// Let's create a struct that matches schema: timestamp, token_id, price.
+	// Reuse PlyMktPriceHistory but ensure Price is set.
+	
+	var items []services.PlyMktPriceHistory
+	for _, pt := range points {
+		var priceVal float64
+		// Handle interface{} for Price
+		switch v := pt.Price.(type) {
+		case float64:
+			priceVal = v
+		case string:
+			if val, err := strconv.ParseFloat(v, 64); err == nil {
+				priceVal = val
+			}
+		case int:
+			priceVal = float64(v)
+		}
+
+		items = append(items, services.PlyMktPriceHistory{
+			Timestamp: pt.Timestamp,
+			Price:     priceVal,
+			TokenID:   tokenID,
+			MarketID:  marketID,
+		})
+	}
+
+	payloads := []SaverPayload{}
+	if len(items) > 0 {
+		payloads = append(payloads, SaverPayload{TableName: "prices_history", Data: items})
+	}
+
+	return &Output{
+		SaverPayloads:   payloads,
+		ItemCount:       len(items),
+		OriginalRequest: resp.Request,
+	}, nil
+}
+
+// processUserPositions handles userPositions subgraph response.
+// Acts as simple transformer - delta computation happens in Saver.
+func (p *Processor) processUserPositions(resp *fetcher.Response, items []services.PlyMktUserPosition) (*Output, error) {
+	payloads := []SaverPayload{
+		{TableName: "position_snapshots", Data: items},
+	}
+
+	return &Output{
+		SaverPayloads:   payloads,
+		ItemCount:       len(items),
+		OriginalRequest: resp.Request,
+	}, nil
+}
+
+

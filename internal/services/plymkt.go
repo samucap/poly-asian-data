@@ -19,6 +19,7 @@ import (
 
 type PlyMktMarket struct {
 	ID                          string          `json:"id"`
+	EventID                     string          `json:"eventId"` // Added for relationship
 	Question                    string          `json:"question"`
 	ConditionID                 string          `json:"conditionId"`
 	Slug                        string          `json:"slug"`
@@ -145,7 +146,7 @@ type PlyMktMarket struct {
 	GameID                      string          `json:"gameId"`
 	GroupItemRange              string          `json:"groupItemRange"`
 	SportsMarketType            string          `json:"sportsMarketType"`
-	Line                        int64           `json:"line"`
+	Line                        float64         `json:"line"`
 	UmaResolutionStatuses       string          `json:"umaResolutionStatuses"`
 	PendingDeployment           bool            `json:"pendingDeployment"`
 	Deploying                   bool            `json:"deploying"`
@@ -321,6 +322,68 @@ type PlyMktTag struct {
 	SportID     string
 }
 
+type PlyMktUserPosition struct {
+	ID        string `json:"id"`
+	User      struct {
+		ID string `json:"id"`
+	} `json:"user"`
+	Market struct {
+		ID string `json:"id"`
+	} `json:"market"`
+	OutcomeIndex string `json:"outcomeIndex"` // Often BigInt in subgraph, check if string
+	Quantity     string `json:"quantity"`     // Net quantity
+	TotalBought  string `json:"totalBought"`
+	TotalSold    string `json:"totalSold"`
+	NetValue     string `json:"netValue"` // Might need computation if not in subgraph directly
+}
+
+type PlyMktOrderbook struct {
+	Timestamp string          `json:"timestamp"` // Derived or from snapshot time
+	TokenID   string          `json:"token_id"`
+	Bids      []OrderbookItem `json:"bids"`
+	Asks      []OrderbookItem `json:"asks"`
+	Spread    float64         `json:"spread"` // Computed
+}
+
+type PositionSnapshot struct {
+	SnapshotTime  time.Time
+	AccountID     string
+	MarketID      string
+	OutcomeIndex  int
+	NetQuantity   float64
+	NetValue      float64
+	DeltaQuantity float64
+	DeltaValue    float64
+	IsSignal      bool
+}
+
+type OrderbookItem struct {
+	Price string `json:"price"`
+	Size  string `json:"size"`
+}
+
+type PlyMktPriceHistory struct {
+	Timestamp int64   `json:"t"` // Unix timestamp key from CLOB usually
+	Price     float64 `json:"p"` 
+	High      float64 `json:"h"` // Keeping for compat if needed, but primary is t, p
+	Low       float64 `json:"l"`
+	Close     float64 `json:"c"`
+	Volume    float64 `json:"v"`
+	MarketID  string  `json:"-"`
+	TokenID   string  `json:"-"`
+}
+
+type PlyMktPricePoint struct {
+	Timestamp int64       `json:"t"`
+	Price     interface{} `json:"p"` // Can be string or float
+}
+
+// API Endpoints
+const (
+	GammaAPIURL = "https://gamma-api.polymarket.com"
+	ClobAPIURL  = "https://clob.polymarket.com"
+)
+
 // =============================================================================
 // Request/Response Types
 // =============================================================================
@@ -420,6 +483,48 @@ type targetDetails struct {
 	body   string
 }
 
+func (ply *PlyMktService) GetDiscoveryReqs(ctx context.Context) ([]*fetcher.Request, error) {
+	gammaEndpoint, ok := config.DefaultEndpoints["gamma"].(string)
+	if !ok {
+		return nil, fmt.Errorf("gamma endpoint not configured")
+	}
+	
+	// Base URL for events
+	u, err := url.Parse(gammaEndpoint)
+	if err != nil {
+		return nil, err
+	}
+	u = u.JoinPath("/events")
+	
+	// Query Params: active=true, closed=false (implied by active?), archived=false
+	// User said "active events".
+	// We'll return an initial request that triggers pagination in the Processor/Fetcher loop.
+	limit := 100
+	offset := 0
+	
+	var reqs []*fetcher.Request
+	// Initial request
+	q := u.Query()
+	q.Set("limit", fmt.Sprintf("%d", limit))
+	q.Set("offset", fmt.Sprintf("%d", offset))
+	q.Set("active", "true")
+	q.Set("closed", "false")
+	q.Set("archived", "false")
+	q.Set("order", "volume")
+	q.Set("ascending", "false")
+	
+	fullURL := *u
+	fullURL.RawQuery = q.Encode()
+	
+	reqs = append(reqs, &fetcher.Request{
+		URL: fullURL.String(),
+		Method: "GET",
+		Headers: map[string]string{"Content-Type": "application/json"},
+	})
+	
+	return reqs, nil
+}
+
 func (ply *PlyMktService) GetSportsReqs(ctx context.Context) ([]*fetcher.Request, error) {
 	//sportsCats := map[string]int {
 	//	"football": 0,
@@ -514,6 +619,7 @@ var SubgraphEntities = map[string]string{
 		timestamp
 		transactionHash
 	}`,
+	// enrichedOrderFilleds: Default query for full sync. Use BuildEnrichedOrderFilledsQuery() for market-filtered queries.
 	"enrichedOrderFilleds": `enrichedOrderFilleds(first: $first, where: { id_gt: $lastId }, orderBy: id, orderDirection: asc) {
 		id
 		timestamp
@@ -523,9 +629,9 @@ var SubgraphEntities = map[string]string{
 		taker {
 			id
 		}
-		price
-		side
 		size
+		side
+		price
 		market {
 			id
 		}
@@ -574,6 +680,37 @@ var SubgraphEntities = map[string]string{
 		avgPrice
 		totalBought
 	}`,
+}
+
+// BuildEnrichedOrderFilledsQuery builds the enrichedOrderFilleds GraphQL query.
+// If marketIds is non-empty, adds a market_in filter; otherwise queries all markets.
+func BuildEnrichedOrderFilledsQuery(marketIds []string) string {
+	whereClause := "{ id_gt: $lastId }"
+	if len(marketIds) > 0 {
+		whereClause = "{ id_gt: $lastId, market_in: $marketIds }"
+	}
+	
+	return fmt.Sprintf(`enrichedOrderFilleds(
+		first: $first
+		where: %s
+		orderBy: timestamp
+		orderDirection: desc
+	) {
+		id
+		timestamp
+		maker {
+			id
+		}
+		taker {
+			id
+		}
+		size
+		side
+		price
+		market {
+			id
+		}
+	}`, whereClause)
 }
 
 type PlyMktCondition struct {
@@ -662,6 +799,40 @@ var targets = map[string]struct{
 		path: "/6c58N5U4MtQE2Y8njfVrrAfRykzfqajMGeTMEvMmskVz", 
 		entity: "userPositions",
 	},
+}
+
+func (ply *PlyMktService) GetPriceHistoryReq(tokenID string, fidelity int, startTs int64) (*fetcher.Request, error) {
+	clobEndpoint, ok := config.DefaultEndpoints["clob"].(string)
+	if !ok || clobEndpoint == "" {
+		return nil, fmt.Errorf("clob endpoint not configured")
+	}
+
+	u, err := url.Parse(clobEndpoint)
+	if err != nil {
+		return nil, err
+	}
+	u = u.JoinPath("/prices-history")
+	
+	q := u.Query()
+	q.Set("market", tokenID)
+	q.Set("fidelity", fmt.Sprintf("%d", fidelity))
+	if startTs > 0 {
+		q.Set("startTs", fmt.Sprintf("%d", startTs))
+	}
+	u.RawQuery = q.Encode()
+
+	return &fetcher.Request{
+		URL:    u.String(),
+		Method: "GET",
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+		},
+		Metadata: map[string]string{
+			"Type":     "price_history",
+			"Expected": "history_points",
+			"TokenID":  tokenID,
+		},
+	}, nil
 }
 
 func (ply *PlyMktService) BuildTempRequests(targetsList []string) ([]*fetcher.Request, error) {

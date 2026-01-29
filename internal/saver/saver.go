@@ -4,13 +4,15 @@ package saver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -326,13 +328,14 @@ func (s *Saver) workerTask(ctx context.Context, record *Record) (*Result, error)
 		rowsAffected, err = s.batchInsertConditions(ctx, record.Data)
 	case "accounts":
 		rowsAffected, err = s.batchInsertAccounts(ctx, record.Data)
-	case "order_filled_events":
-		rowsAffected, err = s.batchInsertOrderFilledEvents(ctx, record.Data)
-	case "enriched_order_filled_events":
-		rowsAffected, err = s.batchInsertEnrichedOrderFilledEvents(ctx, record.Data)
-	case "orders_matched_events":
-		// Reusing OrderFilledEvent struct and handler as per previous analysis
-		rowsAffected, err = s.batchInsertOrderFilledEvents(ctx, record.Data)
+	case "prices_history":
+		rowsAffected, err = s.batchInsertPricesHistory(ctx, record.Data)
+	case "accounts_increment":
+		rowsAffected, err = s.batchIncrementAccounts(ctx, record.Data)
+	case "position_snapshots":
+		rowsAffected, err = s.batchInsertPositionSnapshots(ctx, record.Data)
+	case "orderbooks":
+		rowsAffected, err = s.batchInsertOrderbooks(ctx, record.Data)
 	default:
 		return nil, fmt.Errorf("unknown table: %s", record.TableName)
 	}
@@ -362,6 +365,92 @@ func (s *Saver) workerTask(ctx context.Context, record *Record) (*Result, error)
 		RowsAffected: rowsAffected,
 		Duration:     duration,
 	}, nil
+}
+
+// ... existing batch insert methods ...
+
+func (s *Saver) batchInsertPricesHistory(ctx context.Context, data any) (int64, error) {
+	items, ok := data.([]services.PlyMktPriceHistory)
+	if !ok {
+		return 0, fmt.Errorf("invalid data type for prices_history: got %T", data)
+	}
+
+	batch := &pgx.Batch{}
+	for _, item := range items {
+		// Convert timestamp from int64 (unix seconds) to time.Time
+		ts := time.Unix(item.Timestamp, 0)
+		
+		batch.Queue(`
+			INSERT INTO prices_history (timestamp, token_id, price)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (token_id, timestamp) DO NOTHING
+		`, ts, item.TokenID, item.Price)
+	}
+
+	rows, _, err := s.execBatch(ctx, batch, len(items))
+	return rows, err
+}
+
+// GetActiveTokenIDs fetches token IDs for active markets/whales to prioritize for price history.
+func (s *Saver) GetActiveTokenIDs(ctx context.Context) ([]string, error) {
+	// Simple strategy: Fetch standard active markets from plymkt_markets
+	rows, err := s.db.Query(ctx, `
+		SELECT clob_token_ids FROM plymkt_markets 
+		WHERE active = true AND clob_token_ids IS NOT NULL AND clob_token_ids != ''
+		ORDER BY volume_24hr DESC
+		LIMIT 200
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tokenIDs []string
+	for rows.Next() {
+		var idsVal string
+		if err := rows.Scan(&idsVal); err != nil {
+			continue
+		}
+		// clob_token_ids is usually a JSON array string `["..."]` or plain string?
+		// Schema says 'clob_token_ids TEXT'. API returns JSON encoded string.
+		// Let's assume it's JSON string.
+		var ids []string
+		if err := json.Unmarshal([]byte(idsVal), &ids); err == nil {
+			tokenIDs = append(tokenIDs, ids...)
+		} else {
+             // Fallback if not JSON
+             tokenIDs = append(tokenIDs, idsVal)
+        }
+	}
+	return tokenIDs, nil
+}
+
+// GetWhaleIDs fetches account IDs for top whales by collateral volume.
+func (s *Saver) GetWhaleIDs(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	
+	rows, err := s.db.Query(ctx, `
+		SELECT id FROM accounts 
+		WHERE collateral_volume IS NOT NULL AND collateral_volume != '' AND collateral_volume != '0'
+		ORDER BY COALESCE(collateral_volume::numeric, 0) DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var whaleIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			continue
+		}
+		whaleIDs = append(whaleIDs, id)
+	}
+	return whaleIDs, nil
 }
 
 // =============================================================================
@@ -1027,7 +1116,41 @@ func (s *Saver) batchInsertAccounts(ctx context.Context, data any) (int64, error
 	return totalAffected, err
 }
 
-// batchInsertOrderFilledEvents inserts or updates order_filled_events.
+// batchIncrementAccounts increments account statistics (collateral_volume, num_trades).
+func (s *Saver) batchIncrementAccounts(ctx context.Context, data any) (int64, error) {
+	items, ok := data.([]services.PlyMktAccount)
+	if !ok {
+		return 0, fmt.Errorf("invalid data type for accounts_increment: got %T", data)
+	}
+
+	batch := &pgx.Batch{}
+	for _, item := range items {
+		// Parse numeric values from string fields
+		vol, _ := strconv.ParseFloat(item.CollateralVolume, 64)
+		trades, _ := strconv.ParseInt(item.NumTrades, 10, 64)
+		lastTraded, _ := strconv.ParseInt(item.LastTradedTimestamp, 10, 64)
+		
+		// Convert to timestamptz
+		ts := time.Unix(lastTraded, 0)
+
+		batch.Queue(`
+			INSERT INTO accounts (id, collateral_volume, num_trades, last_traded_timestamp, updated_at)
+			VALUES ($1, $2::text, $3::text, $4, NOW())
+			ON CONFLICT (id) DO UPDATE SET
+				collateral_volume = (COALESCE(accounts.collateral_volume::numeric, 0) + EXCLUDED.collateral_volume::numeric)::text,
+				num_trades = (COALESCE(accounts.num_trades::bigint, 0) + EXCLUDED.num_trades::bigint)::text,
+				last_traded_timestamp = GREATEST(accounts.last_traded_timestamp, EXCLUDED.last_traded_timestamp),
+				updated_at = NOW()
+		`, item.ID, fmt.Sprintf("%.6f", vol), fmt.Sprintf("%d", trades), ts)
+	}
+
+	totalAffected, failIdx, err := s.execBatch(ctx, batch, len(items))
+	if err != nil && failIdx != -1 && failIdx < len(items) {
+		s.logger.Error("failed to increment account", "id", items[failIdx].ID, "error", err)
+	}
+	return totalAffected, err
+}
+
 func (s *Saver) batchInsertOrderFilledEvents(ctx context.Context, data any) (int64, error) {
 	items, ok := data.([]services.PlyMktOrderFilledEvent)
 	if !ok {
@@ -1089,6 +1212,157 @@ func (s *Saver) batchInsertEnrichedOrderFilledEvents(ctx context.Context, data a
 	totalAffected, failIdx, err := s.execBatch(ctx, batch, len(items))
 	if err != nil && failIdx != -1 && failIdx < len(items) {
 		s.logger.Error("failed to save enriched_order_filled_event", "id", items[failIdx].ID, "error", err)
+	}
+	return totalAffected, err
+}
+
+// batchInsertPositionSnapshots inserts position snapshots with computed deltas.
+// Uses Read-Compute-Write pattern: fetches latest position, computes delta, writes new snapshot.
+func (s *Saver) batchInsertPositionSnapshots(ctx context.Context, data any) (int64, error) {
+	items, ok := data.([]services.PlyMktUserPosition)
+	if !ok {
+		return 0, fmt.Errorf("invalid data type for position_snapshots: got %T", data)
+	}
+
+	if len(items) == 0 {
+		return 0, nil
+	}
+
+	// Step 1: Build lookup keys for latest positions
+	keys := make([]posKey, 0, len(items))
+	for _, item := range items {
+		keys = append(keys, posKey{AccountID: item.User.ID, MarketID: item.Market.ID})
+	}
+
+	// Step 2: Fetch latest positions for comparison (batch query)
+	latestPositions := make(map[posKey]struct {
+		Quantity float64
+		Value    float64
+	})
+	
+	// Query for latest snapshot per account+market
+	rows, err := s.db.Query(ctx, `
+		SELECT DISTINCT ON (account_id, market_id)
+			account_id, market_id, net_quantity, net_value
+		FROM position_snapshots
+		WHERE (account_id, market_id) IN (SELECT unnest($1::text[]), unnest($2::text[]))
+		ORDER BY account_id, market_id, snapshot_time DESC
+	`, s.extractAccountIDs(keys), s.extractMarketIDs(keys))
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var accID, mktID string
+			var qty, val float64
+			if err := rows.Scan(&accID, &mktID, &qty, &val); err == nil {
+				latestPositions[posKey{accID, mktID}] = struct {
+					Quantity float64
+					Value    float64
+				}{qty, val}
+			}
+		}
+	}
+
+	// Step 3: Insert new snapshots with computed deltas
+	batch := &pgx.Batch{}
+	now := time.Now()
+	
+	for _, item := range items {
+		key := posKey{AccountID: item.User.ID, MarketID: item.Market.ID}
+		
+		// Parse current values
+		qty, _ := strconv.ParseFloat(item.Quantity, 64)
+		val, _ := strconv.ParseFloat(item.NetValue, 64)
+		outcomeIdx, _ := strconv.Atoi(item.OutcomeIndex)
+		
+		// Compute deltas
+		deltaQty := qty
+		deltaVal := val
+		if prev, exists := latestPositions[key]; exists {
+			deltaQty = qty - prev.Quantity
+			deltaVal = val - prev.Value
+		}
+		
+		// Only insert if there's a meaningful change (or first snapshot)
+		if deltaQty == 0 && deltaVal == 0 {
+			continue
+		}
+
+		batch.Queue(`
+			INSERT INTO position_snapshots 
+				(snapshot_time, account_id, market_id, outcome_index, net_quantity, net_value, delta_quantity, delta_value)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		`, now, item.User.ID, item.Market.ID, outcomeIdx, qty, val, deltaQty, deltaVal)
+	}
+
+	if batch.Len() == 0 {
+		return 0, nil
+	}
+
+	totalAffected, failIdx, err := s.execBatch(ctx, batch, batch.Len())
+	if err != nil && failIdx != -1 {
+		s.logger.Error("failed to save position snapshot", "error", err)
+	}
+	return totalAffected, err
+}
+
+// posKey is a lookup key for account+market position pairs
+type posKey struct {
+	AccountID string
+	MarketID  string
+}
+
+// Helper to extract account IDs for batch query
+func (s *Saver) extractAccountIDs(keys []posKey) []string {
+	result := make([]string, len(keys))
+	for i, k := range keys {
+		result[i] = k.AccountID
+	}
+	return result
+}
+
+// Helper to extract market IDs for batch query
+func (s *Saver) extractMarketIDs(keys []posKey) []string {
+	result := make([]string, len(keys))
+	for i, k := range keys {
+		result[i] = k.MarketID
+	}
+	return result
+}
+
+// batchInsertOrderbooks inserts orderbook snapshots.
+func (s *Saver) batchInsertOrderbooks(ctx context.Context, data any) (int64, error) {
+	var items []services.PlyMktOrderbook
+	
+	switch v := data.(type) {
+	case []services.PlyMktOrderbook:
+		items = v
+	case services.PlyMktOrderbook:
+		items = []services.PlyMktOrderbook{v}
+	default:
+		return 0, fmt.Errorf("invalid data type for orderbooks: got %T", data)
+	}
+
+	if len(items) == 0 {
+		return 0, nil
+	}
+
+	batch := &pgx.Batch{}
+	now := time.Now()
+	
+	for _, item := range items {
+		// Marshal bids and asks to JSONB
+		bidsJSON, _ := json.Marshal(item.Bids)
+		asksJSON, _ := json.Marshal(item.Asks)
+		
+		batch.Queue(`
+			INSERT INTO orderbooks (timestamp, token_id, bids, asks, spread)
+			VALUES ($1, $2, $3, $4, $5)
+		`, now, item.TokenID, bidsJSON, asksJSON, item.Spread)
+	}
+
+	totalAffected, failIdx, err := s.execBatch(ctx, batch, len(items))
+	if err != nil && failIdx != -1 {
+		s.logger.Error("failed to save orderbook", "error", err)
 	}
 	return totalAffected, err
 }

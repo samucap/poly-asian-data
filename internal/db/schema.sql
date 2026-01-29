@@ -106,8 +106,9 @@ CREATE TABLE IF NOT EXISTS order_filled_events (
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
+DROP TABLE IF EXISTS enriched_order_filled_events CASCADE;
 CREATE TABLE IF NOT EXISTS enriched_order_filled_events (
-    id TEXT PRIMARY KEY, -- transaction hash
+    id TEXT NOT NULL, -- transaction hash
     price TEXT,
     side TEXT,
     size TEXT,
@@ -274,3 +275,166 @@ CREATE TRIGGER update_leagues_updated_at BEFORE UPDATE ON leagues FOR EACH ROW E
 
 DROP TRIGGER IF EXISTS update_teams_updated_at ON teams;
 CREATE TRIGGER update_teams_updated_at BEFORE UPDATE ON teams FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- New Tables for Whale Tracking Pipeline
+
+-- Position Snapshots (Hypertable)
+DROP TABLE IF EXISTS position_snapshots CASCADE;
+CREATE TABLE IF NOT EXISTS position_snapshots (
+    snapshot_time TIMESTAMPTZ NOT NULL,
+    account_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    outcome_index INT,
+    net_quantity DOUBLE PRECISION,
+    net_value DOUBLE PRECISION,
+    delta_quantity DOUBLE PRECISION,
+    delta_value DOUBLE PRECISION,
+    is_signal BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+-- Create Hypertable (after table creation)
+-- SELECT create_hypertable('position_snapshots', 'snapshot_time', if_not_exists => TRUE);
+-- Note: User might run this manually or via migration. We include it here as comment or executable if rights allow.
+-- For standard timescaledb setup, we usually run:
+SELECT create_hypertable('position_snapshots', 'snapshot_time', if_not_exists => TRUE);
+
+CREATE INDEX IF NOT EXISTS idx_position_snapshots_account ON position_snapshots (account_id, snapshot_time DESC);
+CREATE INDEX IF NOT EXISTS idx_position_snapshots_market ON position_snapshots (market_id, snapshot_time DESC);
+
+
+-- Orderbooks (Hypertable)
+DROP TABLE IF EXISTS orderbooks CASCADE;
+CREATE TABLE IF NOT EXISTS orderbooks (
+    timestamp TIMESTAMPTZ NOT NULL,
+    token_id TEXT NOT NULL,
+    bids JSONB,
+    asks JSONB,
+    spread DOUBLE PRECISION,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+SELECT create_hypertable('orderbooks', 'timestamp', if_not_exists => TRUE);
+
+CREATE INDEX IF NOT EXISTS idx_orderbooks_token_ts ON orderbooks (token_id, timestamp DESC);
+
+
+
+-- Prices History (Hypertable)
+DROP TABLE IF EXISTS prices_history CASCADE;
+CREATE TABLE IF NOT EXISTS prices_history (
+    timestamp TIMESTAMPTZ NOT NULL,
+    token_id TEXT NOT NULL,
+    price DOUBLE PRECISION NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (token_id, timestamp)
+);
+SELECT create_hypertable('prices_history', 'timestamp', if_not_exists => TRUE);
+-- Index is implicit with Primary Key composite, but we might want just timestamp for general queries?
+-- Access pattern: usually by token_id per time range.
+-- PK covers (token_id, timestamp).
+-- Add index for global time queries/cleanup if needed?
+-- User requested: CREATE INDEX ON prices_history (timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_prices_history_timestamp ON prices_history (timestamp DESC);
+
+
+-- Enriched Order Filled Events (Ensure Hypertable)
+-- We already defined this table, but let's ensure it's a hypertable.
+-- In standard Postgres, if data exists, converting might require migration steps.
+-- Assuming fresh start or compatible:
+SELECT create_hypertable('enriched_order_filled_events', 'timestamp', if_not_exists => TRUE, migrate_data => TRUE);
+
+-- Materialized Views
+
+-- Latest Positions (for quick lookup of current state)
+CREATE MATERIALIZED VIEW IF NOT EXISTS latest_positions AS
+SELECT DISTINCT ON (account_id, market_id, outcome_index)
+    snapshot_time,
+    account_id,
+    market_id,
+    outcome_index,
+    net_quantity,
+    net_value
+FROM position_snapshots
+ORDER BY account_id, market_id, outcome_index, snapshot_time DESC;
+
+CREATE INDEX IF NOT EXISTS idx_latest_positions_lookup ON latest_positions (account_id, market_id);
+
+-- Whale Candidates (Top volume accounts)
+CREATE MATERIALIZED VIEW IF NOT EXISTS whale_candidates AS
+SELECT
+    id AS account_id,
+    collateral_volume, -- Stored as text in accounts table, might need casting if doing numeric sort here
+    num_trades
+FROM accounts
+-- We need to cast collateral_volume to numeric for filtering > 100000
+-- Assuming format doesn't have weird chars
+WHERE (collateral_volume::NUMERIC) > 100000
+ORDER BY collateral_volume::NUMERIC DESC;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_whale_candidates_id ON whale_candidates (account_id);
+
+-- =============================================================================
+-- Feature Store: SQL-Based Indicators (TimescaleDB Continuous Aggregates)
+-- =============================================================================
+
+-- 1. Candlesticks (Price OHLCV) - Hourly aggregation of prices_history
+-- Note: Continuous Aggregates require hypertable. prices_history should be one.
+-- CREATE MATERIALIZED VIEW candlesticks_1h
+-- WITH (timescaledb.continuous) AS
+-- SELECT
+--     time_bucket('1 hour', timestamp) AS bucket,
+--     token_id,
+--     first(price, timestamp) AS open,
+--     max(price) AS high,
+--     min(price) AS low,
+--     last(price, timestamp) AS close,
+--     avg(price) AS vwap,
+--     count(*) AS trades
+-- FROM prices_history
+-- GROUP BY bucket, token_id
+-- WITH NO DATA;
+
+-- 2. Market Pressure (Buy/Sell Ratio from Fills) - Hourly
+CREATE MATERIALIZED VIEW IF NOT EXISTS market_pressure_1h AS
+SELECT
+    date_trunc('hour', timestamp::timestamp) AS bucket,
+    market_id,
+    SUM(CASE WHEN side = 'BUY' THEN size::NUMERIC ELSE 0 END) AS buy_volume,
+    SUM(CASE WHEN side = 'SELL' THEN size::NUMERIC ELSE 0 END) AS sell_volume,
+    CASE 
+        WHEN SUM(size::NUMERIC) > 0 THEN 
+            SUM(CASE WHEN side = 'BUY' THEN size::NUMERIC ELSE 0 END) / SUM(size::NUMERIC)
+        ELSE 0.5 
+    END AS buy_ratio
+FROM enriched_order_filled_events
+GROUP BY bucket, market_id;
+
+CREATE INDEX IF NOT EXISTS idx_market_pressure_lookup ON market_pressure_1h (market_id, bucket DESC);
+
+-- 3. Whale Rankings (Top accounts by 7-day volume)
+CREATE MATERIALIZED VIEW IF NOT EXISTS whale_rankings AS
+SELECT
+    id AS account_id,
+    collateral_volume::NUMERIC AS volume,
+    num_trades::BIGINT AS trade_count,
+    RANK() OVER (ORDER BY collateral_volume::NUMERIC DESC) AS volume_rank,
+    NTILE(100) OVER (ORDER BY collateral_volume::NUMERIC DESC) AS volume_percentile
+FROM accounts
+WHERE collateral_volume IS NOT NULL AND collateral_volume != '' AND collateral_volume != '0';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_whale_rankings_id ON whale_rankings (account_id);
+
+-- 4. Whale Flow (Recent large position changes)
+CREATE MATERIALIZED VIEW IF NOT EXISTS whale_flow_24h AS
+SELECT
+    account_id,
+    market_id,
+    SUM(delta_value) AS net_flow_usd,
+    SUM(delta_quantity) AS net_flow_qty,
+    COUNT(*) AS activity_count
+FROM position_snapshots
+WHERE snapshot_time > NOW() - INTERVAL '24 hours'
+  AND ABS(delta_value) > 1000 -- Only significant moves
+GROUP BY account_id, market_id;
+
+CREATE INDEX IF NOT EXISTS idx_whale_flow_account ON whale_flow_24h (account_id);
+CREATE INDEX IF NOT EXISTS idx_whale_flow_market ON whale_flow_24h (market_id);
