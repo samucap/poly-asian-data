@@ -1,11 +1,11 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: timescale/timescaledb-ha:pg18-all-arm64
     container_name: poly-asian-postgres
     environment:
-      - POSTGRES_USER=polyuser
-      - POSTGRES_PASSWORD=polypassword
-      - POSTGRES_DB=polydata
+      - POSTGRES_USER=${POSTGRES_USER:-polyuser}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-polypassword}
+      - POSTGRES_DB=${POSTGRES_DB:-polydata}
     ports:
       - "5432:5432"
     volumes:

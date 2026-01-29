@@ -1,3 +1,6 @@
+-- 0. Enable TimescaleDB extension
+CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
+
 -- 1. Function for auto-updating updated_at
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
@@ -12,8 +15,8 @@ CREATE TABLE IF NOT EXISTS sports (
     id UUID DEFAULT gen_random_uuid() UNIQUE,
     slug TEXT PRIMARY KEY NOT NULL,
     primary_tag_id TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS tags (
@@ -24,8 +27,8 @@ CREATE TABLE IF NOT EXISTS tags (
     force_hide BOOLEAN,
     sport_id UUID REFERENCES sports(id),
     parent_tag_id TEXT REFERENCES tags(id) DEFERRABLE INITIALLY DEFERRED,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Deferrable Constraint to allow circular references during transaction
@@ -42,8 +45,8 @@ CREATE TABLE IF NOT EXISTS leagues (
     raw_tags TEXT,
     series TEXT,
     sport_id UUID REFERENCES sports(id),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS teams (
@@ -57,8 +60,8 @@ CREATE TABLE IF NOT EXISTS teams (
     provider_id INT,
     color TEXT,
     sport_id UUID REFERENCES sports(id),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS conditions (
@@ -70,23 +73,23 @@ CREATE TABLE IF NOT EXISTS conditions (
     payouts TEXT[],
     question_id TEXT,
     resolution_hash TEXT,
-    resolution_timestamp TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    resolution_timestamp TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY, -- Address
-    creation_timestamp TIMESTAMP,
-    last_seen_timestamp TIMESTAMP,
-    last_traded_timestamp TIMESTAMP,
+    creation_timestamp TIMESTAMPTZ,
+    last_seen_timestamp TIMESTAMPTZ,
+    last_traded_timestamp TIMESTAMPTZ,
     collateral_volume TEXT,
     num_trades TEXT,
     profit TEXT,
     scaled_collateral_volume TEXT,
     scaled_profit TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS order_filled_events (
@@ -98,9 +101,9 @@ CREATE TABLE IF NOT EXISTS order_filled_events (
     maker_id TEXT,
     taker_id TEXT,
     fee TEXT,
-    timestamp TIMESTAMP,
+    timestamp TIMESTAMPTZ,
     transaction_hash TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS enriched_order_filled_events (
@@ -111,8 +114,8 @@ CREATE TABLE IF NOT EXISTS enriched_order_filled_events (
     maker_id TEXT,
     taker_id TEXT,
     market_id TEXT,
-    timestamp TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    timestamp TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS plymkt_markets (
@@ -122,13 +125,13 @@ CREATE TABLE IF NOT EXISTS plymkt_markets (
     slug TEXT,
     twitter_card_image TEXT,
     resolution_source TEXT,
-    end_date TIMESTAMP,
+    end_date TIMESTAMPTZ,
     category TEXT,
     amm_type TEXT,
     liquidity TEXT,
     sponsor_name TEXT,
     sponsor_image TEXT,
-    start_date TIMESTAMP,
+    start_date TIMESTAMPTZ,
     x_axis_value TEXT,
     y_axis_value TEXT,
     denomination_token TEXT,
@@ -150,8 +153,8 @@ CREATE TABLE IF NOT EXISTS plymkt_markets (
     market_maker_address TEXT,
     created_by BIGINT,
     updated_by BIGINT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     closed_time TEXT,
     wide_format BOOLEAN,
     new BOOLEAN,
@@ -221,9 +224,9 @@ CREATE TABLE IF NOT EXISTS plymkt_markets (
     ready BOOLEAN,
     funded BOOLEAN,
     past_slugs TEXT,
-    ready_timestamp TIMESTAMP,
-    funded_timestamp TIMESTAMP,
-    accepting_orders_timestamp TIMESTAMP,
+    ready_timestamp TIMESTAMPTZ,
+    funded_timestamp TIMESTAMPTZ,
+    accepting_orders_timestamp TIMESTAMPTZ,
     competitive NUMERIC,
     rewards_min_size NUMERIC,
     rewards_max_spread NUMERIC,
@@ -252,10 +255,10 @@ CREATE TABLE IF NOT EXISTS plymkt_markets (
     uma_resolution_statuses TEXT,
     pending_deployment BOOLEAN,
     deploying BOOLEAN,
-    deploying_timestamp TIMESTAMP,
-    scheduled_deployment_timestamp TIMESTAMP,
+    deploying_timestamp TIMESTAMPTZ,
+    scheduled_deployment_timestamp TIMESTAMPTZ,
     rfq_enabled BOOLEAN,
-    event_start_time TIMESTAMP,
+    event_start_time TIMESTAMPTZ,
     raw_json JSONB
 );
 

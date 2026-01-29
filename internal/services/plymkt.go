@@ -489,7 +489,7 @@ func (ply *PlyMktService) GetSportsReqs(ctx context.Context) ([]*fetcher.Request
 	return reqs, nil
 }
 
-var subgraphEntities = map[string]string{
+var SubgraphEntities = map[string]string{
 	"ordersMatchedEvents": `ordersMatchedEvents(first: $first, where: { id_gt: $lastId }, orderBy: id, orderDirection: asc) {
 		id
 		takerAmountFilled
@@ -530,7 +530,7 @@ var subgraphEntities = map[string]string{
 			id
 		}
 	}`,
-	"accounts": `accounts(first: $first, where: { id_gt: $lastId }, orderBy: id, orderDirection: asc) {
+	"accounts": `accounts(first: $first, where: { id_gt: $lastId }) {
 		id
 		creationTimestamp
 		lastSeenTimestamp
@@ -552,12 +552,27 @@ var subgraphEntities = map[string]string{
 		payoutNumerators
 		payouts
 		fixedProductMarketMakers {
-			id  # Linked FPMMs/markets
+			id
 		}
 	}`,
 	"fpmms": `fpmms(first: $first, where: { id_gt: $lastId }, orderBy: id, orderDirection: asc) {
 		conditionId,
 		id
+	}`,
+	"userPositions": `userPositions(
+		first: $first
+		where: {user: $userId, id_gt: $lastId}
+		orderBy: amount
+		orderDirection: asc
+		subgraphError: allow
+	) {
+		id
+		user
+		tokenId
+		amount
+		realizedPnl
+		avgPrice
+		totalBought
 	}`,
 }
 
@@ -619,85 +634,104 @@ type PlyMktOrderFilledEvent struct {
 	TransactionHash string `json:"transactionHash"`
 }
 
-func (ply *PlyMktService) GetSubgraphReqs(ctx context.Context) ([]*fetcher.Request, error) {
-	targets := map[string]struct{
-		path string
-		entity string
-	}{
-		//"conditions": {
-		//	path: "/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC", // Example path, or use ID from stub
-		//	entity: "conditions",
-		//},
-		//"orderFilledEvents": {
-		//	path: "/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC",
-		//	entity: "orderFilledEvents",
-		//},
-		//"enrichedOrderFilleds": {
-		//	path: "/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC",
-		//	entity: "enrichedOrderFilleds",
-		//},
-		"accounts": {
-			path: "/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC",
-			entity: "accounts",
-		},
-		"fpmms": {
-			path: "/6c58N5U4MtQE2Y8njfVrrAfRykzfqajMGeTMEvMmskVz", 
-			entity: "fpmms",
-		},
-    }
-    
-    // We need the host. 
-    host := config.DefaultEndpoints["subgraph"].(string) // generic placeholder
+var targets = map[string]struct{
+	path string
+	entity string
+}{
+	"conditions": {
+		path: "/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC", // Example path, or use ID from stub
+		entity: "conditions",
+	},
+	"orderFilledEvents": {
+		path: "/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC",
+		entity: "orderFilledEvents",
+	},
+	"enrichedOrderFilleds": {
+		path: "/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC",
+		entity: "enrichedOrderFilleds",
+	},
+	"accounts": {
+		path: "/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC",
+		entity: "accounts",
+	},
+	"fpmms": {
+		path: "/6c58N5U4MtQE2Y8njfVrrAfRykzfqajMGeTMEvMmskVz", 
+		entity: "fpmms",
+	},
+	"userPositions": {
+		path: "/6c58N5U4MtQE2Y8njfVrrAfRykzfqajMGeTMEvMmskVz", 
+		entity: "userPositions",
+	},
+}
+
+func (ply *PlyMktService) BuildTempRequests(targetsList []string) ([]*fetcher.Request, error) {
 	var reqs []*fetcher.Request
-    
-    // Helper to build request
-    buildReq := func(key, path, entityQuery string) *fetcher.Request {
-         u, _ := url.Parse(host)
-         u = u.JoinPath(path)
-         
-         // Cursor pagination: id_gt instead of skip
-         fullQuery := fmt.Sprintf(`query MyQuery($first: Int, $lastId: String) {
-            %s
-         }`, entityQuery)
-         
-         // Initial Body: first=1000, lastId=""
-         bodyData := map[string]any{
-            "query": fullQuery,
-			"variables": map[string]any{
-				"first": 1000,
-				"lastId": "",
-			},
-         }
-         
-         bodyBytes, err := json.Marshal(bodyData)
-         if err != nil {
-             ply.Logger.Error("failed to marshal body", slog.String("entity", key))
-             return nil
-         }
-
-         return &fetcher.Request{
-            URL: u.String(),
-            Method: "POST",
-            Headers: map[string]string{
-				"Content-Type": "application/json",
-				"Authorization": fmt.Sprintf("Bearer %s", ply.Cfg.SubgraphAPIKey),
-			},
-            Body: bytes.NewReader(bodyBytes),
-            Metadata: map[string]string{
-                "Type": "subgraph",
-                "Entity": key,
-                "GraphqlQuery": fullQuery,
-                "CursorPagination": "true", // Flag for Processor/Fetcher
-            },
-            // No Params set to avoid fetcher auto-pagination
-         }
-    }
-
-	for target := range targets {
-		reqs = append(reqs, buildReq(target, targets[target].path, subgraphEntities[target]))
+	for _, target := range targetsList {
+		if req, err := ply.gqlRequestBuilder(target, ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string), targets[target].path, SubgraphEntities[target]); err != nil {
+			return nil, err
+		} else {
+			reqs = append(reqs, req)
+		}
 	}
 
 	return reqs, nil
+}
+
+func (ply *PlyMktService) GetSubgraphReqs(ctx context.Context, targetsList []string) ([]*fetcher.Request, error) {
+    // We need the host. 
+    host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string) // generic placeholder
+	var reqs []*fetcher.Request
+    
+	for _, target := range targetsList {
+		if req, err := ply.gqlRequestBuilder(target, host, targets[target].path, SubgraphEntities[target]); err != nil {
+			return nil, err
+		} else {
+			reqs = append(reqs, req)
+		}
+	}
+
+	return reqs, nil
+}
+
+func (ply *PlyMktService) gqlRequestBuilder(key, host, path, entityQuery string) (*fetcher.Request, error) {
+	u, _ := url.Parse(host)
+	u = u.JoinPath(path)
+	
+	// Cursor pagination: id_gt instead of skip
+	fullQuery := fmt.Sprintf(`query MyQuery($first: Int, $lastId: String) {
+		%s
+	}`, entityQuery)
+	
+	// Initial Body: first=1000, lastId=""
+	bodyData := map[string]any{
+		"query": fullQuery,
+		"variables": map[string]any{
+			"first": 1000,
+			"lastId": "",
+		},
+	}
+	
+	bodyBytes, err := json.Marshal(bodyData)
+	if err != nil {
+		ply.Logger.Error("failed to marshal body", slog.String("entity", key))
+		return nil, err
+	}
+
+	return &fetcher.Request{
+		URL: u.String(),
+		Method: "POST",
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+			"Authorization": fmt.Sprintf("Bearer %s", ply.Cfg.SubgraphAPIKey),
+		},
+		Body: bytes.NewReader(bodyBytes),
+		Metadata: map[string]string{
+			"Type": "subgraph",
+			"Entity": key,
+			"GraphqlQuery": fullQuery,
+			"CursorPagination": "true", // Flag for Processor/Fetcher
+		},
+	}, nil
 }
 
 // TODO: need to implement this sports sync using the pipeline, but need to

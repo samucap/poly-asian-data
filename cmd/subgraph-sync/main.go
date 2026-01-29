@@ -59,5 +59,5 @@ func subgraphSync(ctx context.Context, cfg *config.Config) {
 		logging.Error("Failed to create pipeline", slog.Any("error", err))
 		os.Exit(1)
 	}
-	plyMktPipeline.RunSubgraphSync()
+	plyMktPipeline.RunSubgraphSync(ctx)
 }

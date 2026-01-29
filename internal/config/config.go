@@ -1,6 +1,9 @@
 package config
 
 import (
+	"fmt"
+	"net/url"
+	"os"
 	"runtime"
 	"strings"
 	"time"
@@ -9,6 +12,14 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/spf13/viper"
 )
+
+// getEnv returns the value of an environment variable or a default value.
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
 
 // DefaultEndpoints contains the default Polymarket API endpoints.
 var DefaultEndpoints = map[string]any{
@@ -118,6 +129,20 @@ func Load() (*Config, error) {
 	v.SetDefault("ProcessorCfg.Qsize", processorWorkers*5)
 	v.SetDefault("SaverCfg.NumWorkers", saverWorkers)
 	v.SetDefault("SaverCfg.Qsize", saverWorkers*5)
+
+	// Construct POSTGRES_URL from individual env vars (allows Docker Compose compatibility)
+	// Only set if POSTGRES_URL is not already explicitly provided
+	if os.Getenv("POSTGRES_URL") == "" {
+		// URL-encode user/password to handle special characters
+		postgresURL := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+			url.QueryEscape(getEnv("POSTGRES_USER", "postgres")),
+			url.QueryEscape(getEnv("POSTGRES_PASSWORD", "postgres")),
+			getEnv("POSTGRES_HOST", "localhost"),
+			getEnv("POSTGRES_PORT", "5432"),
+			getEnv("POSTGRES_DB", "postgres"),
+		)
+		v.Set("POSTGRES_URL", postgresURL)
+	}
 
 	// Step 3: Bind to environment variables (this gives system ENV priority)
 	//v.AutomaticEnv()

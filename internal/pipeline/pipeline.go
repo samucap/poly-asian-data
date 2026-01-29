@@ -152,7 +152,7 @@ func (p *Pipeline) RunSportsTagsSync() {
 }
 
 // RunSubgraphSync starts the pipeline for subgraph data sync.
-func (p *Pipeline) RunSubgraphSync() {
+func (p *Pipeline) RunSubgraphSync(ctx context.Context) {
 	p.logger.Info("Starting Subgraph Sync...")
 
 	plyMktSvc := &services.PlyMktService{
@@ -161,7 +161,9 @@ func (p *Pipeline) RunSubgraphSync() {
 		Ctx:    p.ctx,
 	}
 
-	reqs, err := plyMktSvc.GetSubgraphReqs(p.ctx)
+	targets := []string{"fpmms"}
+
+	reqs, err := plyMktSvc.GetSubgraphReqs(ctx, targets)
 	if err != nil {
 		p.logger.Error("failed to get subgraph reqs", slog.Any("error", err))
 		return
