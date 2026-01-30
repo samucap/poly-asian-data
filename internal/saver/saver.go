@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -14,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -339,6 +339,8 @@ func (s *Saver) workerTask(ctx context.Context, record *Record) (*Result, error)
 		rowsAffected, err = s.batchInsertOrderbooks(ctx, record.Data)
 	case "plymkt_events":
 		rowsAffected, err = s.batchInsertEvents(ctx, record.Data)
+	case "enriched_order_filled_events":
+		rowsAffected, err = s.batchInsertEnrichedOrderFilledEvents(ctx, record.Data)
 	default:
 		return nil, fmt.Errorf("unknown table: %s", record.TableName)
 	}
@@ -1438,7 +1440,7 @@ func (s *Saver) batchInsertEnrichedOrderFilledEvents(ctx context.Context, data a
 		batch.Queue(`
 			INSERT INTO enriched_order_filled_events (id, price, side, size, maker_id, taker_id, market_id, timestamp, created_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-			ON CONFLICT (id) DO NOTHING
+			ON CONFLICT (id, timestamp) DO NOTHING
 		`,
 			item.ID,
 			item.Price,

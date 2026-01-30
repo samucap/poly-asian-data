@@ -116,7 +116,8 @@ CREATE TABLE IF NOT EXISTS enriched_order_filled_events (
     taker_id TEXT,
     market_id TEXT,
     timestamp TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id, timestamp)
 );
 
 -- Events from Gamma API /events endpoint

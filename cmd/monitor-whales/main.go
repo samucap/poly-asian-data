@@ -245,8 +245,8 @@ func printScreen(ctx context.Context, db *pgxpool.Pool, paused bool, sortBy stri
 				}
 			}
 			// Use standard formatting with safe slice
-			fmt.Fprintf(w, "%s..\t%s\t%s\t%s\t%s\t\n",
-				safeSlice(id, 8), formatMoney(vol), formatMoney(profit), formatNumber(trades), lastActiveDisplay)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t\n",
+				formatAddress(id), formatMoney(vol), formatMoney(profit), formatNumber(trades), lastActiveDisplay)
 		}
 		rows.Close()
 	}
@@ -271,8 +271,8 @@ func printScreen(ctx context.Context, db *pgxpool.Pool, paused bool, sortBy stri
 			var acc, mkt string
 			var val, delta float64
 			rows.Scan(&ts, &acc, &mkt, &val, &delta)
-			fmt.Fprintf(w, "%s\t%s..\t%s..\t$%.2f\t$%.2f\t\n",
-				ts.Format(time.TimeOnly), safeSlice(acc, 6), safeSlice(mkt, 6), val, delta)
+			fmt.Fprintf(w, "%s\t%s\t%s\t$%.2f\t$%.2f\t\n",
+				ts.Format(time.TimeOnly), formatAddress(acc), formatAddress(mkt), val, delta)
 		}
 		if !hasRows {
 			fmt.Fprintln(w, "(no snapshots yet)")
@@ -301,8 +301,8 @@ func printScreen(ctx context.Context, db *pgxpool.Pool, paused bool, sortBy stri
 			var flow float64
 			var count int
 			rows.Scan(&acc, &mkt, &flow, &count)
-			fmt.Fprintf(w, "%s..\t%s..\t$%.2f\t%d events\t\n",
-				safeSlice(acc, 8), safeSlice(mkt, 8), flow, count)
+			fmt.Fprintf(w, "%s\t%s\t$%.2f\t%d events\t\n",
+				formatAddress(acc), formatAddress(mkt), flow, count)
 		}
 		if !hasRows {
 			fmt.Fprintln(w, "(no whale flow in last 24h)")
@@ -368,6 +368,14 @@ func safeSlice(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+// formatAddress returns a shortened address like 0x1234...5678
+func formatAddress(s string) string {
+	if len(s) <= 12 {
+		return s
+	}
+	return s[:6] + "..." + s[len(s)-4:]
 }
 
 // parseTimestamp parses a unix timestamp string to time.Time
