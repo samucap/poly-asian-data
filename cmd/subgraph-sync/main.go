@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -12,7 +13,11 @@ import (
 	"github.com/samucap/poly-asian-data/internal/pipeline"
 )
 
+var fullSync = flag.Bool("full", false, "Force full sync, ignore saved cursors")
+
 func main() {
+	flag.Parse()
+	
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -39,6 +44,7 @@ func main() {
 	logging.Info("Configuration loaded successfully",
 		slog.String("environment", cfg.ENV),
 		slog.String("log level", cfg.LogLevel),
+		slog.Bool("fullSync", *fullSync),
 	)
 
 	logging.Info("Application initialized. Starting subgraph sync pipeline...")
@@ -47,17 +53,17 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	go subgraphSync(ctx, cfg)
+	go subgraphSync(ctx, cfg, *fullSync)
 
 	<-sigChan
 	logging.Info("Shutdown signal received. Exiting...")
 }
 
-func subgraphSync(ctx context.Context, cfg *config.Config) {
+func subgraphSync(ctx context.Context, cfg *config.Config, fullSync bool) {
 	plyMktPipeline, err := pipeline.New(ctx, cfg)
 	if err != nil {
 		logging.Error("Failed to create pipeline", slog.Any("error", err))
 		os.Exit(1)
 	}
-	plyMktPipeline.RunSubgraphSync(ctx)
+	plyMktPipeline.RunSubgraphSyncWithOpts(ctx, fullSync)
 }

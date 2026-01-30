@@ -165,17 +165,30 @@ func (p *Pipeline) RunWhaleSync(ctx context.Context) {
 	discoveryTicker := time.NewTicker(5 * time.Minute)
 	fillsTicker := time.NewTicker(1 * time.Minute)
 	positionsTicker := time.NewTicker(3 * time.Minute) // Every 3 min
+	accountsTicker := time.NewTicker(10 * time.Minute) // Every 10 min
 	liveDataTicker := time.NewTicker(1 * time.Minute)
+    whaleFillsTicker := time.NewTicker(10 * time.Minute) // Targeted history sync
 
 	defer func() {
 		discoveryTicker.Stop()
 		fillsTicker.Stop()
 		positionsTicker.Stop()
+		accountsTicker.Stop()
 		liveDataTicker.Stop()
+        whaleFillsTicker.Stop()
 	}()
 
 	// 1. Initial Discovery Run
 	p.runDiscovery(plyMktSvc)
+	p.WaitUntilIdle(ctx, 2*time.Second)
+	p.logCycleComplete("initial_discovery")
+	
+	// 2. Initial Account Sync (Backgrounded to avoid blocking startup)
+	go func() {
+		p.runAccountSync(plyMktSvc)
+		p.logger.Info("Initial Account Sync cycle finished (background)")
+	}()
+    // No WaitUntilIdle here, let it run parallel to positions sync
 
 	// Main Loop
 	for {
@@ -186,17 +199,120 @@ func (p *Pipeline) RunWhaleSync(ctx context.Context) {
 
 		case <-discoveryTicker.C:
 			p.runDiscovery(plyMktSvc)
+			p.WaitUntilIdle(ctx, 2*time.Second)
+			p.logCycleComplete("discovery")
 
 		case <-fillsTicker.C:
 			p.runFillsSync(plyMktSvc)
+			p.WaitUntilIdle(ctx, 2*time.Second)
+			p.logCycleComplete("fills")
 
 		case <-positionsTicker.C:
 			p.runWhalePositionsSync(plyMktSvc)
+			p.WaitUntilIdle(ctx, 2*time.Second)
+			p.logCycleComplete("positions")
 
 		case <-liveDataTicker.C:
 			p.runLiveDataSync(plyMktSvc)
+			p.WaitUntilIdle(ctx, 2*time.Second)
+			p.logCycleComplete("live_data")
+
+		case <-accountsTicker.C:
+			success := p.runAccountSync(plyMktSvc)
+			p.WaitUntilIdle(ctx, 2*time.Second)
+			p.logCycleComplete("accounts")
+            
+            // If accounts sync failed, schedule a retry after other syncs
+            if !success {
+                go func() {
+                    // Wait a bit for other syncs to have a chance
+                    time.Sleep(30 * time.Second)
+                    p.logger.Info("Retrying Account Sync after delay...")
+                    p.runAccountSync(plyMktSvc)
+                }()
+            }
+
+        case <-whaleFillsTicker.C:
+            p.runWhaleFillsSync(plyMktSvc)
+            p.WaitUntilIdle(ctx, 2*time.Second)
+            p.logCycleComplete("whale_fills")
 		}
 	}
+}
+
+func (p *Pipeline) runAccountSync(svc *services.PlyMktService) bool {
+	p.logger.Info("Running Account Sync Phase...")
+	
+    // Use a timeout context to prevent one sync from blocking forever
+    syncCtx, cancel := context.WithTimeout(p.ctx, 2*time.Minute)
+    defer cancel()
+    
+	targets := []string{"accounts"}
+	
+	// Load cursor from DB for incremental sync
+	startIds := make(map[string]string)
+	cursor, err := p.saverPool.GetSyncCursor(syncCtx, "accounts")
+	if err != nil {
+		p.logger.Warn("failed to load accounts cursor, starting fresh", slog.Any("error", err))
+	} else if cursor != "" {
+		startIds["accounts"] = cursor
+		p.logger.Info("Resuming accounts sync from cursor", slog.String("cursor", cursor))
+	}
+	
+	reqs, err := svc.GetSubgraphReqs(syncCtx, targets, startIds)
+	if err != nil {
+		p.logger.Error("failed to get account sync reqs", slog.Any("error", err))
+		return false
+	}
+
+	p.logger.Info("Dispatched Account Sync requests", slog.Int("count", len(reqs)))
+    
+    const maxErrors = 3
+    errorCount := 0
+    
+	for _, req := range reqs {
+        // Check if context timed out
+        select {
+        case <-syncCtx.Done():
+            p.logger.Warn("Account sync timed out, will retry after other syncs",
+                slog.Int("errors", errorCount),
+            )
+            return false
+        default:
+        }
+        
+		if err := p.fetcherPool.SubmitAndThenWait(req); err != nil {
+			p.logger.Error("failed to submit account req", slog.String("url", req.URL), slog.Any("error", err))
+            errorCount++
+            if errorCount >= maxErrors {
+                p.logger.Warn("Account sync hit error limit, will retry after other syncs",
+                    slog.Int("errorCount", errorCount),
+                    slog.Int("maxErrors", maxErrors),
+                )
+                return false
+            }
+		} else {
+            // Reset error count on success
+            errorCount = 0
+        }
+	}
+	
+	// Mark sync as complete
+	if err := p.saverPool.MarkSyncComplete(syncCtx, "accounts"); err != nil {
+		p.logger.Warn("failed to mark accounts sync complete", slog.Any("error", err))
+	}
+	
+    return true
+}
+
+func (p *Pipeline) logCycleComplete(phase string) {
+	stats := p.Stats()
+	p.logger.Info("cycle complete",
+		slog.String("phase", phase),
+		slog.Int64("fetched", stats.Fetcher.Completed),
+		slog.Int64("processed", stats.Processor.Completed),
+		slog.Int64("saved", stats.Saver.RecordsSaved),
+	)
 }
 
 func (p *Pipeline) runDiscovery(svc *services.PlyMktService) {
@@ -218,17 +334,29 @@ func (p *Pipeline) runDiscovery(svc *services.PlyMktService) {
 }
 
 func (p *Pipeline) runFillsSync(svc *services.PlyMktService) {
-	p.logger.Info("Running Fills Sync Phase...")
+	p.logger.Info("Running Fills Sync Phase (Targeted Active Markets)...")
 	
-	// Fetch EnrichedOrderFilleds (Global Sync for now)
-	targets := []string{"enrichedOrderFilleds"}
-	reqs, err := svc.GetSubgraphReqs(p.ctx, targets)
+    // 1. Get Active Markets from DB
+    marketIDs, err := p.saverPool.GetActiveMarketIDs(p.ctx, 100)
+    if err != nil {
+        p.logger.Error("failed to get active market IDs", slog.Any("error", err))
+        return
+    }
+    
+    if len(marketIDs) == 0 {
+        p.logger.Info("No active markets found in DB yet. Skipping fills sync.")
+        return
+    }
+    p.logger.Info("Fetched Active Market IDs", slog.Int("count", len(marketIDs)))
+
+	// 2. Build Targeted Requests
+	reqs, err := svc.GetMarketFillsReqs(p.ctx, marketIDs)
 	if err != nil {
-		p.logger.Error("failed to get fills sync reqs", slog.Any("error", err))
+		p.logger.Error("failed to get market fills reqs", slog.Any("error", err))
 		return
 	}
 
-	p.logger.Info("Dispatched Fills Sync requests", slog.Int("count", len(reqs)))
+	p.logger.Info("Dispatched Market Fills requests", slog.Int("count", len(reqs)))
 	for _, req := range reqs {
 		if err := p.fetcherPool.SubmitAndThenWait(req); err != nil {
 			p.logger.Error("failed to submit fills req", slog.String("url", req.URL), slog.Any("error", err))
@@ -238,12 +366,25 @@ func (p *Pipeline) runFillsSync(svc *services.PlyMktService) {
 
 func (p *Pipeline) runWhalePositionsSync(svc *services.PlyMktService) {
 	p.logger.Info("Running Whale Positions Sync Phase...")
-	// TODO: Filter by specific whale addresses in a real scenario
-	// For now, sync all user positions or a subset to discover whales
-	targets := []string{"userPositions"}
-	reqs, err := svc.GetSubgraphReqs(p.ctx, targets)
+	
+	// 1. Get Top Whales from DB
+	// User requested "top 100 accounts"
+	whaleIDs, err := p.saverPool.GetWhaleIDs(p.ctx, 100)
 	if err != nil {
-		p.logger.Error("failed to get position sync reqs", slog.Any("error", err))
+		p.logger.Error("failed to get top whale IDs", slog.Any("error", err))
+		return
+	}
+	
+	if len(whaleIDs) == 0 {
+		p.logger.Info("No whales found in DB yet. Skipping position sync.")
+		return
+	}
+	p.logger.Info("Fetched Top Whale IDs", slog.Int("count", len(whaleIDs)))
+
+	// 2. Build Targeted Requests
+	reqs, err := svc.GetWhalePositionsReqs(p.ctx, whaleIDs)
+	if err != nil {
+		p.logger.Error("failed to get whale position reqs", slog.Any("error", err))
 		return
 	}
 
@@ -251,6 +392,35 @@ func (p *Pipeline) runWhalePositionsSync(svc *services.PlyMktService) {
 	for _, req := range reqs {
 		if err := p.fetcherPool.SubmitAndThenWait(req); err != nil {
 			p.logger.Error("failed to submit position req", slog.String("url", req.URL), slog.Any("error", err))
+		}
+	}
+}
+
+func (p *Pipeline) runWhaleFillsSync(svc *services.PlyMktService) {
+	p.logger.Info("Running Whale Fills (History) Sync Phase...")
+	
+	// 1. Get Top Whales from DB
+	whaleIDs, err := p.saverPool.GetWhaleIDs(p.ctx, 100)
+	if err != nil {
+		p.logger.Error("failed to get top whale IDs for fills", slog.Any("error", err))
+		return
+	}
+	
+	if len(whaleIDs) == 0 {
+		return
+	}
+
+	// 2. Build Targeted Fills Requests (Maker & Taker)
+	reqs, err := svc.GetWhaleFillsReqs(p.ctx, whaleIDs)
+	if err != nil {
+		p.logger.Error("failed to get whale fills reqs", slog.Any("error", err))
+		return
+	}
+
+	p.logger.Info("Dispatched Whale Fills requests", slog.Int("count", len(reqs)))
+	for _, req := range reqs {
+		if err := p.fetcherPool.SubmitAndThenWait(req); err != nil {
+			p.logger.Error("failed to submit whale fill req", slog.String("url", req.URL), slog.Any("error", err))
 		}
 	}
 }
@@ -294,8 +464,15 @@ func (p *Pipeline) runLiveDataSync(svc *services.PlyMktService) {
 }
 
 // RunSubgraphSync starts the pipeline for subgraph data sync.
+// Supports incremental syncing by loading cursors from DB.
 func (p *Pipeline) RunSubgraphSync(ctx context.Context) {
-	p.logger.Info("Starting Subgraph Sync...")
+	p.RunSubgraphSyncWithOpts(ctx, false)
+}
+
+// RunSubgraphSyncWithOpts starts the pipeline for subgraph data sync with options.
+// If fullSync is true, ignores saved cursors and starts from beginning.
+func (p *Pipeline) RunSubgraphSyncWithOpts(ctx context.Context, fullSync bool) {
+	p.logger.Info("Starting Subgraph Sync...", slog.Bool("fullSync", fullSync))
 
 	plyMktSvc := &services.PlyMktService{
 		Cfg:    p.cfg,
@@ -305,15 +482,36 @@ func (p *Pipeline) RunSubgraphSync(ctx context.Context) {
 
 	targets := []string{"fpmms"}
 
-	reqs, err := plyMktSvc.GetSubgraphReqs(ctx, targets)
+	// Load cursors from DB for incremental sync
+	var startIds map[string]string
+	if !fullSync {
+		cursors, err := p.saverPool.GetAllSyncCursors(ctx)
+		if err != nil {
+			p.logger.Warn("failed to load sync cursors, starting fresh", slog.Any("error", err))
+		} else if len(cursors) > 0 {
+			startIds = cursors
+			p.logger.Info("Loaded sync cursors for incremental sync", 
+				slog.Int("count", len(cursors)),
+				slog.Any("cursors", cursors),
+			)
+		}
+	} else {
+		// Full sync - reset cursors
+		for _, target := range targets {
+			if err := p.saverPool.ResetSyncCursor(ctx, target); err != nil {
+				p.logger.Warn("failed to reset cursor", slog.String("target", target), slog.Any("error", err))
+			}
+		}
+	}
+
+	reqs, err := plyMktSvc.GetSubgraphReqs(ctx, targets, startIds)
 	if err != nil {
 		p.logger.Error("failed to get subgraph reqs", slog.Any("error", err))
 		return
 	}
 
-	p.logger.Info("DEBUG: Submitting initial subgraph requests...")
-	for i, req := range reqs {
-		p.logger.Info("DEBUG: Submitting request", slog.Int("index", i), slog.String("url", req.URL))
+	p.logger.Info("Submitting subgraph requests...", slog.Int("count", len(reqs)))
+	for _, req := range reqs {
 		if err := p.fetcherPool.SubmitAndThenWait(req); err != nil {
 			p.logger.Error("failed to submit req", slog.Any("error", err))
 			return
@@ -321,9 +519,15 @@ func (p *Pipeline) RunSubgraphSync(ctx context.Context) {
 	}
 
 	p.logger.Info("Initial subgraph requests submitted. Waiting for pipeline completion...")
-	// Wait responsibly
 	p.WaitUntilIdle(p.ctx, 5*time.Second)
-	p.logger.Info("DEBUG: WaitUntilIdle returned. Printing final report...")
+	
+	// Mark syncs as complete
+	for _, target := range targets {
+		if err := p.saverPool.MarkSyncComplete(ctx, target); err != nil {
+			p.logger.Warn("failed to mark sync complete", slog.String("target", target), slog.Any("error", err))
+		}
+	}
+	
 	p.PrintFinalReport()
 	p.StopNow()
 }
@@ -489,6 +693,19 @@ func (p *Pipeline) routeProcessorOutput(ctx context.Context) {
 						}
 					}()
 				}
+			}
+
+			// 1b. Update sync cursor for incremental sync
+			if output.SyncType != "" && output.LastCursor != "" {
+				go func(syncType, cursor string, itemCount int) {
+					if err := p.saverPool.SetSyncCursor(ctx, syncType, cursor, itemCount); err != nil {
+						p.logger.Warn("failed to update sync cursor",
+							slog.String("syncType", syncType),
+							slog.String("cursor", cursor),
+							slog.Any("error", err),
+						)
+					}
+				}(output.SyncType, output.LastCursor, output.ItemCount)
 			}
 
 			// 2. Route Derived Requests (e.g. Events for Sports)

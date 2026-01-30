@@ -66,6 +66,9 @@ type Output struct {
 	Duration        time.Duration
 	ProcessedAt     time.Time
 	OriginalRequest *fetcher.Request
+	// For incremental sync cursor tracking
+	SyncType   string // Entity type (e.g., "accounts", "fpmms")
+	LastCursor string // Last ID processed (for cursor pagination)
 }
 
 // Stats contains atomic counters for processor statistics.
@@ -146,6 +149,8 @@ func (p *Processor) SubscribeToFetcher(ctx context.Context, upstream <-chan work
 				return
 			}
 			if result.Err != nil {
+				p.logger.Warn("skipping failed fetch result",
+					slog.String("error", result.Err.Error()))
 				continue
 			}
 			_ = p.SubmitWait(result.Value)
@@ -339,6 +344,8 @@ func (p *Processor) processEvents(resp *fetcher.Response) (*Output, error) {
 	var derivedReqs []*fetcher.Request
 	var marketsToSave []services.PlyMktMarket
 	var tagsToUpdate []services.PlyMktTag
+	var allTokenIds []string           // Collect all tokens for batch orderbook request
+	seenTokens := make(map[string]bool) // Global deduplication for price history
 
 	for _, ev := range events {
 		// Determine effective sport slug for this event
@@ -357,69 +364,20 @@ func (p *Processor) processEvents(resp *fetcher.Response) (*Output, error) {
 			m.EventID = ev.ID // Ensure link
 			marketsToSave = append(marketsToSave, *m)
 			
-			// Generate Derived Requests
-			// 1. Orderbook
-			clobAPI, _ := p.cfg.Services.PlyMkt.Endpoints["clob"].(string) 
-			if clobAPI != "" {
-				// CLOB /book usually takes token_id.
-				// Gamma Market usually has "clobTokenIds" or we use the asset_id (tokenID).
-				// Let's assume m.AssetID is the token ID or m.ID or m.ClobTokenID (if exists)
-				// Checking PlayMktMarket struct: TokenID string `json:"clobTokenId"`
-				// Actually I need to check the struct field name.
-				// Based on common knowledge, CLOB uses Token ID.
-				// Let's use m.TokenID (if available) or m.ID?
-				// User's py-clob-client uses token_id.
-				
-				// Using m.ID as placeholder if TokenID not clear, but likely m.ID for Gamma markets map to CLOB?
-				// Wait, Gamma market ID != CLOB Token ID sometimes.
-				// Let's assume m.ID for now or check if we have a specialized field.
-				
-				// From previous view: no explicit ClobTokenId field seen in logs, but let's check code view if needed.
-				// Assuming m.ID is usable or we constructed it.
-				
-				// Parse ClobTokenIds once for orderbooks and price history
-				var tokenIds []string
-				if m.ClobTokenIds != "" {
-					if err := json.Unmarshal([]byte(m.ClobTokenIds), &tokenIds); err != nil {
-						tokenIds = strings.Split(m.ClobTokenIds, ",")
-					}
+			// Parse ClobTokenIds for this market
+			var tokenIds []string
+			if m.ClobTokenIds != "" {
+				if err := json.Unmarshal([]byte(m.ClobTokenIds), &tokenIds); err != nil {
+					tokenIds = strings.Split(m.ClobTokenIds, ",")
 				}
-
-				// Orderbook Requests - one per token
-				for _, tid := range tokenIds {
-					tid = strings.TrimSpace(tid)
-					if tid == "" {
-						continue
-					}
-					derivedReqs = append(derivedReqs, &fetcher.Request{
-						URL: fmt.Sprintf("%s/book?token_id=%s", clobAPI, tid),
-						Method: "GET",
-						Headers: map[string]string{"Content-Type": "application/json"},
-						Metadata: map[string]string{
-							"MarketID": m.ID,
-							"TokenID": tid,
-							"Type": "orderbook",
-						},
-					})
-				}
-				
-				// Price History Requests - one per token
-				for _, tid := range tokenIds {
-					tid = strings.TrimSpace(tid)
-					if tid == "" {
-						continue
-					}
-					histReq := &fetcher.Request{
-						URL: fmt.Sprintf("%s/prices-history?interval=1m&market=%s&fidelity=60", clobAPI, tid),
-						Method: "GET",
-						Headers: map[string]string{"Content-Type": "application/json"},
-						Metadata: map[string]string{
-							"MarketID": m.ID,
-							"TokenID": tid,
-							"Type": "price_history",
-						},
-					}
-					derivedReqs = append(derivedReqs, histReq)
+			}
+			
+			// Collect unique tokens for orderbook and price history
+			for _, tid := range tokenIds {
+				tid = strings.TrimSpace(tid)
+				if tid != "" && !seenTokens[tid] {
+					seenTokens[tid] = true
+					allTokenIds = append(allTokenIds, tid)
 				}
 			}
 		}
@@ -438,7 +396,51 @@ func (p *Processor) processEvents(resp *fetcher.Response) (*Output, error) {
 		}
 	}
 
+	// NOTE: Price history requests are now handled by runLiveDataSync to avoid
+	// duplicate requests across paginated event responses (was generating 30k+ requests).
+	// The batch orderbook request below still uses allTokenIds.
+
+	// Create batch orderbook requests (POST /books with token IDs, chunked to avoid API limits)
+	if len(allTokenIds) > 0 {
+		clobAPI, _ := p.cfg.Services.PlyMkt.Endpoints["clob"].(string)
+		if clobAPI != "" {
+			// Chunk tokens into batches of 100 to avoid API size limits
+			const batchSize = 100
+			type tokenReq struct {
+				TokenID string `json:"token_id"`
+			}
+			
+			for i := 0; i < len(allTokenIds); i += batchSize {
+				end := i + batchSize
+				if end > len(allTokenIds) {
+					end = len(allTokenIds)
+				}
+				chunk := allTokenIds[i:end]
+				
+				var bodyItems []tokenReq
+				for _, tid := range chunk {
+					bodyItems = append(bodyItems, tokenReq{TokenID: tid})
+				}
+				bodyBytes, _ := json.Marshal(bodyItems)
+				
+				derivedReqs = append(derivedReqs, &fetcher.Request{
+					URL:    fmt.Sprintf("%s/books", clobAPI),
+					Method: "POST",
+					Headers: map[string]string{"Content-Type": "application/json"},
+					Body:   bytes.NewReader(bodyBytes),
+					Metadata: map[string]string{
+						"Type":       "orderbooks_batch",
+						"TokenCount": fmt.Sprintf("%d", len(chunk)),
+					},
+				})
+			}
+		}
+	}
+
 	payloads := []SaverPayload{}
+	if len(events) > 0 {
+		payloads = append(payloads, SaverPayload{TableName: "plymkt_events", Data: events})
+	}
 	if len(tagsToUpdate) > 0 {
 		payloads = append(payloads, SaverPayload{TableName: "tags_sport_link", Data: tagsToUpdate})
 	}
@@ -782,25 +784,73 @@ func (p *Processor) processSubgraph(resp *fetcher.Response) (*Output, error) {
 
 	// Build Next Request if Cursor Pagination is enabled and we have a lastID
 	if itemCount >= 1000 && lastID != "" && resp.Request.Metadata["CursorPagination"] == "true" {
+            // Check MaxPages limit
+            if maxPagesStr, ok := resp.Request.Metadata["MaxPages"]; ok && maxPagesStr != "" {
+                maxPages, _ := strconv.Atoi(maxPagesStr)
+                currentPage := 1
+                if cpStr, ok := resp.Request.Metadata["CurrentPage"]; ok && cpStr != "" {
+                    currentPage, _ = strconv.Atoi(cpStr)
+                }
+                if currentPage >= maxPages {
+                    p.logger.Info("reached max pages limit",
+                        slog.Int("maxPages", maxPages),
+                        slog.Int("currentPage", currentPage),
+                    )
+                    // Return early - no next page
+                    return &Output{
+                        SaverPayloads:   payloads,
+                        DerivedRequests: derivedReqs,
+                        NextPageRequest: nil, // Stop pagination
+                        ItemCount:       itemCount,
+                        OriginalRequest: resp.Request,
+                    }, nil
+                }
+            }
+            
 			// Construct full query using request metadata template
 			fullQuery := resp.Request.Metadata["GraphqlQuery"]
+			
+			// Restore variables from Metadata or Default
+			vars := make(map[string]any)
+			if varsJSON, ok := resp.Request.Metadata["GraphqlVariables"]; ok && varsJSON != "" {
+				if err := json.Unmarshal([]byte(varsJSON), &vars); err != nil {
+					p.logger.Error("failed to unmarshal graphql variables from metadata", slog.String("error", err.Error()))
+					// Fallback to default?
+					vars["first"] = 1000
+					vars["lastId"] = lastID
+				}
+			} else {
+				// Default fallback
+				vars["first"] = 1000
+				vars["lastId"] = lastID
+			}
+
+			// Update Cursor
+			vars["lastId"] = lastID
 			
 			// Build body
 			bodyData := map[string]any{
 				"query": fullQuery,
-				"variables": map[string]any{
-					"first": 1000,
-					"lastId": lastID,
-				},
+				"variables": vars,
 			}
 			bodyBytes, _ := json.Marshal(bodyData) // Error ignored, should be safe
+            
+            // Increment CurrentPage in metadata for next request
+            newMetadata := make(map[string]string)
+            for k, v := range resp.Request.Metadata {
+                newMetadata[k] = v
+            }
+            if cpStr, ok := resp.Request.Metadata["CurrentPage"]; ok && cpStr != "" {
+                cp, _ := strconv.Atoi(cpStr)
+                newMetadata["CurrentPage"] = strconv.Itoa(cp + 1)
+            }
 			
 			nextReq = &fetcher.Request{
 				URL: resp.Request.URL,
 				Method: resp.Request.Method,
 				Headers: resp.Request.Headers,
 				Body: bytes.NewReader(bodyBytes),
-				Metadata: resp.Request.Metadata,
+				Metadata: newMetadata,
 				// No Params
 			}
 	}
@@ -810,7 +860,9 @@ func (p *Processor) processSubgraph(resp *fetcher.Response) (*Output, error) {
 		DerivedRequests: derivedReqs,
 		NextPageRequest: nextReq,
 		ItemCount:       itemCount,
-		OriginalRequest: resp.Request, // Fetcher handles generic pagination if NextPageRequest is nil
+		OriginalRequest: resp.Request,
+		SyncType:        entity,    // For cursor tracking
+		LastCursor:      lastID,    // Last ID processed
 	}, nil
 }
 
@@ -917,39 +969,53 @@ func findSportSlugForTeam(t *services.PlyMktTeam) string {
 	return "" // Simplified
 }
 
-// processOrderbook handles /book response.
+// processOrderbook handles /book and /books (batch) responses.
 func (p *Processor) processOrderbook(resp *fetcher.Response) (*Output, error) {
-	var book services.PlyMktOrderbook
-	if err := json.Unmarshal(resp.Data, &book); err != nil {
-		return nil, err
+	var books []services.PlyMktOrderbook
+	
+	// Check if batch response (array) or single (object)
+	if len(resp.Data) > 0 && resp.Data[0] == '[' {
+		// Batch response: array of orderbooks
+		if err := json.Unmarshal(resp.Data, &books); err != nil {
+			return nil, err
+		}
+	} else {
+		// Single orderbook
+		var book services.PlyMktOrderbook
+		if err := json.Unmarshal(resp.Data, &book); err != nil {
+			return nil, err
+		}
+		// Enrich from metadata
+		if book.TokenID == "" && resp.Request.Metadata != nil {
+			book.TokenID = resp.Request.Metadata["MarketID"]
+		}
+		books = append(books, book)
 	}
 
-	// Enrich from metadata
-	if book.TokenID == "" && resp.Request.Metadata != nil {
-		book.TokenID = resp.Request.Metadata["MarketID"] // Using MarketID as TokenID proxy if needed
+	// Compute Spread for all books
+	for i := range books {
+		var bestBid, bestAsk float64
+		if len(books[i].Bids) > 0 {
+			bestBid, _ = strconv.ParseFloat(books[i].Bids[0].Price, 64)
+		}
+		if len(books[i].Asks) > 0 {
+			bestAsk, _ = strconv.ParseFloat(books[i].Asks[0].Price, 64)
+		}
+		books[i].Spread = CalculateSpread(bestBid, bestAsk)
+		
+		// Use asset_id as TokenID if not set (batch API returns asset_id)
+		if books[i].TokenID == "" && books[i].AssetID != "" {
+			books[i].TokenID = books[i].AssetID
+		}
 	}
-
-	// Compute Spread
-	// Need to parse string prices to float for calculation?
-	// services.PlyMktOrderbook definitions: Price is string.
-	// calculations.CalculateSpread takes floats.
-	// Let's parse best bid/ask
-	var bestBid, bestAsk float64
-	if len(book.Bids) > 0 {
-		bestBid, _ = strconv.ParseFloat(book.Bids[0].Price, 64)
-	}
-	if len(book.Asks) > 0 {
-		bestAsk, _ = strconv.ParseFloat(book.Asks[0].Price, 64)
-	}
-	book.Spread = CalculateSpread(bestBid, bestAsk)
 
 	payloads := []SaverPayload{
-		{TableName: "orderbooks", Data: book},
+		{TableName: "orderbooks", Data: books},
 	}
 
 	return &Output{
 		SaverPayloads:   payloads,
-		ItemCount:       1,
+		ItemCount:       len(books),
 		OriginalRequest: resp.Request,
 	}, nil
 }

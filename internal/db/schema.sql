@@ -119,6 +119,44 @@ CREATE TABLE IF NOT EXISTS enriched_order_filled_events (
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Events from Gamma API /events endpoint
+CREATE TABLE IF NOT EXISTS plymkt_events (
+    id TEXT PRIMARY KEY,
+    ticker TEXT,
+    slug TEXT,
+    title TEXT,
+    description TEXT,
+    start_date TIMESTAMPTZ,
+    end_date TIMESTAMPTZ,
+    category TEXT,
+    image TEXT,
+    icon TEXT,
+    active BOOLEAN,
+    closed BOOLEAN,
+    archived BOOLEAN,
+    new BOOLEAN,
+    featured BOOLEAN,
+    restricted BOOLEAN,
+    liquidity NUMERIC,
+    volume NUMERIC,
+    volume_24hr NUMERIC,
+    volume_1wk NUMERIC,
+    volume_1mo NUMERIC,
+    volume_1yr NUMERIC,
+    liquidity_clob NUMERIC,
+    competitive NUMERIC,
+    neg_risk BOOLEAN,
+    neg_risk_market_id TEXT,
+    comment_count INT,
+    enable_order_book BOOLEAN,
+    series_slug TEXT,
+    live BOOLEAN,
+    ended BOOLEAN,
+    creator_id TEXT,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS plymkt_markets (
     id TEXT PRIMARY KEY,
     question TEXT,
@@ -345,7 +383,9 @@ SELECT create_hypertable('enriched_order_filled_events', 'timestamp', if_not_exi
 -- Materialized Views
 
 -- Latest Positions (for quick lookup of current state)
-CREATE MATERIALIZED VIEW IF NOT EXISTS latest_positions AS
+-- Latest Positions (for quick lookup of current state)
+-- Converted to Standard View for Real-time Access
+CREATE OR REPLACE VIEW latest_positions AS
 SELECT DISTINCT ON (account_id, market_id, outcome_index)
     snapshot_time,
     account_id,
@@ -356,21 +396,23 @@ SELECT DISTINCT ON (account_id, market_id, outcome_index)
 FROM position_snapshots
 ORDER BY account_id, market_id, outcome_index, snapshot_time DESC;
 
-CREATE INDEX IF NOT EXISTS idx_latest_positions_lookup ON latest_positions (account_id, market_id);
+-- CREATE INDEX IF NOT EXISTS idx_latest_positions_lookup ON latest_positions (account_id, market_id);
 
 -- Whale Candidates (Top volume accounts)
-CREATE MATERIALIZED VIEW IF NOT EXISTS whale_candidates AS
+-- Whale Candidates (Top volume accounts)
+-- Converted to Standard View for Real-time Access
+CREATE OR REPLACE VIEW whale_candidates AS
 SELECT
     id AS account_id,
-    collateral_volume, -- Stored as text in accounts table, might need casting if doing numeric sort here
+    scaled_collateral_volume,
     num_trades
 FROM accounts
--- We need to cast collateral_volume to numeric for filtering > 100000
--- Assuming format doesn't have weird chars
-WHERE (collateral_volume::NUMERIC) > 100000
-ORDER BY collateral_volume::NUMERIC DESC;
+WHERE scaled_collateral_volume IS NOT NULL 
+  AND (scaled_collateral_volume::NUMERIC) > 100  -- $100 USD threshold
+ORDER BY scaled_collateral_volume::NUMERIC DESC;
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_whale_candidates_id ON whale_candidates (account_id);
+-- Standard Views do not have independent indexes (they use underlying table)
+-- CREATE UNIQUE INDEX IF NOT EXISTS idx_whale_candidates_id ON whale_candidates (account_id);
 
 -- =============================================================================
 -- Feature Store: SQL-Based Indicators (TimescaleDB Continuous Aggregates)
@@ -424,7 +466,8 @@ WHERE collateral_volume IS NOT NULL AND collateral_volume != '' AND collateral_v
 CREATE UNIQUE INDEX IF NOT EXISTS idx_whale_rankings_id ON whale_rankings (account_id);
 
 -- 4. Whale Flow (Recent large position changes)
-CREATE MATERIALIZED VIEW IF NOT EXISTS whale_flow_24h AS
+-- Converted to Standard View for Real-time Access
+CREATE OR REPLACE VIEW whale_flow_24h AS
 SELECT
     account_id,
     market_id,
@@ -436,5 +479,11 @@ WHERE snapshot_time > NOW() - INTERVAL '24 hours'
   AND ABS(delta_value) > 1000 -- Only significant moves
 GROUP BY account_id, market_id;
 
-CREATE INDEX IF NOT EXISTS idx_whale_flow_account ON whale_flow_24h (account_id);
-CREATE INDEX IF NOT EXISTS idx_whale_flow_market ON whale_flow_24h (market_id);
+-- Sync state for incremental syncing
+CREATE TABLE IF NOT EXISTS sync_state (
+    sync_type TEXT PRIMARY KEY,      -- e.g. 'accounts', 'conditions', 'events'
+    last_cursor TEXT,                -- Last ID/offset synced
+    last_sync_at TIMESTAMPTZ,
+    total_items INT DEFAULT 0,
+    status TEXT DEFAULT 'idle'       -- 'running', 'completed', 'failed'
+);

@@ -153,7 +153,7 @@ func newSecureHTTPClient() *http.Client {
 
 	return &http.Client{
 		Transport: transport,
-		Timeout:   2 * time.Second,
+		Timeout:   30 * time.Second,
 	}
 }
 
@@ -217,6 +217,66 @@ func (f *Fetcher) Fetch(ctx context.Context, inputReqDetails *Request) (*Respons
 
 			return resp, nil
 		}
+		
+		// Error occurred (timeout or status 500+)
+		// Check for adaptive batch sizing if this is a GraphQL query
+		if varsJSON, ok := inputReqDetails.Metadata["GraphqlVariables"]; ok {
+			var vars map[string]any
+			if jsonErr := json.Unmarshal([]byte(varsJSON), &vars); jsonErr == nil {
+				// Check for 'first' parameter
+				if firstVal, ok := vars["first"]; ok {
+					// Handle float64 (json default) or int
+					var currentLimit int
+					switch v := firstVal.(type) {
+					case float64:
+						currentLimit = int(v)
+					case int:
+						currentLimit = v
+					}
+
+					// Only reduce if we have room (e.g., > 10 items)
+					if currentLimit > 10 {
+						// Reduce by 20%
+						newLimit := int(float64(currentLimit) * 0.8)
+						if newLimit < 1 {
+							newLimit = 1
+						}
+						
+						f.logger.Warn("reducing batch size due to error", 
+							slog.String("error", err.Error()),
+							slog.Int("oldLimit", currentLimit),
+							slog.Int("newLimit", newLimit),
+							slog.Int("attempt", attempt),
+						)
+						
+						// Update variables
+						vars["first"] = newLimit
+						
+						// Update Body and Metadata
+						// We need to re-construct the full body ("query", "variables")
+						// We can get the query from metadata or parsing original body?
+						// Better to rely on metadata "GraphqlQuery" as standardized in plymkt/processor
+						if query, qOk := inputReqDetails.Metadata["GraphqlQuery"]; qOk {
+							newBodyData := map[string]any{
+								"query": query,
+								"variables": vars,
+							}
+							
+							if newBodyBytes, mErr := json.Marshal(newBodyData); mErr == nil {
+								// Update Request
+								inputReqDetails.Body = bytes.NewReader(newBodyBytes)
+								
+								// Update Metadata for next retry/pagination preservation
+								if newVarsBytes, vErr := json.Marshal(vars); vErr == nil {
+									inputReqDetails.Metadata["GraphqlVariables"] = string(newVarsBytes)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		
 		lastErr = err
 	}
 

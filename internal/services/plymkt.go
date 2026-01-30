@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -323,23 +325,20 @@ type PlyMktTag struct {
 }
 
 type PlyMktUserPosition struct {
-	ID        string `json:"id"`
-	User      struct {
-		ID string `json:"id"`
-	} `json:"user"`
-	Market struct {
-		ID string `json:"id"`
-	} `json:"market"`
-	OutcomeIndex string `json:"outcomeIndex"` // Often BigInt in subgraph, check if string
-	Quantity     string `json:"quantity"`     // Net quantity
-	TotalBought  string `json:"totalBought"`
-	TotalSold    string `json:"totalSold"`
-	NetValue     string `json:"netValue"` // Might need computation if not in subgraph directly
+	ID          string `json:"id"`
+	User        string `json:"user"`
+	TokenID     string `json:"tokenId"`
+	Amount      string `json:"amount"` // Net quantity
+	AvgPrice    string `json:"avgPrice"`
+	RealizedPnl string `json:"realizedPnl"`
+	TotalBought string `json:"totalBought"`
 }
 
 type PlyMktOrderbook struct {
 	Timestamp string          `json:"timestamp"` // Derived or from snapshot time
 	TokenID   string          `json:"token_id"`
+	AssetID   string          `json:"asset_id"` // From batch API response
+	Market    string          `json:"market"`   // Market identifier from batch API
 	Bids      []OrderbookItem `json:"bids"`
 	Asks      []OrderbookItem `json:"asks"`
 	Spread    float64         `json:"spread"` // Computed
@@ -499,7 +498,7 @@ func (ply *PlyMktService) GetDiscoveryReqs(ctx context.Context) ([]*fetcher.Requ
 	// Query Params: active=true, closed=false (implied by active?), archived=false
 	// User said "active events".
 	// We'll return an initial request that triggers pagination in the Processor/Fetcher loop.
-	limit := 100
+	limit := 300
 	offset := 0
 	
 	var reqs []*fetcher.Request
@@ -636,7 +635,13 @@ var SubgraphEntities = map[string]string{
 			id
 		}
 	}`,
-	"accounts": `accounts(first: $first, where: { id_gt: $lastId }) {
+	"accounts": `accounts(first: $first,
+		where: {
+			id_gt: $lastId,
+			scaledCollateralVolume_gte: $scaledCollateralVolumeGte
+		},
+		orderBy: scaledCollateralVolume,
+		orderDirection: desc) {
 		id
 		creationTimestamp
 		lastSeenTimestamp
@@ -667,17 +672,16 @@ var SubgraphEntities = map[string]string{
 	}`,
 	"userPositions": `userPositions(
 		first: $first
-		where: {user: $userId, id_gt: $lastId}
-		orderBy: amount
-		orderDirection: asc
-		subgraphError: allow
+		where: {id_gt: $lastId, user: $userId}
+		orderBy: id
+		orderDirection: desc
 	) {
 		id
 		user
 		tokenId
 		amount
-		realizedPnl
 		avgPrice
+		realizedPnl
 		totalBought
 	}`,
 }
@@ -815,6 +819,7 @@ func (ply *PlyMktService) GetPriceHistoryReq(tokenID string, fidelity int, start
 	
 	q := u.Query()
 	q.Set("market", tokenID)
+	q.Set("interval", "max") // Use 'max' to get all available history
 	q.Set("fidelity", fmt.Sprintf("%d", fidelity))
 	if startTs > 0 {
 		q.Set("startTs", fmt.Sprintf("%d", startTs))
@@ -838,7 +843,21 @@ func (ply *PlyMktService) GetPriceHistoryReq(tokenID string, fidelity int, start
 func (ply *PlyMktService) BuildTempRequests(targetsList []string) ([]*fetcher.Request, error) {
 	var reqs []*fetcher.Request
 	for _, target := range targetsList {
-		if req, err := ply.gqlRequestBuilder(target, ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string), targets[target].path, SubgraphEntities[target]); err != nil {
+        // Default vars stub
+        vars := map[string]any{
+            "first": 1000,
+            "lastId": "",
+        }
+        // Need to construct URL stub using logic or just pass a placeholder if this function isn't used
+        // It seems this function is a legacy backup? Let's fix signature anyway.
+        // It was calling gqlRequestBuilder(target, host, path, entity) BEFORE I changed signature 
+        // to gqlRequestBuilder(key, fullURL, entityQuery, vars).
+        
+        host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
+        u, _ := url.Parse(host)
+        u = u.JoinPath(targets[target].path)
+        
+		if req, err := ply.gqlRequestBuilder(target, u.String(), SubgraphEntities[target], vars); err != nil {
 			return nil, err
 		} else {
 			reqs = append(reqs, req)
@@ -848,15 +867,68 @@ func (ply *PlyMktService) BuildTempRequests(targetsList []string) ([]*fetcher.Re
 	return reqs, nil
 }
 
-func (ply *PlyMktService) GetSubgraphReqs(ctx context.Context, targetsList []string) ([]*fetcher.Request, error) {
-    // We need the host. 
-    host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string) // generic placeholder
+// GetSubgraphReqsWithOpts generates subgraph requests with optional configuration.
+// accountsMinVolume: if non-empty, used as scaledCollateralVolume_gte filter for accounts query.
+func (ply *PlyMktService) GetSubgraphReqs(ctx context.Context, targetsList []string, startIds map[string]string) ([]*fetcher.Request, error) {
+	return ply.GetSubgraphReqsWithOpts(ctx, targetsList, startIds, "")
+}
+
+// GetSubgraphReqsWithOpts generates subgraph requests with optional volume threshold.
+func (ply *PlyMktService) GetSubgraphReqsWithOpts(ctx context.Context, targetsList []string, startIds map[string]string, accountsMinVolume string) ([]*fetcher.Request, error) {
+    // Determine Host
+    host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
+    useGateway := ply.Cfg.SubgraphAPIKey != ""
+    
 	var reqs []*fetcher.Request
     
 	for _, target := range targetsList {
-		if req, err := ply.gqlRequestBuilder(target, host, targets[target].path, SubgraphEntities[target]); err != nil {
+        // Construct URL
+        path := targets[target].path
+        var endpointURL string
+        
+        if useGateway && len(ply.Cfg.SubgraphAPIKey) > 0 {
+            // Gateway Format: https://gateway.thegraph.com/api/[KEY]/subgraphs/id/[ID]
+            // Path contains slash? remove strict leading slash if double
+            cleanPath := strings.TrimPrefix(path, "/")
+            endpointURL = fmt.Sprintf("https://gateway.thegraph.com/api/%s/subgraphs/id/%s", ply.Cfg.SubgraphAPIKey, cleanPath)
+        } else {
+            // Legacy / Hosted Service Format: [HOST]/[PATH]
+            u, _ := url.Parse(host)
+            u = u.JoinPath(path)
+            endpointURL = u.String()
+        }
+
+		// Default variables
+		vars := map[string]any{
+			"first": 1000,
+			"lastId": "",
+		}
+        
+        // Add filter for accounts - use provided threshold or default to $100
+        if target == "accounts" {
+            if accountsMinVolume != "" {
+                vars["scaledCollateralVolumeGte"] = accountsMinVolume
+            } else {
+                vars["scaledCollateralVolumeGte"] = "100" // Default $100 minimum
+            }
+        }
+        
+        // Check for resume ID
+        if startIds != nil {
+            if sid, ok := startIds[target]; ok && sid != "" {
+                vars["lastId"] = sid
+                ply.Logger.Info("resuming sync", slog.String("target", target), slog.String("start_id", sid))
+            }
+        }
+		
+		if req, err := ply.gqlRequestBuilder(target, endpointURL, SubgraphEntities[target], vars); err != nil {
 			return nil, err
 		} else {
+            // Cap accounts sync to 10 pages (10,000 accounts)
+            if target == "accounts" {
+                req.Metadata["MaxPages"] = "20"
+                req.Metadata["CurrentPage"] = "1"
+            }
 			reqs = append(reqs, req)
 		}
 	}
@@ -864,22 +936,200 @@ func (ply *PlyMktService) GetSubgraphReqs(ctx context.Context, targetsList []str
 	return reqs, nil
 }
 
-func (ply *PlyMktService) gqlRequestBuilder(key, host, path, entityQuery string) (*fetcher.Request, error) {
-	u, _ := url.Parse(host)
-	u = u.JoinPath(path)
+// GetTop500AccountsReq returns a request to fetch the top 500 accounts by scaledCollateralVolume.
+// Use the response to calculate the average volume as a threshold for subsequent queries.
+func (ply *PlyMktService) GetTop500AccountsReq(ctx context.Context) (*fetcher.Request, error) {
+    host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
+    useGateway := ply.Cfg.SubgraphAPIKey != ""
+    path := targets["accounts"].path
+    var endpointURL string
+    
+    if useGateway && len(ply.Cfg.SubgraphAPIKey) > 0 {
+        cleanPath := strings.TrimPrefix(path, "/")
+        endpointURL = fmt.Sprintf("https://gateway.thegraph.com/api/%s/subgraphs/id/%s", ply.Cfg.SubgraphAPIKey, cleanPath)
+    } else {
+        u, _ := url.Parse(host)
+        u = u.JoinPath(path)
+        endpointURL = u.String()
+    }
+
+    // Query for top 100 accounts without any volume filter
+    query := `accounts(first: 500, orderBy: scaledCollateralVolume, orderDirection: desc) {
+        id
+        scaledCollateralVolume
+    }`
+    
+    vars := map[string]any{}
+    
+    fullQuery := fmt.Sprintf(`query Top500Accounts {
+        %s
+    }`, query)
+    
+    return ply.buildGQLRequest(endpointURL, "top500accounts", fullQuery, vars, false)
+}
+
+// CalculateAvgVolume calculates the average scaledCollateralVolume from a list of accounts.
+// Returns the average as a string suitable for use in subsequent queries.
+func CalculateAvgVolume(accounts []PlyMktAccount) string {
+    if len(accounts) == 0 {
+        return "100" // Fallback default
+    }
+    
+    var total float64
+    for _, acc := range accounts {
+        // Parse the scaledCollateralVolume string to float
+        if vol, err := parseScaledVolume(acc.ScaledCollateralVolume); err == nil {
+            total += vol
+        }
+    }
+    
+    avg := total / float64(len(accounts))
+    // Return as integer string (truncated)
+    return fmt.Sprintf("%.0f", avg)
+}
+
+func parseScaledVolume(s string) (float64, error) {
+    var val float64
+    _, err := fmt.Sscanf(s, "%f", &val)
+    return val, err
+}
+
+// GetWhalePositionsReqs generates requests for specific user IDs.
+func (ply *PlyMktService) GetWhalePositionsReqs(ctx context.Context, userIDs []string) ([]*fetcher.Request, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+    
+    // Determine URL
+    host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
+    useGateway := ply.Cfg.SubgraphAPIKey != ""
+    path := targets["userPositions"].path
+    var endpointURL string
+    if useGateway && len(ply.Cfg.SubgraphAPIKey) > 0 {
+        cleanPath := strings.TrimPrefix(path, "/")
+        endpointURL = fmt.Sprintf("https://gateway.thegraph.com/api/%s/subgraphs/id/%s", ply.Cfg.SubgraphAPIKey, cleanPath)
+    } else {
+        u, _ := url.Parse(host)
+        u = u.JoinPath(path)
+        endpointURL = u.String()
+    }
+
+	query := `userPositions(
+		first: $first
+		where: { id_gt: $lastId, user_in: $userIds }
+		orderBy: id
+		orderDirection: asc
+		subgraphError: allow
+	) {
+		id
+		user
+		tokenId
+		amount
+		avgPrice
+		realizedPnl
+		totalBought
+	}`
 	
-	// Cursor pagination: id_gt instead of skip
-	fullQuery := fmt.Sprintf(`query MyQuery($first: Int, $lastId: String) {
+	// Variables
+	vars := map[string]any{
+		"first": 1000,
+		"lastId": "",
+		"userIds": userIDs,
+	}
+
+	fullQuery := fmt.Sprintf(`query MyQuery($first: Int, $lastId: String, $userIds: [String!]) {
 		%s
-	}`, entityQuery)
+	}`, query)
+
+	req, err := ply.buildGQLRequest(endpointURL, "userPositions", fullQuery, vars, true)
+	if err != nil {
+		return nil, err
+	}
 	
-	// Initial Body: first=1000, lastId=""
+	// Tag as filtered so processor knows to maintain filters on next page
+	req.Metadata["UserFiltered"] = "true"
+	// Store user IDs in metadata? Too large.
+	// We handle pagination logic in Processor by checking if "variables" has userIds.
+	// But `fetcher.Request` Body is a Reader. We can't easily read it back without parsing.
+	// We might need to store the user IDs in metadata as JSON string if < 4KB?
+	// 100 addresses * 42 bytes = 4200 bytes. Borderline.
+	// Better: The processor, when seeing "UserFiltered", should look at the *Response*'s request body?
+	// Or we just rely on infinite scroll logic which grabs the same query/vars from the previous request body JSON?
+	// The generic pagination logic in `processor.go` uses `resp.Request` but might not preserve complex variables if they aren't in Metadata.
+	// WAIT. `processor.go` pagination logic:
+	// It parses `limit` and `offset` from URL QUERY.
+	// BUT for Subgraph, it uses `id_gt` in BODY.
+	// See `processSubgraph` in `processor.go`:
+	/*
+		// Build Next Request if Cursor Pagination is enabled ...
+		fullQuery := resp.Request.Metadata["GraphqlQuery"]
+		bodyData := map[string]any{
+			"query": fullQuery,
+			"variables": map[string]any{
+				"first": 1000,
+				"lastId": lastID,
+			},
+		}
+	*/
+	// IT HARDCODES VARIABLES!
+	// It obliterates `$userIds`.
+	
+	// I need to fix `processor.go` to preserve existing variables.
+	// But `fetcher.Request` doesn't expose them struct-wise.
+	// I should pass json serialized variables in Metadata for easier restoration?
+	// OR use `json.Unmarshal` on `OriginalRequest.Body` (we need a copy of body).
+	// `fetcher.Response.Request.Body` is likely exhausted/closed.
+	// We have `OriginalRequest` in `Output`. Processor receives `resp`. `resp.Request` is the original *Request object*.
+	
+	// `fetcher.go` might not copy the body for us into the Response object.
+	// But wait, `processor.go` Re-Marshals `bodyData`.
+	
+	// FIX: I will pass the Variables map as a JSON string in Metadata `GraphqlVariables`.
+	
+	varsBytes, _ := json.Marshal(vars)
+	req.Metadata["GraphqlVariables"] = string(varsBytes)
+
+	return []*fetcher.Request{req}, nil
+}
+
+func (ply *PlyMktService) gqlRequestBuilder(key, fullURL, entityQuery string, vars map[string]any) (*fetcher.Request, error) {
+	// Build variable declarations dynamically based on vars map
+	varDecls := []string{}
+	for varName, varValue := range vars {
+		var gqlType string
+		switch varValue.(type) {
+		case int, int64, int32:
+			gqlType = "Int"
+		case string:
+			gqlType = "String"
+		case []string:
+			gqlType = "[String!]"
+		case bool:
+			gqlType = "Boolean"
+		case float64, float32:
+			gqlType = "Float"
+		default:
+			gqlType = "String" // Default fallback
+		}
+		varDecls = append(varDecls, fmt.Sprintf("$%s: %s", varName, gqlType))
+	}
+	
+	// Sort for consistent ordering
+	sort.Strings(varDecls)
+	varDeclStr := strings.Join(varDecls, ", ")
+	
+	// Wrapper for query
+	fullQuery := fmt.Sprintf(`query MyQuery(%s) {
+		%s
+	}`, varDeclStr, entityQuery)
+	
+	return ply.buildGQLRequest(fullURL, key, fullQuery, vars, true)
+}
+
+func (ply *PlyMktService) buildGQLRequest(fullURL, key, query string, vars map[string]any, cursorPagination bool) (*fetcher.Request, error) {
 	bodyData := map[string]any{
-		"query": fullQuery,
-		"variables": map[string]any{
-			"first": 1000,
-			"lastId": "",
-		},
+		"query": query,
+		"variables": vars,
 	}
 	
 	bodyBytes, err := json.Marshal(bodyData)
@@ -887,20 +1137,28 @@ func (ply *PlyMktService) gqlRequestBuilder(key, host, path, entityQuery string)
 		ply.Logger.Error("failed to marshal body", slog.String("entity", key))
 		return nil, err
 	}
+	
+	cursorStr := "false"
+	if cursorPagination {
+		cursorStr = "true"
+	}
+	
+	// Serialize variables to Metadata for pagination persistence
+	varsBytes, _ := json.Marshal(vars)
 
 	return &fetcher.Request{
-		URL: u.String(),
+		URL: fullURL,
 		Method: "POST",
 		Headers: map[string]string{
 			"Content-Type": "application/json",
-			"Authorization": fmt.Sprintf("Bearer %s", ply.Cfg.SubgraphAPIKey),
 		},
 		Body: bytes.NewReader(bodyBytes),
 		Metadata: map[string]string{
 			"Type": "subgraph",
 			"Entity": key,
-			"GraphqlQuery": fullQuery,
-			"CursorPagination": "true", // Flag for Processor/Fetcher
+			"GraphqlQuery": query,
+			"GraphqlVariables": string(varsBytes),
+			"CursorPagination": cursorStr,
 		},
 	}, nil
 }
@@ -1080,4 +1338,142 @@ func (ply *PlyMktService) gqlRequestBuilder(key, host, path, entityQuery string)
 //    condition
 //    amount
 //  }
-//}	
+//}	// GetWhaleFillsReqs generates requests for trade history of specific user IDs.
+// It fetches EnrichedOrderFilledEvents where the user is either the Maker or the Taker.
+func (ply *PlyMktService) GetWhaleFillsReqs(ctx context.Context, userIDs []string) ([]*fetcher.Request, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+
+    // Determine URL
+    host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
+    useGateway := ply.Cfg.SubgraphAPIKey != ""
+    path := targets["enrichedOrderFilleds"].path
+    var endpointURL string
+    if useGateway && len(ply.Cfg.SubgraphAPIKey) > 0 {
+        cleanPath := strings.TrimPrefix(path, "/")
+        endpointURL = fmt.Sprintf("https://gateway.thegraph.com/api/%s/subgraphs/id/%s", ply.Cfg.SubgraphAPIKey, cleanPath)
+    } else {
+        u, _ := url.Parse(host)
+        u = u.JoinPath(path)
+        endpointURL = u.String()
+    }
+    
+    // Query Template
+    // Note: We use orderBy: id for stable pagination.
+    // We already have "enrichedOrderFilleds" in SubgraphEntities but that's a generic one.
+    // We construct filtering queries manually here.
+    
+    queryTemplate := `enrichedOrderFilleds(
+        first: $first
+        where: { id_gt: $lastId, %s: $userIds }
+        orderBy: id
+        orderDirection: asc
+    ) {
+        id
+        timestamp
+        maker { id }
+        taker { id }
+        size
+        side
+        price
+        market { id }
+    }`
+
+    vars := map[string]any{
+        "first": 1000,
+        "lastId": "",
+        "userIds": userIDs,
+    }
+    
+    var reqs []*fetcher.Request
+    
+    // Request 1: As Maker
+    queryMaker := fmt.Sprintf(queryTemplate, "maker_in")
+    fullQueryMaker := fmt.Sprintf(`query WhalesAsMakers($first: Int, $lastId: String, $userIds: [String!]) {
+        %s
+    }`, queryMaker)
+    
+    reqMaker, err := ply.buildGQLRequest(endpointURL, "enrichedOrderFilleds", fullQueryMaker, vars, true)
+    if err != nil {
+        return nil, err
+    }
+    // Tag for processor
+    reqMaker.Metadata["UserFiltered"] = "true"
+    reqs = append(reqs, reqMaker)
+    
+    // Request 2: As Taker
+    queryTaker := fmt.Sprintf(queryTemplate, "taker_in")
+    fullQueryTaker := fmt.Sprintf(`query WhalesAsTakers($first: Int, $lastId: String, $userIds: [String!]) {
+        %s
+    }`, queryTaker)
+    
+    // Important: We need a fresh map for vars to avoid reference issues if buildGQL modifies it (it shouldn't, but safer)
+    varsTaker := map[string]any{
+        "first": 1000,
+        "lastId": "",
+        "userIds": userIDs,
+    }
+    
+    reqTaker, err := ply.buildGQLRequest(endpointURL, "enrichedOrderFilleds", fullQueryTaker, varsTaker, true)
+     if err != nil {
+        return nil, err
+    }
+    reqTaker.Metadata["UserFiltered"] = "true"
+    reqs = append(reqs, reqTaker)
+
+    return reqs, nil
+}
+
+// GetMarketFillsReqs builds targeted requests for enriched order fills for specific markets.
+func (ply *PlyMktService) GetMarketFillsReqs(ctx context.Context, marketIDs []string) ([]*fetcher.Request, error) {
+    if len(marketIDs) == 0 {
+		return nil, nil
+	}
+
+    host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
+    useGateway := ply.Cfg.SubgraphAPIKey != ""
+    path := targets["enrichedOrderFilleds"].path
+    var endpointURL string
+    
+    if useGateway && len(ply.Cfg.SubgraphAPIKey) > 0 {
+        cleanPath := strings.TrimPrefix(path, "/")
+        endpointURL = fmt.Sprintf("https://gateway.thegraph.com/api/%s/subgraphs/id/%s", ply.Cfg.SubgraphAPIKey, cleanPath)
+    } else {
+        u, _ := url.Parse(host)
+        u = u.JoinPath(path)
+        endpointURL = u.String()
+    }
+    
+    // Batch markets into groups of 50
+    batchSize := 50
+    var reqs []*fetcher.Request
+    
+    for i := 0; i < len(marketIDs); i += batchSize {
+        end := i + batchSize
+        if end > len(marketIDs) {
+            end = len(marketIDs)
+        }
+        chunk := marketIDs[i:end]
+        
+        queryContent := BuildEnrichedOrderFilledsQuery(chunk)
+        
+        fullQuery := fmt.Sprintf(`query ActiveMarketFills($first: Int, $lastId: String, $marketIds: [String!]) {
+            %s
+        }`, queryContent)
+        
+        vars := map[string]any{
+            "first": 1000,
+            "lastId": "",
+            "marketIds": chunk,
+        }
+        
+        req, err := ply.buildGQLRequest(endpointURL, "enrichedOrderFilleds", fullQuery, vars, true)
+        if err != nil {
+            return nil, err
+        }
+        reqs = append(reqs, req)
+    }
+    
+    return reqs, nil
+}

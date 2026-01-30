@@ -247,6 +247,7 @@ func (p *Pool[T, R]) processItem(input Input[T]) Result[R] {
 		// Include value even on error - caller may have set useful data
 		return Result[R]{
 			Value:    value,
+			Err:      err,
 			Duration: duration,
 		}
 	}
