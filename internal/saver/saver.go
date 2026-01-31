@@ -119,11 +119,7 @@ type StatsSnapshot struct {
 // =============================================================================
 
 // New creates and initializes a saver pool with a PostgreSQL connection.
-func New(ctx context.Context, cfg *config.Config, numWorkers, qSize int) (*Saver, error) {
-	logger := logging.Logger.With(
-		slog.String("component", "saver"),
-	)
-
+func New(ctx context.Context, logger *slog.Logger, cfg *config.Config, numWorkers, qSize int) (*Saver, error) {
 	// Initialize pgx connection pool
 	poolConfig, err := pgxpool.ParseConfig(cfg.PostgresURL)
 	if err != nil {
@@ -1453,9 +1449,14 @@ func (s *Saver) batchInsertEnrichedOrderFilledEvents(ctx context.Context, data a
 		)
 	}
 
+	fmt.Printf("DEBUG: Saving %d enriched order filled events\n", len(items))
 	totalAffected, failIdx, err := s.execBatch(ctx, batch, len(items))
-	if err != nil && failIdx != -1 && failIdx < len(items) {
-		s.logger.Error("failed to save enriched_order_filled_event", "id", items[failIdx].ID, "error", err)
+	if err != nil {
+		fmt.Printf("DEBUG: Failed to save enriched order filled events: %v\n", err)
+		if failIdx != -1 && failIdx < len(items) {
+			fmt.Printf("DEBUG: Failed item ID: %s\n", items[failIdx].ID)
+			s.logger.Error("failed to save enriched_order_filled_event", "id", items[failIdx].ID, "error", err)
+		}
 	}
 	return totalAffected, err
 }

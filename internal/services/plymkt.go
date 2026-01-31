@@ -1381,7 +1381,7 @@ func (ply *PlyMktService) GetWhaleFillsReqs(ctx context.Context, userIDs []strin
     }`
 
     vars := map[string]any{
-        "first": 1000,
+        "first": 500,
         "lastId": "",
         "userIds": userIDs,
     }
@@ -1410,7 +1410,7 @@ func (ply *PlyMktService) GetWhaleFillsReqs(ctx context.Context, userIDs []strin
     
     // Important: We need a fresh map for vars to avoid reference issues if buildGQL modifies it (it shouldn't, but safer)
     varsTaker := map[string]any{
-        "first": 1000,
+        "first": 500,
         "lastId": "",
         "userIds": userIDs,
     }
@@ -1463,7 +1463,7 @@ func (ply *PlyMktService) GetMarketFillsReqs(ctx context.Context, marketIDs []st
         }`, queryContent)
         
         vars := map[string]any{
-            "first": 1000,
+            "first": 500,
             "lastId": "",
             "marketIds": chunk,
         }

@@ -84,7 +84,8 @@ func New(ctx context.Context, cfg *config.Config) (*Pipeline, error) {
 		return nil, err
 	}
 
-	saverPool, err := saver.New(pipelineCtx, cfg, cfg.SaverCfg.NumWorkers, cfg.SaverCfg.Qsize)
+	saverLogger := logging.Logger.With(slog.String("component", "saver"))
+	saverPool, err := saver.New(pipelineCtx, saverLogger, cfg, cfg.SaverCfg.NumWorkers, cfg.SaverCfg.Qsize)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -166,7 +167,7 @@ func (p *Pipeline) RunWhaleSync(ctx context.Context) {
 	fillsTicker := time.NewTicker(1 * time.Minute)
 	positionsTicker := time.NewTicker(3 * time.Minute) // Every 3 min
 	accountsTicker := time.NewTicker(10 * time.Minute) // Every 10 min
-	liveDataTicker := time.NewTicker(1 * time.Minute)
+	liveDataTicker := time.NewTicker(15 * time.Minute)
     whaleFillsTicker := time.NewTicker(10 * time.Minute) // Targeted history sync
 
 	defer func() {
@@ -445,7 +446,7 @@ func (p *Pipeline) runLiveDataSync(svc *services.PlyMktService) {
 	for _, tokenID := range tokenIDs {
 		// Fidelity 1 (1 min), StartTs 0 (full history or rely on API default/limit)
 		// Optimization: Check last fetch time? For now, nice to have, but simple loop first.
-		req, err := svc.GetPriceHistoryReq(tokenID, 1, 0)
+		req, err := svc.GetPriceHistoryReq(tokenID, 60, 0)
 		if err != nil {
 			p.logger.Error("failed to build price history req", slog.String("tokenID", tokenID), slog.Any("error", err))
 			continue
