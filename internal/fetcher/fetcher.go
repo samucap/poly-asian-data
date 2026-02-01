@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/samucap/poly-asian-data/internal/config"
@@ -40,6 +41,11 @@ type Fetcher struct {
 	httpClient *http.Client
 	logger     *slog.Logger
 	cfg        *config.Config
+
+	// Backoff & Throttling
+	mu           sync.RWMutex
+	backoffUntil time.Time
+	globalLimit  int // Cap on 'first' param for GraphQL queries
 }
 
 // Request represents a fetch request.
@@ -74,9 +80,10 @@ func New(ctx context.Context, config *config.Config, numWorkers, qSize int) (*Fe
 
 	// Create fetcher first so we can pass its method to the pool
 	f := &Fetcher{
-		httpClient: newSecureHTTPClient(),
-		cfg:        config,
-		logger:     logger,
+		httpClient:  newSecureHTTPClient(),
+		cfg:         config,
+		logger:      logger,
+		globalLimit: 1000, // Default to 1000 as requested
 	}
 
 	pool, err := workerpool.NewPool[*Request, *Response](ctx, "fetcher", numWorkers, qSize, logger, f.workerTask)
@@ -174,6 +181,59 @@ func (f *Fetcher) Fetch(ctx context.Context, inputReqDetails *Request) (*Respons
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// 1. Backoff Check & Limit Enforcement
+		f.mu.RLock()
+		backoff := f.backoffUntil
+		limitCap := f.globalLimit
+		f.mu.RUnlock()
+
+		if sleepDur := time.Until(backoff); sleepDur > 0 {
+			f.logger.Warn("fetcher backing off", slog.Duration("duration", sleepDur))
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(sleepDur):
+			}
+		}
+
+		// 2. Reduce Batch Size if Cap Enforced (Adaptive Limit)
+		// Only applies to GraphQL requests with "first" variable
+		if varsJSON, ok := inputReqDetails.Metadata["GraphqlVariables"]; ok {
+			var vars map[string]any
+			if jsonErr := json.Unmarshal([]byte(varsJSON), &vars); jsonErr == nil {
+				if firstVal, ok := vars["first"]; ok {
+					var current int
+					switch v := firstVal.(type) {
+					case float64: current = int(v)
+					case int: current = v
+					}
+
+					// If current batch size exceeds global limit, clamp it
+					if current > limitCap {
+						f.logger.Info("clamping batch size to global limit", 
+							slog.Int("original", current), 
+							slog.Int("limit", limitCap))
+						
+						vars["first"] = limitCap
+						
+						// Rewrite Body
+						if query, qOk := inputReqDetails.Metadata["GraphqlQuery"]; qOk {
+							newBodyData := map[string]any{
+								"query": query,
+								"variables": vars,
+							}
+							if newBytes, err := json.Marshal(newBodyData); err == nil {
+								inputReqDetails.Body = bytes.NewReader(newBytes)
+								// Update metadata for persistence
+								if vBytes, err := json.Marshal(vars); err == nil {
+									inputReqDetails.Metadata["GraphqlVariables"] = string(vBytes)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
 		if attempt > 0 {
 			delay := retryDelay * time.Duration(1<<(attempt-1))
 			select {
@@ -215,67 +275,46 @@ func (f *Fetcher) Fetch(ctx context.Context, inputReqDetails *Request) (*Respons
 				slog.Int("bytes", len(resp.Data)),
 			)
 
-			return resp, nil
+			// Check for GraphQL Errors inside 200 OK
+			// If contains specific errors, handle backoff and return error to trigger retry loop
+			// Note: This requires unmarshalling twice (here and processor), but overhead is acceptable for safety.
+			// Optimization: Check bytes before unmarshal?
+			if bytes.Contains(resp.Data, []byte("indexer not available")) || bytes.Contains(resp.Data, []byte("bad indexers")) {
+				// Trigger Backoff
+				f.mu.Lock()
+				f.backoffUntil = time.Now().Add(15 * time.Second)
+				
+				// Adaptive Limit Reduction
+				if f.globalLimit > 1000 {
+					f.globalLimit = 1000 // Snap to safe standard limit first
+				} else if f.globalLimit > 10 {
+					f.globalLimit = int(float64(f.globalLimit) * 0.5) // Halve limit
+					if f.globalLimit < 10 { f.globalLimit = 10 }
+				}
+				newLimit := f.globalLimit
+				f.mu.Unlock()
+
+				err = fmt.Errorf("subgraph indexer unavailable, backing off until %s (new limit: %d)", 
+					f.backoffUntil.Format(time.RFC3339), newLimit)
+				f.logger.Warn(err.Error())
+				
+				// Proceed to retry loop (which will respect backoff and limit cap on next attempt)
+			} else {
+				// Success
+				return resp, nil
+			}
 		}
 		
 		// Error occurred (timeout or status 500+)
-		// Check for adaptive batch sizing if this is a GraphQL query
-		if varsJSON, ok := inputReqDetails.Metadata["GraphqlVariables"]; ok {
-			var vars map[string]any
-			if jsonErr := json.Unmarshal([]byte(varsJSON), &vars); jsonErr == nil {
-				// Check for 'first' parameter
-				if firstVal, ok := vars["first"]; ok {
-					// Handle float64 (json default) or int
-					var currentLimit int
-					switch v := firstVal.(type) {
-					case float64:
-						currentLimit = int(v)
-					case int:
-						currentLimit = v
-					}
-
-					// Only reduce if we have room (e.g., > 10 items)
-					if currentLimit > 10 {
-						// Reduce by 20%
-						newLimit := int(float64(currentLimit) * 0.8)
-						if newLimit < 1 {
-							newLimit = 1
-						}
-						
-						f.logger.Warn("reducing batch size due to error", 
-							slog.String("error", err.Error()),
-							slog.Int("oldLimit", currentLimit),
-							slog.Int("newLimit", newLimit),
-							slog.Int("attempt", attempt),
-						)
-						
-						// Update variables
-						vars["first"] = newLimit
-						
-						// Update Body and Metadata
-						// We need to re-construct the full body ("query", "variables")
-						// We can get the query from metadata or parsing original body?
-						// Better to rely on metadata "GraphqlQuery" as standardized in plymkt/processor
-						if query, qOk := inputReqDetails.Metadata["GraphqlQuery"]; qOk {
-							newBodyData := map[string]any{
-								"query": query,
-								"variables": vars,
-							}
-							
-							if newBodyBytes, mErr := json.Marshal(newBodyData); mErr == nil {
-								// Update Request
-								inputReqDetails.Body = bytes.NewReader(newBodyBytes)
-								
-								// Update Metadata for next retry/pagination preservation
-								if newVarsBytes, vErr := json.Marshal(vars); vErr == nil {
-									inputReqDetails.Metadata["GraphqlVariables"] = string(newVarsBytes)
-								}
-							}
-						}
-					}
-				}
-			}
-		}
+		// Check for specific Subgraph errors in the body if available (sometimes 200 OK returns errors, but here we are in error block?)
+		// Actually, Fetcher.doRequest returns error for 500+.
+		// But for Graph node, "indexer not available" might come as 500 or 503 or even 200 with errors.
+		// If doRequest returned valid response, we are in 'if err == nil' block (above).
+		// Wait, the user said: "subgraph error: [map[message:bad indexers...]]". This usually comes inside a 200 OK JSON response "errors" field.
+		// My doRequest returns response if err == nil.
+		// So checking for "indexer not available" must happen inside the 'if err == nil' block or inside a new check.
+		// The current code returns immediately if err == nil.
+		// I need to modify that path to inspect the body for GraphQL errors.
 		
 		lastErr = err
 	}

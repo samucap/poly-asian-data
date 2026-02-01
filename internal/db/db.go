@@ -16,6 +16,9 @@ var schemaSQL string
 func InitDB(ctx context.Context, pool *pgxpool.Pool, forceReset bool) error {
 	if forceReset {
 		dropQueries := []string{
+			`DROP TABLE IF EXISTS prices_history CASCADE;`,
+			`DROP TABLE IF EXISTS orderbooks CASCADE;`,
+			`DROP TABLE IF EXISTS position_snapshots CASCADE;`,
 			`DROP TABLE IF EXISTS enriched_order_filled_events CASCADE;`,
 			`DROP TABLE IF EXISTS order_filled_events CASCADE;`,
 			`DROP TABLE IF EXISTS accounts CASCADE;`,
@@ -24,6 +27,9 @@ func InitDB(ctx context.Context, pool *pgxpool.Pool, forceReset bool) error {
 			`DROP TABLE IF EXISTS leagues CASCADE;`,
 			`DROP TABLE IF EXISTS tags CASCADE;`,
 			`DROP TABLE IF EXISTS sports CASCADE;`,
+			`DROP TABLE IF EXISTS plymkt_holders CASCADE;`,
+			`DROP TABLE IF EXISTS plymkt_users CASCADE;`,
+			`DROP TABLE IF EXISTS plymkt_leaderboard CASCADE;`,
 		}
 		for _, q := range dropQueries {
 			if _, err := pool.Exec(ctx, q); err != nil {

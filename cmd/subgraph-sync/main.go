@@ -60,7 +60,7 @@ func main() {
 }
 
 func subgraphSync(ctx context.Context, cfg *config.Config, fullSync bool) {
-	plyMktPipeline, err := pipeline.New(ctx, cfg)
+	plyMktPipeline, err := pipeline.New(ctx, logging.Logger, cfg)
 	if err != nil {
 		logging.Error("Failed to create pipeline", slog.Any("error", err))
 		os.Exit(1)

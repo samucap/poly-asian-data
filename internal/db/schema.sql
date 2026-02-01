@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS order_filled_events (
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
-DROP TABLE IF EXISTS enriched_order_filled_events CASCADE;
+
 CREATE TABLE IF NOT EXISTS enriched_order_filled_events (
     id TEXT NOT NULL, -- transaction hash
     price TEXT,
@@ -312,13 +312,15 @@ CREATE TRIGGER update_tags_updated_at BEFORE UPDATE ON tags FOR EACH ROW EXECUTE
 DROP TRIGGER IF EXISTS update_leagues_updated_at ON leagues;
 CREATE TRIGGER update_leagues_updated_at BEFORE UPDATE ON leagues FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+
 DROP TRIGGER IF EXISTS update_teams_updated_at ON teams;
 CREATE TRIGGER update_teams_updated_at BEFORE UPDATE ON teams FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- New Tables for Whale Tracking Pipeline
 
 -- Position Snapshots (Hypertable)
-DROP TABLE IF EXISTS position_snapshots CASCADE;
+-- Position Snapshots (Hypertable)
+
 CREATE TABLE IF NOT EXISTS position_snapshots (
     snapshot_time TIMESTAMPTZ NOT NULL,
     account_id TEXT NOT NULL,
@@ -342,7 +344,8 @@ CREATE INDEX IF NOT EXISTS idx_position_snapshots_market ON position_snapshots (
 
 
 -- Orderbooks (Hypertable)
-DROP TABLE IF EXISTS orderbooks CASCADE;
+-- Orderbooks (Hypertable)
+
 CREATE TABLE IF NOT EXISTS orderbooks (
     timestamp TIMESTAMPTZ NOT NULL,
     token_id TEXT NOT NULL,
@@ -358,7 +361,8 @@ CREATE INDEX IF NOT EXISTS idx_orderbooks_token_ts ON orderbooks (token_id, time
 
 
 -- Prices History (Hypertable)
-DROP TABLE IF EXISTS prices_history CASCADE;
+-- Prices History (Hypertable)
+
 CREATE TABLE IF NOT EXISTS prices_history (
     timestamp TIMESTAMPTZ NOT NULL,
     token_id TEXT NOT NULL,
@@ -488,3 +492,31 @@ CREATE TABLE IF NOT EXISTS sync_state (
     total_items INT DEFAULT 0,
     status TEXT DEFAULT 'idle'       -- 'running', 'completed', 'failed'
 );
+
+-- 4. Top Sync Tables (Users & Holdings)
+
+CREATE TABLE IF NOT EXISTS plymkt_users (
+    proxy_wallet TEXT PRIMARY KEY,
+    username TEXT,
+    name TEXT,
+    bio TEXT,
+    profile_image TEXT,
+    x_username TEXT,
+    verified_badge BOOLEAN,
+    -- Metrics (Latest snapshot from leaderboard/holders)
+    vol NUMERIC,
+    pnl NUMERIC,
+    rank INT, -- Latest observed rank (context dependent, optional)
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS plymkt_holders (
+    token_id TEXT,
+    proxy_wallet TEXT REFERENCES plymkt_users(proxy_wallet),
+    amount NUMERIC,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (token_id, proxy_wallet)
+);
+CREATE INDEX IF NOT EXISTS idx_plymkt_holders_token ON plymkt_holders (token_id);
+CREATE INDEX IF NOT EXISTS idx_plymkt_holders_wallet ON plymkt_holders (proxy_wallet);
+

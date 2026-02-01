@@ -49,7 +49,7 @@ func main() {
 }
 
 func runWhaleSync(ctx context.Context, cfg *config.Config) {
-	pipe, err := pipeline.New(ctx, cfg)
+	pipe, err := pipeline.New(ctx, logging.Logger, cfg)
 	if err != nil {
 		logging.Error("Failed to create pipeline", slog.Any("error", err))
 		os.Exit(1)

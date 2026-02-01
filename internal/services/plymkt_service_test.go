@@ -28,6 +28,13 @@ func TestGetSubgraphReqs(t *testing.T) {
 
 	cfg := &config.Config{
 		SubgraphAPIKey: "test-api-key",
+		Services: config.ServicesConfig{
+			PlyMkt: config.PlyMktConfig{
+				Endpoints: map[string]any{
+					"subgraph": testEndpoint,
+				},
+			},
+		},
 	}
 
 	svc := &PlyMktService{
@@ -35,7 +42,9 @@ func TestGetSubgraphReqs(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	reqs, err := svc.GetSubgraphReqs(ctx)
+	// GetSubgraphReqs now requires targets and startIds
+	targets := []string{"conditions", "orderFilledEvents", "enrichedOrderFilleds", "accounts", "fpmms"}
+	reqs, err := svc.GetSubgraphReqs(ctx, targets, nil)
 	require.NoError(t, err)
 	
 	// Verify we get requests for all expected entities

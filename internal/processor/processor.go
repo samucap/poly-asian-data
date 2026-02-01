@@ -21,6 +21,7 @@ import (
 	"github.com/samucap/poly-asian-data/internal/fetcher"
 	"github.com/samucap/poly-asian-data/internal/logging"
 	"github.com/samucap/poly-asian-data/internal/services"
+	"github.com/samucap/poly-asian-data/internal/utils"
 	"github.com/samucap/poly-asian-data/internal/workerpool"
 )
 
@@ -199,6 +200,10 @@ func (p *Processor) workerTask(ctx context.Context, resp *fetcher.Response) (*Ou
 		output, err = p.processOrderbook(resp)
 	case strings.Contains(urlPath, "/prices-history"):
 		output, err = p.processPricesHistory(resp)
+	case strings.Contains(urlPath, "/leaderboard"):
+		output, err = p.processLeaderboard(resp)
+	case strings.Contains(urlPath, "/holders"):
+		output, err = p.processHolders(resp)
 	default:
 		// Fallback for unexpected URLs
 		output = &Output{
@@ -362,6 +367,20 @@ func (p *Processor) processEvents(resp *fetcher.Response) (*Output, error) {
 			}
 			// Enrich market with event ID if needed (usually relation handled by DB)
 			m.EventID = ev.ID // Ensure link
+			
+			// NORMALIZE MARKET DATA
+			m.Liquidity = utils.CleanNumericString(m.Liquidity)
+			m.Volume = utils.CleanNumericString(m.Volume)
+			m.Fee = utils.CleanNumericString(m.Fee)
+			m.OutcomePrices = utils.NormalizeString(m.OutcomePrices) // Just trim, it's a JSON string usually
+			
+			// PlyMktMarket struct definition check:
+			// Liquidity string
+			// Volume string
+			// Fee string
+			// Volume24hr float64 (already typed) -> no need to clean string unless we change struct.
+			// The plan focused on "string fields" normalization.
+			
 			marketsToSave = append(marketsToSave, *m)
 			
 			// Parse ClobTokenIds for this market
@@ -605,6 +624,14 @@ func (p *Processor) processSubgraph(resp *fetcher.Response) (*Output, error) {
 		if itemCount > 0 {
 			lastID = items[itemCount-1].ID
 		}
+		// Normalize Accounts
+		for i := range items {
+			items[i].CollateralVolume = utils.CleanNumericString(items[i].CollateralVolume)
+			items[i].ScaledCollateralVolume = utils.CleanNumericString(items[i].ScaledCollateralVolume)
+			items[i].Profit = utils.CleanNumericString(items[i].Profit)
+			items[i].ScaledProfit = utils.CleanNumericString(items[i].ScaledProfit)
+			items[i].NumTrades = utils.CleanNumericString(items[i].NumTrades)
+		}
 		payloads = append(payloads, SaverPayload{TableName: "accounts", Data: items})
 
 	case "orderFilledEvents":
@@ -615,6 +642,13 @@ func (p *Processor) processSubgraph(resp *fetcher.Response) (*Output, error) {
 		itemCount = len(items)
 		if itemCount > 0 {
 			lastID = items[itemCount-1].ID
+		}
+		// Normalize OrderFilledEvents
+		for i := range items {
+			items[i].Fee = utils.CleanNumericString(items[i].Fee)
+			items[i].MakerAmountFilled = utils.CleanNumericString(items[i].MakerAmountFilled)
+			items[i].TakerAmountFilled = utils.CleanNumericString(items[i].TakerAmountFilled)
+			items[i].Timestamp = utils.CleanTimestampString(items[i].Timestamp)
 		}
 		payloads = append(payloads, SaverPayload{TableName: "order_filled_events", Data: items})
 
@@ -628,6 +662,13 @@ func (p *Processor) processSubgraph(resp *fetcher.Response) (*Output, error) {
 			lastID = items[itemCount-1].ID
 		}
 		
+		// Normalize EnrichedOrderFilledEvents (Modify IN PLACE before saving/aggregating)
+		for i := range items {
+			items[i].Price = utils.CleanNumericString(items[i].Price)
+			items[i].Size = utils.CleanNumericString(items[i].Size)
+			items[i].Timestamp = utils.CleanTimestampString(items[i].Timestamp)
+		}
+
 		// 1. Save Fills
 		payloads = append(payloads, SaverPayload{TableName: "enriched_order_filled_events", Data: items})
 
@@ -775,6 +816,13 @@ func (p *Processor) processSubgraph(resp *fetcher.Response) (*Output, error) {
 		itemCount = len(items)
 		if itemCount > 0 {
 			lastID = items[itemCount-1].ID
+		}
+		// Normalize UserPositions
+		for i := range items {
+			items[i].Amount = utils.CleanNumericString(items[i].Amount)
+			items[i].AvgPrice = utils.CleanNumericString(items[i].AvgPrice)
+			items[i].RealizedPnl = utils.CleanNumericString(items[i].RealizedPnl)
+			items[i].TotalBought = utils.CleanNumericString(items[i].TotalBought)
 		}
 		// Use custom handler for computation logic
 		return p.processUserPositions(resp, items)
@@ -1120,6 +1168,92 @@ func (p *Processor) processUserPositions(resp *fetcher.Response, items []service
 		SaverPayloads:   payloads,
 		ItemCount:       len(items),
 		OriginalRequest: resp.Request,
+	}, nil
+}
+
+// processLeaderboard handles /leaderboard response
+func (p *Processor) processLeaderboard(resp *fetcher.Response) (*Output, error) {
+	var items []services.PlyMktLeaderboardEntry
+	if err := json.Unmarshal(resp.Data, &items); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal leaderboard: %w", err)
+	}
+
+
+
+	// Map to PlyMktUser
+	var users []services.PlyMktUser
+	for _, item := range items {
+		rankVal, _ := strconv.Atoi(item.Rank)
+		users = append(users, services.PlyMktUser{
+			ProxyWallet:   item.ProxyWallet,
+			Username:      item.UserName,
+			ProfileImage:  item.ProfileImage,
+			XUsername:     item.XUsername,
+			VerifiedBadge: item.VerifiedBadge,
+			Vol:           item.Vol,
+			Pnl:           item.Pnl,
+			Rank:          rankVal,
+		})
+	}
+
+	return &Output{
+		SaverPayloads: []SaverPayload{
+			{
+				TableName: "plymkt_users",
+				Data:      users,
+			},
+		},
+		ItemCount: len(items),
+	}, nil
+}
+
+// processHolders handles /holders response
+func (p *Processor) processHolders(resp *fetcher.Response) (*Output, error) {
+	var tokens []services.PlyMktHolderToken
+	// API returns array of tokens with holders
+	if err := json.Unmarshal(resp.Data, &tokens); err != nil {
+		// Try single token object? API docs "List of holder profiles".
+		// Actually https://data-api.polymarket.com/holders usually returns array of objects with token and holders list.
+		return nil, fmt.Errorf("failed to unmarshal holders: %w", err)
+	}
+
+	var holders []services.PlyMktHolderRecord
+	var users []services.PlyMktUser
+	now := time.Now()
+
+	for _, t := range tokens {
+		for _, h := range t.Holders {
+			// Extract User
+			users = append(users, services.PlyMktUser{
+				ProxyWallet:           h.ProxyWallet,
+				Name:                  h.Name,
+				Username:              h.Pseudonym, // Pseudonym maps to Username? Or Name? User said "pseudonym": "<string>".
+				Bio:                   h.Bio,
+				ProfileImage:          h.ProfileImage,
+				// Pnl/Vol not in holders response
+			})
+
+			// Extract Holder Link
+			holders = append(holders, services.PlyMktHolderRecord{
+				TokenID:     t.Token,
+				ProxyWallet: h.ProxyWallet,
+				Amount:      h.Amount,
+				UpdatedAt:   now,
+			})
+		}
+	}
+
+	return &Output{
+		SaverPayloads: []SaverPayload{
+			{
+				TableName: "plymkt_holders_bundle",
+				Data: services.PlyMktHoldersBundle{
+					Users:   users,
+					Holders: holders,
+				},
+			},
+		},
+		ItemCount: len(holders), // One record per holding link
 	}, nil
 }
 

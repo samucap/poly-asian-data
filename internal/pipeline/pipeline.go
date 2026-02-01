@@ -11,7 +11,6 @@ import (
 
 	"github.com/samucap/poly-asian-data/internal/config"
 	"github.com/samucap/poly-asian-data/internal/fetcher"
-	"github.com/samucap/poly-asian-data/internal/logging"
 	"github.com/samucap/poly-asian-data/internal/processor"
 	"github.com/samucap/poly-asian-data/internal/saver"
 	"github.com/samucap/poly-asian-data/internal/workerpool"
@@ -59,16 +58,19 @@ type Pipeline struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	stopped atomic.Bool
+
+	// Services
+	plyMktSvc *services.PlyMktService
 }
 
 // New creates a new pipeline with the given configuration.
-func New(ctx context.Context, cfg *config.Config) (*Pipeline, error) {
+func New(ctx context.Context, logger *slog.Logger, cfg *config.Config) (*Pipeline, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
 	pipelineCtx, cancel := context.WithCancel(ctx)
-	logger := logging.Logger.With(slog.String("component", "pipeline"))
+	logger = logger.With(slog.String("component", "pipeline"))
 	logger.Info("Initializing Pipeline...")
 
 	// Create all stages
@@ -84,7 +86,7 @@ func New(ctx context.Context, cfg *config.Config) (*Pipeline, error) {
 		return nil, err
 	}
 
-	saverLogger := logging.Logger.With(slog.String("component", "saver"))
+	saverLogger := logger.With(slog.String("component", "saver"))
 	saverPool, err := saver.New(pipelineCtx, saverLogger, cfg, cfg.SaverCfg.NumWorkers, cfg.SaverCfg.Qsize)
 	if err != nil {
 		cancel()
@@ -100,6 +102,11 @@ func New(ctx context.Context, cfg *config.Config) (*Pipeline, error) {
 		cfg:           cfg,
 		ctx:           pipelineCtx,
 		cancel:        cancel,
+		plyMktSvc: &services.PlyMktService{
+			Cfg:    cfg,
+			Logger: logger,
+			Ctx:    pipelineCtx,
+		},
 	}
 
 	// Connect stages:
@@ -119,17 +126,10 @@ func New(ctx context.Context, cfg *config.Config) (*Pipeline, error) {
 	return p, nil
 }
 
-// RunSportsTagsSync starts the pipeline and submits initial requests.
 func (p *Pipeline) RunSportsTagsSync() {
 	p.logger.Info("Starting PolyMarket Sync...")
 	
-	plyMktSvc := &services.PlyMktService{
-		Cfg: p.cfg,
-		Logger: p.logger,
-		Ctx: p.ctx,
-	}
-
-	reqs, err := plyMktSvc.GetSportsReqs(p.ctx)
+	reqs, err := p.plyMktSvc.GetSportsReqs(p.ctx)
 	if err != nil {
 		p.logger.Error("failed to get sports reqs", slog.Any("error", err))
 		return
@@ -156,40 +156,19 @@ func (p *Pipeline) RunSportsTagsSync() {
 func (p *Pipeline) RunWhaleSync(ctx context.Context) {
 	p.logger.Info("Starting Whale Sync Pipeline...")
 
-	plyMktSvc := &services.PlyMktService{
-		Cfg:    p.cfg,
-		Logger: p.logger,
-		Ctx:    p.ctx,
-	}
-
 	// Tickers
 	discoveryTicker := time.NewTicker(5 * time.Minute)
-	fillsTicker := time.NewTicker(1 * time.Minute)
-	positionsTicker := time.NewTicker(3 * time.Minute) // Every 3 min
-	accountsTicker := time.NewTicker(10 * time.Minute) // Every 10 min
 	liveDataTicker := time.NewTicker(15 * time.Minute)
-    whaleFillsTicker := time.NewTicker(10 * time.Minute) // Targeted history sync
 
 	defer func() {
 		discoveryTicker.Stop()
-		fillsTicker.Stop()
-		positionsTicker.Stop()
-		accountsTicker.Stop()
 		liveDataTicker.Stop()
-        whaleFillsTicker.Stop()
 	}()
 
 	// 1. Initial Discovery Run
-	p.runDiscovery(plyMktSvc)
+	p.runDiscovery()
 	p.WaitUntilIdle(ctx, 2*time.Second)
 	p.logCycleComplete("initial_discovery")
-	
-	// 2. Initial Account Sync (Backgrounded to avoid blocking startup)
-	go func() {
-		p.runAccountSync(plyMktSvc)
-		p.logger.Info("Initial Account Sync cycle finished (background)")
-	}()
-    // No WaitUntilIdle here, let it run parallel to positions sync
 
 	// Main Loop
 	for {
@@ -199,50 +178,24 @@ func (p *Pipeline) RunWhaleSync(ctx context.Context) {
 			return
 
 		case <-discoveryTicker.C:
-			p.runDiscovery(plyMktSvc)
+			p.runDiscovery()
 			p.WaitUntilIdle(ctx, 2*time.Second)
+			p.saverPool.SetSyncStatus(ctx, "plymkt_events", "completed")
 			p.logCycleComplete("discovery")
 
-		case <-fillsTicker.C:
-			p.runFillsSync(plyMktSvc)
-			p.WaitUntilIdle(ctx, 2*time.Second)
-			p.logCycleComplete("fills")
-
-		case <-positionsTicker.C:
-			p.runWhalePositionsSync(plyMktSvc)
-			p.WaitUntilIdle(ctx, 2*time.Second)
-			p.logCycleComplete("positions")
-
 		case <-liveDataTicker.C:
-			p.runLiveDataSync(plyMktSvc)
+			p.runLiveDataSync()
 			p.WaitUntilIdle(ctx, 2*time.Second)
+			p.saverPool.SetSyncStatus(ctx, "prices_history", "completed")
 			p.logCycleComplete("live_data")
-
-		case <-accountsTicker.C:
-			success := p.runAccountSync(plyMktSvc)
-			p.WaitUntilIdle(ctx, 2*time.Second)
-			p.logCycleComplete("accounts")
-            
-            // If accounts sync failed, schedule a retry after other syncs
-            if !success {
-                go func() {
-                    // Wait a bit for other syncs to have a chance
-                    time.Sleep(30 * time.Second)
-                    p.logger.Info("Retrying Account Sync after delay...")
-                    p.runAccountSync(plyMktSvc)
-                }()
-            }
-
-        case <-whaleFillsTicker.C:
-            p.runWhaleFillsSync(plyMktSvc)
-            p.WaitUntilIdle(ctx, 2*time.Second)
-            p.logCycleComplete("whale_fills")
 		}
 	}
 }
 
-func (p *Pipeline) runAccountSync(svc *services.PlyMktService) bool {
+
+func (p *Pipeline) runAccountSync() bool {
 	p.logger.Info("Running Account Sync Phase...")
+	p.saverPool.SetSyncStatus(p.ctx, "accounts", "running")
 	
     // Use a timeout context to prevent one sync from blocking forever
     syncCtx, cancel := context.WithTimeout(p.ctx, 2*time.Minute)
@@ -260,7 +213,7 @@ func (p *Pipeline) runAccountSync(svc *services.PlyMktService) bool {
 		p.logger.Info("Resuming accounts sync from cursor", slog.String("cursor", cursor))
 	}
 	
-	reqs, err := svc.GetSubgraphReqs(syncCtx, targets, startIds)
+	reqs, err := p.plyMktSvc.GetSubgraphReqs(syncCtx, targets, startIds)
 	if err != nil {
 		p.logger.Error("failed to get account sync reqs", slog.Any("error", err))
 		return false
@@ -301,7 +254,10 @@ func (p *Pipeline) runAccountSync(svc *services.PlyMktService) bool {
 	// Mark sync as complete
 	if err := p.saverPool.MarkSyncComplete(syncCtx, "accounts"); err != nil {
 		p.logger.Warn("failed to mark accounts sync complete", slog.Any("error", err))
-	}
+	} else {
+        // Explicitly set status to completed if MarkSyncComplete doesn't do it (it does, but just ensuring)
+        // MarkSyncComplete sets "completed".
+    }
 	
     return true
 }
@@ -316,11 +272,13 @@ func (p *Pipeline) logCycleComplete(phase string) {
 	)
 }
 
-func (p *Pipeline) runDiscovery(svc *services.PlyMktService) {
+func (p *Pipeline) runDiscovery() {
 	p.logger.Info("Running Discovery Phase...")
+	p.saverPool.SetSyncStatus(p.ctx, "plymkt_events", "running")
+	p.saverPool.SetSyncStatus(p.ctx, "fpmms", "running") // Also fpmms just in case
 	
 	// 1. Fetch Active Events (Discovery)
-	reqs, err := svc.GetDiscoveryReqs(p.ctx)
+	reqs, err := p.plyMktSvc.GetDiscoveryReqs(p.ctx)
 	if err != nil {
 		p.logger.Error("failed to get discovery reqs", slog.Any("error", err))
 		return
@@ -334,8 +292,9 @@ func (p *Pipeline) runDiscovery(svc *services.PlyMktService) {
 	}
 }
 
-func (p *Pipeline) runFillsSync(svc *services.PlyMktService) {
+func (p *Pipeline) runFillsSync() {
 	p.logger.Info("Running Fills Sync Phase (Targeted Active Markets)...")
+	p.saverPool.SetSyncStatus(p.ctx, "enriched_order_filled_events", "running")
 	
     // 1. Get Active Markets from DB
     marketIDs, err := p.saverPool.GetActiveMarketIDs(p.ctx, 100)
@@ -351,7 +310,7 @@ func (p *Pipeline) runFillsSync(svc *services.PlyMktService) {
     p.logger.Info("Fetched Active Market IDs", slog.Int("count", len(marketIDs)))
 
 	// 2. Build Targeted Requests
-	reqs, err := svc.GetMarketFillsReqs(p.ctx, marketIDs)
+	reqs, err := p.plyMktSvc.GetMarketFillsReqs(p.ctx, marketIDs)
 	if err != nil {
 		p.logger.Error("failed to get market fills reqs", slog.Any("error", err))
 		return
@@ -365,8 +324,9 @@ func (p *Pipeline) runFillsSync(svc *services.PlyMktService) {
 	}
 }
 
-func (p *Pipeline) runWhalePositionsSync(svc *services.PlyMktService) {
+func (p *Pipeline) runWhalePositionsSync() {
 	p.logger.Info("Running Whale Positions Sync Phase...")
+	p.saverPool.SetSyncStatus(p.ctx, "position_snapshots", "running")
 	
 	// 1. Get Top Whales from DB
 	// User requested "top 100 accounts"
@@ -383,7 +343,7 @@ func (p *Pipeline) runWhalePositionsSync(svc *services.PlyMktService) {
 	p.logger.Info("Fetched Top Whale IDs", slog.Int("count", len(whaleIDs)))
 
 	// 2. Build Targeted Requests
-	reqs, err := svc.GetWhalePositionsReqs(p.ctx, whaleIDs)
+	reqs, err := p.plyMktSvc.GetWhalePositionsReqs(p.ctx, whaleIDs)
 	if err != nil {
 		p.logger.Error("failed to get whale position reqs", slog.Any("error", err))
 		return
@@ -397,8 +357,9 @@ func (p *Pipeline) runWhalePositionsSync(svc *services.PlyMktService) {
 	}
 }
 
-func (p *Pipeline) runWhaleFillsSync(svc *services.PlyMktService) {
+func (p *Pipeline) runWhaleFillsSync() {
 	p.logger.Info("Running Whale Fills (History) Sync Phase...")
+	p.saverPool.SetSyncStatus(p.ctx, "enriched_order_filled_events", "running")
 	
 	// 1. Get Top Whales from DB
 	whaleIDs, err := p.saverPool.GetWhaleIDs(p.ctx, 100)
@@ -412,7 +373,7 @@ func (p *Pipeline) runWhaleFillsSync(svc *services.PlyMktService) {
 	}
 
 	// 2. Build Targeted Fills Requests (Maker & Taker)
-	reqs, err := svc.GetWhaleFillsReqs(p.ctx, whaleIDs)
+	reqs, err := p.plyMktSvc.GetWhaleFillsReqs(p.ctx, whaleIDs)
 	if err != nil {
 		p.logger.Error("failed to get whale fills reqs", slog.Any("error", err))
 		return
@@ -426,8 +387,9 @@ func (p *Pipeline) runWhaleFillsSync(svc *services.PlyMktService) {
 	}
 }
 
-func (p *Pipeline) runLiveDataSync(svc *services.PlyMktService) {
+func (p *Pipeline) runLiveDataSync() {
 	p.logger.Info("Running Live Data Sync Phase (Prices History)")
+	p.saverPool.SetSyncStatus(p.ctx, "prices_history", "running")
 
 	// 1. Get Active Tokens
 	tokenIDs, err := p.saverPool.GetActiveTokenIDs(p.ctx)
@@ -446,7 +408,7 @@ func (p *Pipeline) runLiveDataSync(svc *services.PlyMktService) {
 	for _, tokenID := range tokenIDs {
 		// Fidelity 1 (1 min), StartTs 0 (full history or rely on API default/limit)
 		// Optimization: Check last fetch time? For now, nice to have, but simple loop first.
-		req, err := svc.GetPriceHistoryReq(tokenID, 60, 0)
+		req, err := p.plyMktSvc.GetPriceHistoryReq(tokenID, 60, 0)
 		if err != nil {
 			p.logger.Error("failed to build price history req", slog.String("tokenID", tokenID), slog.Any("error", err))
 			continue
@@ -475,12 +437,6 @@ func (p *Pipeline) RunSubgraphSync(ctx context.Context) {
 func (p *Pipeline) RunSubgraphSyncWithOpts(ctx context.Context, fullSync bool) {
 	p.logger.Info("Starting Subgraph Sync...", slog.Bool("fullSync", fullSync))
 
-	plyMktSvc := &services.PlyMktService{
-		Cfg:    p.cfg,
-		Logger: p.logger,
-		Ctx:    p.ctx,
-	}
-
 	targets := []string{"fpmms"}
 
 	// Load cursors from DB for incremental sync
@@ -505,7 +461,7 @@ func (p *Pipeline) RunSubgraphSyncWithOpts(ctx context.Context, fullSync bool) {
 		}
 	}
 
-	reqs, err := plyMktSvc.GetSubgraphReqs(ctx, targets, startIds)
+	reqs, err := p.plyMktSvc.GetSubgraphReqs(ctx, targets, startIds)
 	if err != nil {
 		p.logger.Error("failed to get subgraph reqs", slog.Any("error", err))
 		return
@@ -803,4 +759,58 @@ func (p *Pipeline) StopNow() {
 	p.processorPool.StopNow()
 	p.saverPool.StopNow()
 	p.saverPool.Close()
+}
+
+// RunTopSync starts the pipeline for Top Traders/Holders sync.
+func (p *Pipeline) RunTopSync(ctx context.Context) {
+	p.logger.Info("Starting Top Sync Pipeline (Leaderboard & Holders)...")
+	
+	// 1. Fetch Leaderboard
+	// We might want multiple windows? e.g. "all", "month", "week"?
+	// Let's fetch "all" and "month" for now as key metrics.
+	windows := []string{"all", "month", "week"}
+	for _, w := range windows {
+		params := services.PlyMktLeaderboardParams{
+			TimePeriod: w,
+			Limit:      100, // Top 100
+		}
+		reqs, err := p.plyMktSvc.GetLeaderboardReqs(ctx, params)
+		if err != nil {
+			p.logger.Error("failed to get leaderboard reqs", slog.String("window", w), slog.Any("error", err))
+			continue
+		}
+		p.logger.Info("Dispatched Leaderboard requests", slog.String("window", w), slog.Int("count", len(reqs)))
+		for _, req := range reqs {
+			if err := p.fetcherPool.SubmitAndThenWait(req); err != nil {
+				p.logger.Error("failed to submit leaderboard req", slog.Any("error", err))
+			}
+		}
+	}
+
+	// 2. Fetch Holders for Active Markets
+	// Similar strategy to Fills Sync: get top active markets
+	marketIDs, err := p.saverPool.GetActiveMarketIDs(ctx, 100)
+	if err != nil {
+		p.logger.Error("failed to get active market IDs for holders", slog.Any("error", err))
+	} else if len(marketIDs) > 0 {
+		p.logger.Info("Fetching Holders for Active Markets", slog.Int("count", len(marketIDs)))
+		reqs, err := p.plyMktSvc.GetHoldersReqs(ctx, marketIDs)
+		if err != nil {
+			p.logger.Error("failed to get holders reqs", slog.Any("error", err))
+		} else {
+			p.logger.Info("Dispatched Holders requests", slog.Int("count", len(reqs)))
+			for _, req := range reqs {
+				if err := p.fetcherPool.SubmitAndThenWait(req); err != nil {
+					p.logger.Error("failed to submit holders req", slog.Any("error", err))
+				}
+			}
+		}
+	} else {
+		p.logger.Info("No active markets found, skipping holders sync")
+	}
+
+	p.logger.Info("Top Sync requests submitted. Waiting for pipeline completion...")
+	p.WaitUntilIdle(ctx, 5*time.Second)
+	p.PrintFinalReport()
+	p.StopNow()
 }

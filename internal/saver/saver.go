@@ -19,7 +19,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/samucap/poly-asian-data/internal/config"
 	internaldb "github.com/samucap/poly-asian-data/internal/db"
-	"github.com/samucap/poly-asian-data/internal/logging"
 	"github.com/samucap/poly-asian-data/internal/services"
 	"github.com/samucap/poly-asian-data/internal/workerpool"
 )
@@ -337,6 +336,12 @@ func (s *Saver) workerTask(ctx context.Context, record *Record) (*Result, error)
 		rowsAffected, err = s.batchInsertEvents(ctx, record.Data)
 	case "enriched_order_filled_events":
 		rowsAffected, err = s.batchInsertEnrichedOrderFilledEvents(ctx, record.Data)
+	case "plymkt_users":
+		rowsAffected, err = s.batchInsertUsers(ctx, record.Data)
+	case "plymkt_holders":
+		rowsAffected, err = s.batchInsertHolders(ctx, record.Data)
+	case "plymkt_holders_bundle":
+		rowsAffected, err = s.batchInsertHoldersBundle(ctx, record.Data)
 	default:
 		return nil, fmt.Errorf("unknown table: %s", record.TableName)
 	}
@@ -427,15 +432,16 @@ func (s *Saver) GetActiveTokenIDs(ctx context.Context) ([]string, error) {
 	return tokenIDs, nil
 }
 
-// GetActiveMarketIDs fetches distinct market IDs for active markets with high volume.
+// GetActiveMarketIDs fetches distinct market IDs (Condition IDs) for active markets with high volume.
 func (s *Saver) GetActiveMarketIDs(ctx context.Context, limit int) ([]string, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	
+	// Select condition_id (Hex) instead of id (Numeric Asset ID)
 	rows, err := s.db.Query(ctx, `
-		SELECT id FROM plymkt_markets 
-		WHERE active = true
+		SELECT condition_id FROM plymkt_markets 
+		WHERE active = true AND condition_id != ''
 		ORDER BY volume_24hr DESC
 		LIMIT $1
 	`, limit)
@@ -537,6 +543,19 @@ func (s *Saver) SetSyncCursor(ctx context.Context, syncType, cursor string, item
 			total_items = sync_state.total_items + $3,
 			status = 'running'
 	`, syncType, cursor, itemCount)
+	return err
+}
+
+// SetSyncStatus updates the status of a sync type without changing the cursor.
+// Used to indicate "running" state at the start of a cycle.
+func (s *Saver) SetSyncStatus(ctx context.Context, syncType, status string) error {
+	_, err := s.db.Exec(ctx, `
+		INSERT INTO sync_state (sync_type, last_sync_at, status, total_items, last_cursor)
+		VALUES ($1, NOW(), $2, 0, '')
+		ON CONFLICT (sync_type) DO UPDATE SET
+			status = $2,
+			last_sync_at = NOW()
+	`, syncType, status)
 	return err
 }
 
@@ -1622,4 +1641,107 @@ func (s *Saver) batchInsertOrderbooks(ctx context.Context, data any) (int64, err
 		s.logger.Error("failed to save orderbook", "error", err)
 	}
 	return totalAffected, err
+}
+
+// batchInsertUsers inserts user/profile data.
+func (s *Saver) batchInsertUsers(ctx context.Context, data any) (int64, error) {
+	items, ok := data.([]services.PlyMktUser)
+	if !ok {
+		return 0, fmt.Errorf("invalid data type for users: got %T", data)
+	}
+
+	// Sort items by ProxyWallet to prevent deadlocks
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].ProxyWallet < items[j].ProxyWallet
+	})
+
+	batch := &pgx.Batch{}
+	for _, item := range items {
+		batch.Queue(`
+			INSERT INTO plymkt_users (
+				proxy_wallet, username, name, bio, profile_image, x_username, verified_badge,
+				vol, pnl, rank, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
+			ON CONFLICT (proxy_wallet) DO UPDATE SET
+				username = COALESCE(NULLIF(EXCLUDED.username, ''), plymkt_users.username),
+				name = COALESCE(NULLIF(EXCLUDED.name, ''), plymkt_users.name),
+				bio = COALESCE(NULLIF(EXCLUDED.bio, ''), plymkt_users.bio),
+				profile_image = COALESCE(NULLIF(EXCLUDED.profile_image, ''), plymkt_users.profile_image),
+				x_username = COALESCE(NULLIF(EXCLUDED.x_username, ''), plymkt_users.x_username),
+				verified_badge = COALESCE(EXCLUDED.verified_badge, plymkt_users.verified_badge),
+				vol = COALESCE(EXCLUDED.vol, plymkt_users.vol),
+				pnl = COALESCE(EXCLUDED.pnl, plymkt_users.pnl),
+				rank = COALESCE(EXCLUDED.rank, plymkt_users.rank),
+				updated_at = CURRENT_TIMESTAMP
+		`,
+			item.ProxyWallet, item.Username, item.Name, item.Bio, item.ProfileImage,
+			item.XUsername, item.VerifiedBadge, item.Vol, item.Pnl, item.Rank,
+		)
+	}
+	
+	rows, _, err := s.execBatch(ctx, batch, len(items))
+	return rows, err
+}
+
+// batchInsertHolders inserts holder records.
+func (s *Saver) batchInsertHolders(ctx context.Context, data any) (int64, error) {
+	items, ok := data.([]services.PlyMktHolderRecord)
+	if !ok {
+		return 0, fmt.Errorf("invalid data type for holders: got %T", data)
+	}
+
+	// Sort items by TokenID + ProxyWallet to prevent deadlocks
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].TokenID != items[j].TokenID {
+			return items[i].TokenID < items[j].TokenID
+		}
+		return items[i].ProxyWallet < items[j].ProxyWallet
+	})
+
+	batch := &pgx.Batch{}
+	for _, item := range items {
+		batch.Queue(`
+			INSERT INTO plymkt_holders (
+				token_id, proxy_wallet, amount, updated_at
+			) VALUES ($1, $2, $3, $4)
+			ON CONFLICT (token_id, proxy_wallet) DO UPDATE SET
+				amount = EXCLUDED.amount,
+				updated_at = EXCLUDED.updated_at
+		`,
+			item.TokenID, item.ProxyWallet, item.Amount, item.UpdatedAt,
+		)
+	}
+
+	rows, _, err := s.execBatch(ctx, batch, len(items))
+	return rows, err
+}
+
+// batchInsertHoldersBundle handles atomic save of users and holders.
+func (s *Saver) batchInsertHoldersBundle(ctx context.Context, data any) (int64, error) {
+	bundle, ok := data.(services.PlyMktHoldersBundle)
+	if !ok {
+		return 0, fmt.Errorf("invalid data type for holders bundle: got %T", data)
+	}
+
+	var totalAffected int64
+
+	// 1. Insert Users first
+	if len(bundle.Users) > 0 {
+		n, err := s.batchInsertUsers(ctx, bundle.Users)
+		if err != nil {
+			return 0, fmt.Errorf("failed to save bundle users: %w", err)
+		}
+		totalAffected += n
+	}
+
+	// 2. Insert Holders
+	if len(bundle.Holders) > 0 {
+		n, err := s.batchInsertHolders(ctx, bundle.Holders)
+		if err != nil {
+			return totalAffected, fmt.Errorf("failed to save bundle holders: %w", err)
+		}
+		totalAffected += n
+	}
+
+	return totalAffected, nil
 }

@@ -440,6 +440,195 @@ func (ply *PlyMktService) SyncSubgraph(ctx context.Context) (*RespDetails, error
 	// redemptions
 	return nil, nil
 }
+
+// =============================================================================
+// Data API (Leaderboard & Holders)
+// =============================================================================
+
+type PlyMktLeaderboardEntry struct {
+	Rank          string  `json:"rank"`
+	ProxyWallet   string  `json:"proxyWallet"`
+	UserName      string  `json:"userName"`
+	Vol           float64 `json:"vol"`
+	Pnl           float64 `json:"pnl"`
+	ProfileImage  string  `json:"profileImage"`
+	XUsername     string  `json:"xUsername"`
+	VerifiedBadge bool    `json:"verifiedBadge"`
+	// Additional fields we might want to track metadata
+	Period        string  `json:"-"` 
+}
+
+type PlyMktLeaderboardParams struct {
+	Category   string
+	TimePeriod string
+	OrderBy    string
+	Limit      int
+	Offset     int
+	User       string
+}
+
+type PlyMktHolderEntry struct {
+	ProxyWallet           string  `json:"proxyWallet"`
+	Pseudonym             string  `json:"pseudonym"`
+	Name                  string  `json:"name"` // Added based on feedback
+	Amount                float64 `json:"amount"` 
+	Bio                   string  `json:"bio"`
+	ProfileImage          string  `json:"profileImage"`
+	ProfileImageOptimized string  `json:"profileImageOptimized"`
+	DisplayUsernamePublic bool    `json:"displayUsernamePublic"`
+	OutcomeIndex          int     `json:"outcomeIndex"`
+	Asset                 string  `json:"asset"`
+}
+
+type PlyMktHolderToken struct {
+	Token   string              `json:"token"`
+	Holders []PlyMktHolderEntry `json:"holders"`
+}
+
+type PlyMktUser struct {
+	ProxyWallet   string  `json:"proxyWallet"`
+	Username      string  `json:"username"`
+	Name          string  `json:"name"`
+	Bio           string  `json:"bio"`
+	ProfileImage  string  `json:"profileImage"`
+	XUsername     string  `json:"xUsername"`
+	VerifiedBadge bool    `json:"verifiedBadge"`
+	Vol           float64 `json:"vol"`
+	Pnl           float64 `json:"pnl"`
+	Rank          int     `json:"rank"`
+}
+
+type PlyMktHolderRecord struct {
+	TokenID               string  `json:"tokenID"`
+	ProxyWallet           string  `json:"proxyWallet"`
+	Amount                float64 `json:"amount"`
+	UpdatedAt             time.Time `json:"updatedAt"`
+}
+
+// PlyMktHoldersBundle groups users and holders for atomic saving
+type PlyMktHoldersBundle struct {
+	Users   []PlyMktUser
+	Holders []PlyMktHolderRecord
+}
+
+func (ply *PlyMktService) GetLeaderboardReqs(ctx context.Context, params PlyMktLeaderboardParams) ([]*fetcher.Request, error) {
+	dataEndpoint, ok := config.DefaultEndpoints["data"].(string)
+	if !ok {
+		// Fallback or error? Config should be loaded.
+		// If using injected cfg, try that.
+		if ply.Cfg != nil {
+			if ep, ok := ply.Cfg.Services.PlyMkt.Endpoints["data"].(string); ok {
+				dataEndpoint = ep
+			}
+		}
+		if dataEndpoint == "" {
+			dataEndpoint = "https://data-api.polymarket.com" // Default fallback
+		}
+	}
+
+	u, err := url.Parse(dataEndpoint)
+	if err != nil {
+		return nil, err
+	}
+	u = u.JoinPath("/v1/leaderboard")
+
+	q := u.Query()
+	if params.Category != "" {
+		q.Set("category", params.Category)
+	}
+	if params.TimePeriod != "" {
+		q.Set("timePeriod", params.TimePeriod)
+	}
+	if params.OrderBy != "" {
+		q.Set("orderBy", params.OrderBy)
+	}
+	if params.Limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", params.Limit))
+	}
+	if params.Offset > 0 {
+		q.Set("offset", fmt.Sprintf("%d", params.Offset))
+	}
+	if params.User != "" {
+		q.Set("user", params.User)
+	}
+	u.RawQuery = q.Encode()
+
+	req := &fetcher.Request{
+		URL:    u.String(),
+		Method: "GET",
+		Headers: map[string]string{
+			"User-Agent": "PolyAsianData/1.0",
+			"Accept":     "application/json",
+		},
+		Metadata: map[string]string{
+			"IsLeaderboard": "true",
+		},
+	}
+
+	return []*fetcher.Request{req}, nil
+}
+
+func (ply *PlyMktService) GetHoldersReqs(ctx context.Context, marketIDs []string) ([]*fetcher.Request, error) {
+	dataEndpoint, ok := config.DefaultEndpoints["data"].(string)
+	if !ok {
+		if ply.Cfg != nil {
+			if ep, ok := ply.Cfg.Services.PlyMkt.Endpoints["data"].(string); ok {
+				dataEndpoint = ep
+			}
+		}
+		if dataEndpoint == "" {
+			dataEndpoint = "https://data-api.polymarket.com"
+		}
+	}
+
+	u, err := url.Parse(dataEndpoint)
+	if err != nil {
+		return nil, err
+	}
+	u = u.JoinPath("/holders")
+
+	// Limit is hardcapped at 20 per request/token? OR "limit=20" in query.
+	// API docs say "market: comma-separated list of condition IDs".
+	// Gamma market ID usually IS the condition ID or close mapping?
+	// Note: API doc says "condition IDs". Our `PlyMktMarket.ConditionID`.
+	
+	// We'll chunk to be safe, e.g. 20 markets per request?
+	// User didn't specify batch size, but usually 20-50 is safe for comma lists.
+	// Let's use 20.
+	
+	var reqs []*fetcher.Request
+	chunkSize := 20
+	
+	for i := 0; i < len(marketIDs); i += chunkSize {
+		end := i + chunkSize
+		if end > len(marketIDs) {
+			end = len(marketIDs)
+		}
+		chunk := marketIDs[i:end]
+		
+		q := u.Query()
+		q.Set("market", strings.Join(chunk, ","))
+		q.Set("limit", "20") // Max per token
+		
+		// Copy URL
+		reqURL := *u
+		reqURL.RawQuery = q.Encode()
+		
+		reqs = append(reqs, &fetcher.Request{
+			URL:    reqURL.String(),
+			Method: "GET",
+			Headers: map[string]string{
+				"User-Agent": "PolyAsianData/1.0",
+				"Accept":     "application/json",
+			},
+			Metadata: map[string]string{
+				"IsHolders": "true",
+			},
+		})
+	}
+	
+	return reqs, nil
+}
 type PlyMktTeam struct {
 	ID           int    `json:"id"`
 	Name         string `json:"name"`
@@ -742,20 +931,22 @@ type PlyMktAccount struct {
 }
 
 type PlyMktEnrichedOrderFilledEvent struct {
-	ID        string `json:"id"`    // Tx hash
+	ID        string `json:"id"`    // Tx hash + order hash
 	Price     string `json:"price"` // Fill price
 	Side      string `json:"side"`  // Maker or taker
 	Size      string `json:"size"`  // Fill size
-	Maker     struct {
+	Maker     struct { // added liquidity by posting order side = "buy" (they took liquidity)
 		ID string `json:"id"`
 	} `json:"maker"`
-	Taker struct {
+	Taker struct { // removed liquidity by taking order side = "sell" (they added liquidity)
 		ID string `json:"id"`
 	} `json:"taker"`
 	Market struct {
 		ID string `json:"id"`
 	} `json:"market"`
 	Timestamp string `json:"timestamp"`
+	TransactionHash string `json:"transactionHash"`
+    OrderHash       string `json:"orderHash"`
 }
 
 type PlyMktOrderFilledEvent struct {
