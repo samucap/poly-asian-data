@@ -60,13 +60,13 @@ func migrator() {
 		_, err := dbPool.Exec(ctx, q)
 		if err != nil {
 			fmt.Printf("Failed to execute: %s\nError: %v\n", q, err)
-			// Check if constraint exists already error? (23505 duplicate key if constraint already executed? no, alter constraint creates it)
-			// If constraint drop/add fails because of existing dupes, we might have issues.
-			// But table is hypertable...
-			// Let's assume it works or fails hard.
 			os.Exit(1)
 		}
 		fmt.Println("Success: ", q)
 	}
 	fmt.Println("Migration complete.")
+}
+
+func main() {
+	migrator()
 }

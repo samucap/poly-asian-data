@@ -309,16 +309,16 @@ type Category struct {
 }
 
 type PlyMktTag struct {
-	ID           string    `json:"id"`
-	Label        string    `json:"label"`
-	Slug         string    `json:"slug"`
-	ForceShow    bool      `json:"forceShow"`
-	PublishedAt  string    `json:"publishedAt"`
-	CreatedBy    int       `json:"createdBy"`
-	UpdatedBy    int       `json:"updatedBy"`
-	CreatedAtPly time.Time `json:"createdAt"`
-	UpdatedAtPly time.Time `json:"updatedAt"`
-	ForceHide    bool      `json:"forceHide"`
+	ID             string    `json:"id"`
+	Label          string    `json:"label"`
+	Slug           string    `json:"slug"`
+	ForceShow      bool      `json:"forceShow"`
+	PublishedAt    string    `json:"publishedAt"`
+	CreatedBy      int       `json:"createdBy"`
+	UpdatedBy      int       `json:"updatedBy"`
+	CreatedAtPly   time.Time `json:"createdAt"`
+	UpdatedAtPly   time.Time `json:"updatedAt"`
+	ForceHide      bool      `json:"forceHide"`
 	ParentCategory string
 }
 
@@ -364,6 +364,8 @@ type PlyMktPriceHistory struct {
 	Price     float64 `json:"p"`
 	MarketID  string  `json:"-"`
 	TokenID   string  `json:"-"`
+	Interval  string  `json:"-"` //?? do i need this? just wondering how to dedupe price entries
+	Fidelity  string  `json:"-"`
 }
 
 type PlyMktPricePoint struct {
