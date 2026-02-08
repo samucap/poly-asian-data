@@ -3,8 +3,8 @@
 package processor
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -256,71 +256,14 @@ func (p *Processor) processTags(resp *fetcher.Response) (*Output, error) {
 		return nil, err
 	}
 
-	var sportsToSave []services.PlyMktSportCategory
-	var derivedReqs []*fetcher.Request
-
-	for i := range tags {
-		tag := &tags[i]
-		if slices.Contains(sportSlugs, tag.Slug) {
-			// Found a sport category
-			sportsToSave = append(sportsToSave, services.PlyMktSportCategory{
-				Slug:         tag.Slug,
-				PrimaryTagID: tag.ID,
-			})
-			tag.SportSlug = tag.Slug
-
-			u := getBaseURL(resp.URL)
-			eventsURL := u + "/events?tag_id=" + tag.ID
-
-			req := &fetcher.Request{
-				URL:     eventsURL,
-				Method:  "GET",
-				Headers: resp.Request.Headers,
-				Metadata: map[string]string{
-					"SportSlug": tag.Slug,
-				},
-			}
-			derivedReqs = append(derivedReqs, req)
-		} else if tag.ID == gamesTagID {
-			// Found the Games tag
-			u := getBaseURL(resp.URL)
-			eventsURL := u + "/events?tag_id=" + tag.ID // Note: tester-concurrent doesn't pass 'related_tags' for gamesTag?
-			// "if tagID != "100639" { params.Add("related_tags", "true") }" in fetchEvents
-			// fetcher.go might not have this logic embedded in simplified Req.
-			// We should append query params manually here.
-
-			// Re-construct URL with explicit params to match tester
-			// Or let fetcher handle it (but fetcher is generic).
-			// Better to be explicit here.
-
-			// However, the Fetcher logic was simple.
-			// Let's assume we construct the URL fully.
-
-			req := &fetcher.Request{
-				URL:     eventsURL,
-				Method:  "GET",
-				Headers: resp.Request.Headers,
-				Metadata: map[string]string{
-					"IsGames": "true",
-				},
-			}
-			derivedReqs = append(derivedReqs, req)
-		}
-	}
-
-	// ...
 	payloads := []SaverPayload{}
 	if len(tags) > 0 {
 		// Start of the pipeline: definitions
 		payloads = append(payloads, SaverPayload{TableName: "tags_definitions", Data: tags})
 	}
-	if len(sportsToSave) > 0 {
-		payloads = append(payloads, SaverPayload{TableName: "sports", Data: sportsToSave})
-	}
 
 	return &Output{
 		SaverPayloads:   payloads,
-		DerivedRequests: derivedReqs,
 		ItemCount:       len(tags),
 		OriginalRequest: resp.Request,
 	}, nil
@@ -349,7 +292,7 @@ func (p *Processor) processEvents(resp *fetcher.Response) (*Output, error) {
 	var derivedReqs []*fetcher.Request
 	var marketsToSave []services.PlyMktMarket
 	var tagsToUpdate []services.PlyMktTag
-	var allTokenIds []string           // Collect all tokens for batch orderbook request
+	var allTokenIds []string            // Collect all tokens for batch orderbook request
 	seenTokens := make(map[string]bool) // Global deduplication for price history
 
 	for _, ev := range events {
@@ -367,22 +310,22 @@ func (p *Processor) processEvents(resp *fetcher.Response) (*Output, error) {
 			}
 			// Enrich market with event ID if needed (usually relation handled by DB)
 			m.EventID = ev.ID // Ensure link
-			
+
 			// NORMALIZE MARKET DATA
 			m.Liquidity = utils.CleanNumericString(m.Liquidity)
 			m.Volume = utils.CleanNumericString(m.Volume)
 			m.Fee = utils.CleanNumericString(m.Fee)
 			m.OutcomePrices = utils.NormalizeString(m.OutcomePrices) // Just trim, it's a JSON string usually
-			
+
 			// PlyMktMarket struct definition check:
 			// Liquidity string
 			// Volume string
 			// Fee string
 			// Volume24hr float64 (already typed) -> no need to clean string unless we change struct.
 			// The plan focused on "string fields" normalization.
-			
+
 			marketsToSave = append(marketsToSave, *m)
-			
+
 			// Parse ClobTokenIds for this market
 			var tokenIds []string
 			if m.ClobTokenIds != "" {
@@ -390,7 +333,7 @@ func (p *Processor) processEvents(resp *fetcher.Response) (*Output, error) {
 					tokenIds = strings.Split(m.ClobTokenIds, ",")
 				}
 			}
-			
+
 			// Collect unique tokens for orderbook and price history
 			for _, tid := range tokenIds {
 				tid = strings.TrimSpace(tid)
@@ -428,25 +371,25 @@ func (p *Processor) processEvents(resp *fetcher.Response) (*Output, error) {
 			type tokenReq struct {
 				TokenID string `json:"token_id"`
 			}
-			
+
 			for i := 0; i < len(allTokenIds); i += batchSize {
 				end := i + batchSize
 				if end > len(allTokenIds) {
 					end = len(allTokenIds)
 				}
 				chunk := allTokenIds[i:end]
-				
+
 				var bodyItems []tokenReq
 				for _, tid := range chunk {
 					bodyItems = append(bodyItems, tokenReq{TokenID: tid})
 				}
 				bodyBytes, _ := json.Marshal(bodyItems)
-				
+
 				derivedReqs = append(derivedReqs, &fetcher.Request{
-					URL:    fmt.Sprintf("%s/books", clobAPI),
-					Method: "POST",
+					URL:     fmt.Sprintf("%s/books", clobAPI),
+					Method:  "POST",
 					Headers: map[string]string{"Content-Type": "application/json"},
-					Body:   bytes.NewReader(bodyBytes),
+					Body:    bytes.NewReader(bodyBytes),
 					Metadata: map[string]string{
 						"Type":       "orderbooks_batch",
 						"TokenCount": fmt.Sprintf("%d", len(chunk)),
@@ -476,22 +419,22 @@ func (p *Processor) processEvents(resp *fetcher.Response) (*Output, error) {
 			q := u.Query()
 			limitStr := q.Get("limit")
 			offsetStr := q.Get("offset")
-			
+
 			if limitStr != "" && offsetStr != "" {
 				limit, _ := strconv.Atoi(limitStr)
 				offset, _ := strconv.Atoi(offsetStr)
 				newOffset := offset + limit
 				q.Set("offset", fmt.Sprintf("%d", newOffset))
 				u.RawQuery = q.Encode()
-				
+
 				nextReq = &fetcher.Request{
 					URL:      u.String(),
 					Method:   resp.Request.Method,
 					Headers:  resp.Request.Headers,
 					Metadata: resp.Request.Metadata,
 				}
-				p.logger.Info("built next page request", 
-					slog.String("component", "processor"), 
+				p.logger.Info("built next page request",
+					slog.String("component", "processor"),
 					slog.String("url", nextReq.URL),
 					slog.Int("newOffset", newOffset),
 				)
@@ -515,21 +458,9 @@ func (p *Processor) processLeagues(resp *fetcher.Response) (*Output, error) {
 		return nil, err
 	}
 
-	for i := range leagues {
-		l := &leagues[i]
-
-		// We defer hierarchy logic to Saver via 'league_hierarchy' payload
-		sSlug := findSportSlugForLeague(l)
-		if sSlug != "" {
-			l.SportSlug = sSlug
-		}
-	}
-
 	payloads := []SaverPayload{}
 	if len(leagues) > 0 {
 		payloads = append(payloads, SaverPayload{TableName: "leagues", Data: leagues})
-		// Also send for hierarchy processing (Saver has the context to do this right)
-		payloads = append(payloads, SaverPayload{TableName: "league_hierarchy", Data: leagues})
 	}
 
 	return &Output{
@@ -544,16 +475,6 @@ func (p *Processor) processTeams(resp *fetcher.Response) (*Output, error) {
 	var teams []services.PlyMktTeam
 	if err := json.Unmarshal(resp.Data, &teams); err != nil {
 		return nil, err
-	}
-
-	for i := range teams {
-		// Just pass through. Saver will resolve logic.
-		// We can try to hint SportSlug if possible.
-		t := &teams[i]
-		sSlug := findSportSlugForTeam(t)
-		if sSlug != "" {
-			t.SportSlug = sSlug
-		}
 	}
 
 	payloads := []SaverPayload{}
@@ -661,7 +582,7 @@ func (p *Processor) processSubgraph(resp *fetcher.Response) (*Output, error) {
 		if itemCount > 0 {
 			lastID = items[itemCount-1].ID
 		}
-		
+
 		// Normalize EnrichedOrderFilledEvents (Modify IN PLACE before saving/aggregating)
 		for i := range items {
 			items[i].Price = utils.CleanNumericString(items[i].Price)
@@ -674,18 +595,18 @@ func (p *Processor) processSubgraph(resp *fetcher.Response) (*Output, error) {
 
 		// 2. Aggregate Account Stats (In-Memory)
 		type AccAgg struct {
-			ID string
-			Vol float64
-			Trades int64
+			ID         string
+			Vol        float64
+			Trades     int64
 			LastTraded int64
 		}
 		accStats := make(map[string]*AccAgg)
-		
+
 		updateAcc := func(id string, vol float64, ts int64) {
 			if _, exists := accStats[id]; !exists {
 				accStats[id] = &AccAgg{
-					ID: id,
-					Vol: 0,
+					ID:     id,
+					Vol:    0,
 					Trades: 0,
 				}
 			}
@@ -700,10 +621,10 @@ func (p *Processor) processSubgraph(resp *fetcher.Response) (*Output, error) {
 			price, _ := strconv.ParseFloat(item.Price, 64)
 			size, _ := strconv.ParseFloat(item.Size, 64)
 			vol := price * size
-			
+
 			// Parse timestamp (usually string seconds)
 			tsLine, _ := strconv.ParseInt(item.Timestamp, 10, 64)
-			
+
 			if item.Maker.ID != "" {
 				updateAcc(item.Maker.ID, vol, tsLine)
 			}
@@ -717,14 +638,14 @@ func (p *Processor) processSubgraph(resp *fetcher.Response) (*Output, error) {
 		var accs []services.PlyMktAccount
 		for _, agg := range accStats {
 			accs = append(accs, services.PlyMktAccount{
-				ID: agg.ID,
-				CollateralVolume: fmt.Sprintf("%f", agg.Vol),
-				NumTrades: fmt.Sprintf("%d", agg.Trades),
+				ID:                  agg.ID,
+				CollateralVolume:    fmt.Sprintf("%f", agg.Vol),
+				NumTrades:           fmt.Sprintf("%d", agg.Trades),
 				LastTradedTimestamp: fmt.Sprintf("%d", agg.LastTraded),
 				// Other fields empty, Saver should handle incomplete structs for increment
 			})
 		}
-		
+
 		if len(accs) > 0 {
 			payloads = append(payloads, SaverPayload{TableName: "accounts_increment", Data: accs})
 		}
@@ -832,75 +753,75 @@ func (p *Processor) processSubgraph(resp *fetcher.Response) (*Output, error) {
 
 	// Build Next Request if Cursor Pagination is enabled and we have a lastID
 	if itemCount >= 1000 && lastID != "" && resp.Request.Metadata["CursorPagination"] == "true" {
-            // Check MaxPages limit
-            if maxPagesStr, ok := resp.Request.Metadata["MaxPages"]; ok && maxPagesStr != "" {
-                maxPages, _ := strconv.Atoi(maxPagesStr)
-                currentPage := 1
-                if cpStr, ok := resp.Request.Metadata["CurrentPage"]; ok && cpStr != "" {
-                    currentPage, _ = strconv.Atoi(cpStr)
-                }
-                if currentPage >= maxPages {
-                    p.logger.Info("reached max pages limit",
-                        slog.Int("maxPages", maxPages),
-                        slog.Int("currentPage", currentPage),
-                    )
-                    // Return early - no next page
-                    return &Output{
-                        SaverPayloads:   payloads,
-                        DerivedRequests: derivedReqs,
-                        NextPageRequest: nil, // Stop pagination
-                        ItemCount:       itemCount,
-                        OriginalRequest: resp.Request,
-                    }, nil
-                }
-            }
-            
-			// Construct full query using request metadata template
-			fullQuery := resp.Request.Metadata["GraphqlQuery"]
-			
-			// Restore variables from Metadata or Default
-			vars := make(map[string]any)
-			if varsJSON, ok := resp.Request.Metadata["GraphqlVariables"]; ok && varsJSON != "" {
-				if err := json.Unmarshal([]byte(varsJSON), &vars); err != nil {
-					p.logger.Error("failed to unmarshal graphql variables from metadata", slog.String("error", err.Error()))
-					// Fallback to default?
-					vars["first"] = 1000
-					vars["lastId"] = lastID
-				}
-			} else {
-				// Default fallback
+		// Check MaxPages limit
+		if maxPagesStr, ok := resp.Request.Metadata["MaxPages"]; ok && maxPagesStr != "" {
+			maxPages, _ := strconv.Atoi(maxPagesStr)
+			currentPage := 1
+			if cpStr, ok := resp.Request.Metadata["CurrentPage"]; ok && cpStr != "" {
+				currentPage, _ = strconv.Atoi(cpStr)
+			}
+			if currentPage >= maxPages {
+				p.logger.Info("reached max pages limit",
+					slog.Int("maxPages", maxPages),
+					slog.Int("currentPage", currentPage),
+				)
+				// Return early - no next page
+				return &Output{
+					SaverPayloads:   payloads,
+					DerivedRequests: derivedReqs,
+					NextPageRequest: nil, // Stop pagination
+					ItemCount:       itemCount,
+					OriginalRequest: resp.Request,
+				}, nil
+			}
+		}
+
+		// Construct full query using request metadata template
+		fullQuery := resp.Request.Metadata["GraphqlQuery"]
+
+		// Restore variables from Metadata or Default
+		vars := make(map[string]any)
+		if varsJSON, ok := resp.Request.Metadata["GraphqlVariables"]; ok && varsJSON != "" {
+			if err := json.Unmarshal([]byte(varsJSON), &vars); err != nil {
+				p.logger.Error("failed to unmarshal graphql variables from metadata", slog.String("error", err.Error()))
+				// Fallback to default?
 				vars["first"] = 1000
 				vars["lastId"] = lastID
 			}
-
-			// Update Cursor
+		} else {
+			// Default fallback
+			vars["first"] = 1000
 			vars["lastId"] = lastID
-			
-			// Build body
-			bodyData := map[string]any{
-				"query": fullQuery,
-				"variables": vars,
-			}
-			bodyBytes, _ := json.Marshal(bodyData) // Error ignored, should be safe
-            
-            // Increment CurrentPage in metadata for next request
-            newMetadata := make(map[string]string)
-            for k, v := range resp.Request.Metadata {
-                newMetadata[k] = v
-            }
-            if cpStr, ok := resp.Request.Metadata["CurrentPage"]; ok && cpStr != "" {
-                cp, _ := strconv.Atoi(cpStr)
-                newMetadata["CurrentPage"] = strconv.Itoa(cp + 1)
-            }
-			
-			nextReq = &fetcher.Request{
-				URL: resp.Request.URL,
-				Method: resp.Request.Method,
-				Headers: resp.Request.Headers,
-				Body: bytes.NewReader(bodyBytes),
-				Metadata: newMetadata,
-				// No Params
-			}
+		}
+
+		// Update Cursor
+		vars["lastId"] = lastID
+
+		// Build body
+		bodyData := map[string]any{
+			"query":     fullQuery,
+			"variables": vars,
+		}
+		bodyBytes, _ := json.Marshal(bodyData) // Error ignored, should be safe
+
+		// Increment CurrentPage in metadata for next request
+		newMetadata := make(map[string]string)
+		for k, v := range resp.Request.Metadata {
+			newMetadata[k] = v
+		}
+		if cpStr, ok := resp.Request.Metadata["CurrentPage"]; ok && cpStr != "" {
+			cp, _ := strconv.Atoi(cpStr)
+			newMetadata["CurrentPage"] = strconv.Itoa(cp + 1)
+		}
+
+		nextReq = &fetcher.Request{
+			URL:      resp.Request.URL,
+			Method:   resp.Request.Method,
+			Headers:  resp.Request.Headers,
+			Body:     bytes.NewReader(bodyBytes),
+			Metadata: newMetadata,
+			// No Params
+		}
 	}
 
 	return &Output{
@@ -909,8 +830,8 @@ func (p *Processor) processSubgraph(resp *fetcher.Response) (*Output, error) {
 		NextPageRequest: nextReq,
 		ItemCount:       itemCount,
 		OriginalRequest: resp.Request,
-		SyncType:        entity,    // For cursor tracking
-		LastCursor:      lastID,    // Last ID processed
+		SyncType:        entity, // For cursor tracking
+		LastCursor:      lastID, // Last ID processed
 	}, nil
 }
 
@@ -1020,7 +941,7 @@ func findSportSlugForTeam(t *services.PlyMktTeam) string {
 // processOrderbook handles /book and /books (batch) responses.
 func (p *Processor) processOrderbook(resp *fetcher.Response) (*Output, error) {
 	var books []services.PlyMktOrderbook
-	
+
 	// Check if batch response (array) or single (object)
 	if len(resp.Data) > 0 && resp.Data[0] == '[' {
 		// Batch response: array of orderbooks
@@ -1050,7 +971,7 @@ func (p *Processor) processOrderbook(resp *fetcher.Response) (*Output, error) {
 			bestAsk, _ = strconv.ParseFloat(books[i].Asks[0].Price, 64)
 		}
 		books[i].Spread = CalculateSpread(bestBid, bestAsk)
-		
+
 		// Use asset_id as TokenID if not set (batch API returns asset_id)
 		if books[i].TokenID == "" && books[i].AssetID != "" {
 			books[i].TokenID = books[i].AssetID
@@ -1074,9 +995,9 @@ func (p *Processor) processPricesHistory(resp *fetcher.Response) (*Output, error
 	type HistoryResponse struct {
 		History []services.PlyMktPricePoint `json:"history"`
 	}
-	
+
 	var points []services.PlyMktPricePoint
-	
+
 	// properties from metadata
 	marketID := ""
 	tokenID := ""
@@ -1102,7 +1023,7 @@ func (p *Processor) processPricesHistory(resp *fetcher.Response) (*Output, error
 			p.logger.Warn("price history API error", slog.String("url", resp.URL), slog.String("error", errResp.Error))
 			return &Output{ItemCount: 0, OriginalRequest: resp.Request}, nil
 		}
-		
+
 		// Try Array format
 		if err := json.Unmarshal(resp.Data, &points); err != nil {
 			// If both fail, and data isn't empty, it's an error.
@@ -1121,7 +1042,7 @@ func (p *Processor) processPricesHistory(resp *fetcher.Response) (*Output, error
 	// The Saver expects `prices_history` table payload.
 	// Let's create a struct that matches schema: timestamp, token_id, price.
 	// Reuse PlyMktPriceHistory but ensure Price is set.
-	
+
 	var items []services.PlyMktPriceHistory
 	for _, pt := range points {
 		var priceVal float64
@@ -1178,8 +1099,6 @@ func (p *Processor) processLeaderboard(resp *fetcher.Response) (*Output, error) 
 		return nil, fmt.Errorf("failed to unmarshal leaderboard: %w", err)
 	}
 
-
-
 	// Map to PlyMktUser
 	var users []services.PlyMktUser
 	for _, item := range items {
@@ -1225,11 +1144,11 @@ func (p *Processor) processHolders(resp *fetcher.Response) (*Output, error) {
 		for _, h := range t.Holders {
 			// Extract User
 			users = append(users, services.PlyMktUser{
-				ProxyWallet:           h.ProxyWallet,
-				Name:                  h.Name,
-				Username:              h.Pseudonym, // Pseudonym maps to Username? Or Name? User said "pseudonym": "<string>".
-				Bio:                   h.Bio,
-				ProfileImage:          h.ProfileImage,
+				ProxyWallet:  h.ProxyWallet,
+				Name:         h.Name,
+				Username:     h.Pseudonym, // Pseudonym maps to Username? Or Name? User said "pseudonym": "<string>".
+				Bio:          h.Bio,
+				ProfileImage: h.ProfileImage,
 				// Pnl/Vol not in holders response
 			})
 
@@ -1256,5 +1175,3 @@ func (p *Processor) processHolders(resp *fetcher.Response) (*Output, error) {
 		ItemCount: len(holders), // One record per holding link
 	}, nil
 }
-
-

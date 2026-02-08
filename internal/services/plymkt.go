@@ -20,142 +20,142 @@ import (
 )
 
 type PlyMktMarket struct {
-	ID                          string          `json:"id"`
-	EventID                     string          `json:"eventId"` // Added for relationship
-	Question                    string          `json:"question"`
-	ConditionID                 string          `json:"conditionId"`
-	Slug                        string          `json:"slug"`
-	TwitterCardImage            string          `json:"twitterCardImage"`
-	ResolutionSource            string          `json:"resolutionSource"`
-	EndDate                     time.Time       `json:"endDate" time_format:"2026-03-31T12:00:00Z"`
-	Category                    string          `json:"category"`
-	AmmType                     string          `json:"ammType"`
-	Liquidity                   string          `json:"liquidity"` // String to preserve precision
-	SponsorName                 string          `json:"sponsorName"`
-	SponsorImage                string          `json:"sponsorImage"`
-	StartDate                   time.Time       `json:"startDate" time_format:"2026-03-31T12:00:00Z"`
-	XAxisValue                  string          `json:"xAxisValue"`
-	YAxisValue                  string          `json:"yAxisValue"`
-	DenominationToken           string          `json:"denominationToken"`
-	Fee                         string          `json:"fee"` // String to preserve precision
-	Image                       string          `json:"image"`
-	Icon                        string          `json:"icon"`
-	LowerBound                  string          `json:"lowerBound"`
-	UpperBound                  string          `json:"upperBound"`
-	Description                 string          `json:"description"`
-	Outcomes                    string          `json:"outcomes"`
-	OutcomePrices               string          `json:"outcomePrices"`
-	Volume                      string          `json:"volume"` // String to preserve precision
-	Active                      bool            `json:"active"`
-	MarketType                  string          `json:"marketType"`
-	FormatType                  string          `json:"formatType"`
-	LowerBoundDate              string          `json:"lowerBoundDate"`
-	UpperBoundDate              string          `json:"upperBoundDate"`
-	Closed                      bool            `json:"closed"`
-	MarketMakerAddress          string          `json:"marketMakerAddress"`
-	CreatedBy                   int64           `json:"createdBy"`
-	UpdatedBy                   int64           `json:"updatedBy"`
-	CreatedAt                   time.Time       `json:"createdAt" time_format:"2025-03-26T14:44:31.96609Z"`
-	UpdatedAt                   time.Time       `json:"updatedAt" time_format:"2025-03-26T14:44:31.96609Z"`
-	ClosedTime                  string          `json:"closedTime"`
-	WideFormat                  bool            `json:"wideFormat"`
-	New                         bool            `json:"new"`
-	MailchimpTag                string          `json:"mailchimpTag"`
-	Featured                    bool            `json:"featured"`
-	Archived                    bool            `json:"archived"`
-	ResolvedBy                  string          `json:"resolvedBy"`
-	Restricted                  bool            `json:"restricted"`
-	MarketGroup                 int64           `json:"marketGroup"`
-	GroupItemTitle              string          `json:"groupItemTitle"`
-	GroupItemThreshold          string          `json:"groupItemThreshold"`
-	QuestionID                  string          `json:"questionID"`
-	UmaEndDate                  string          `json:"umaEndDate"`
-	EnableOrderBook             bool            `json:"enableOrderBook"`
-	OrderPriceMinTickSize       float64           `json:"orderPriceMinTickSize"`
-	OrderMinSize                float64           `json:"orderMinSize"`
-	UmaResolutionStatus         string          `json:"umaResolutionStatus"`
-	CurationOrder               int64           `json:"curationOrder"`
-	VolumeNum                   float64           `json:"volumeNum"`
-	LiquidityNum                float64           `json:"liquidityNum"`
-	EndDateIso                  string          `json:"endDateIso"`
-	StartDateIso                string          `json:"startDateIso"`
-	UmaEndDateIso               string          `json:"umaEndDateIso"`
-	HasReviewedDates            bool            `json:"hasReviewedDates"`
-	ReadyForCron                bool            `json:"readyForCron"`
-	CommentsEnabled             bool            `json:"commentsEnabled"`
-	Volume24hr                  float64           `json:"volume24hr"`
-	Volume1wk                   float64           `json:"volume1wk"`
-	Volume1mo                   float64           `json:"volume1mo"`
-	Volume1yr                   float64           `json:"volume1yr"`
-	GameStartTime               string          `json:"gameStartTime"`
-	SecondsDelay                int64           `json:"secondsDelay"`
-	ClobTokenIds                string          `json:"clobTokenIds"`
-	DisqusThread                string          `json:"disqusThread"`
-	ShortOutcomes               string          `json:"shortOutcomes"`
-	TeamAID                     string          `json:"teamAID"`
-	TeamBID                     string          `json:"teamBID"`
-	UmaBond                     string          `json:"umaBond"`
-	UmaReward                    string          `json:"umaReward"`
-	FpmmLive                    bool            `json:"fpmmLive"`
-	Volume24hrAmm               float64           `json:"volume24hrAmm"`
-	Volume1wkAmm                float64           `json:"volume1wkAmm"`
-	Volume1moAmm                float64           `json:"volume1moAmm"`
-	Volume1yrAmm                float64           `json:"volume1yrAmm"`
-	Volume24hrClob              float64           `json:"volume24hrClob"`
-	Volume1wkClob               float64           `json:"volume1wkClob"`
-	Volume1moClob               float64           `json:"volume1moClob"`
-	Volume1yrClob               float64           `json:"volume1yrClob"`
-	VolumeAmm                   float64           `json:"volumeAmm"`
-	VolumeClob                  float64           `json:"volumeClob"`
-	LiquidityAmm                float64           `json:"liquidityAmm"`
-	LiquidityClob               float64           `json:"liquidityClob"`
-	MakerBaseFee                int64           `json:"makerBaseFee"`
-	TakerBaseFee                int64           `json:"takerBaseFee"`
-	CustomLiveness              int64           `json:"customLiveness"`
-	AcceptingOrders             bool            `json:"acceptingOrders"`
-	NotificationsEnabled        bool            `json:"notificationsEnabled"`
-	Score                       int64           `json:"score"`
-	ImageOptimized              ImageOptimized  `json:"imageOptimized"`
-	IconOptimized               ImageOptimized  `json:"iconOptimized"`
-	Creator                     string          `json:"creator"`
-	Ready                       bool            `json:"ready"`
-	Funded                      bool            `json:"funded"`
-	PastSlugs                   string          `json:"pastSlugs"`
-	ReadyTimestamp              time.Time       `json:"readyTimestamp"`
-	FundedTimestamp             time.Time       `json:"fundedTimestamp"`
-	AcceptingOrdersTimestamp    time.Time       `json:"acceptingOrdersTimestamp"`
-	Competitive                 float64           `json:"competitive"`
-	RewardsMinSize              float64           `json:"rewardsMinSize"`
-	RewardsMaxSpread            float64           `json:"rewardsMaxSpread"`
-	Spread                      float64           `json:"spread"`
-	AutomaticallyResolved       bool            `json:"automaticallyResolved"`
-	OneDayPriceChange           float64           `json:"oneDayPriceChange"`
-	OneHourPriceChange          float64           `json:"oneHourPriceChange"`
-	OneWeekPriceChange          float64           `json:"oneWeekPriceChange"`
-	OneMonthPriceChange         float64           `json:"oneMonthPriceChange"`
-	OneYearPriceChange          float64           `json:"oneYearPriceChange"`
-	LastTradePrice              float64           `json:"lastTradePrice"`
-	BestBid                     float64           `json:"bestBid"`
-	BestAsk                     float64           `json:"bestAsk"`
-	AutomaticallyActive         bool            `json:"automaticallyActive"`
-	ClearBookOnStart            bool            `json:"clearBookOnStart"`
-	ChartColor                  string          `json:"chartColor"`
-	SeriesColor                 string          `json:"seriesColor"`
-	ShowGmpSeries               bool            `json:"showGmpSeries"`
-	ShowGmpOutcome              bool            `json:"showGmpOutcome"`
-	ManualActivation            bool            `json:"manualActivation"`
-	NegRiskOther                bool            `json:"negRiskOther"`
-	GameID                      string          `json:"gameId"`
-	GroupItemRange              string          `json:"groupItemRange"`
-	SportsMarketType            string          `json:"sportsMarketType"`
-	Line                        float64         `json:"line"`
-	UmaResolutionStatuses       string          `json:"umaResolutionStatuses"`
-	PendingDeployment           bool            `json:"pendingDeployment"`
-	Deploying                   bool            `json:"deploying"`
-	DeployingTimestamp          time.Time       `json:"deployingTimestamp"`
+	ID                           string         `json:"id"`
+	EventID                      string         `json:"eventId"` // Added for relationship
+	Question                     string         `json:"question"`
+	ConditionID                  string         `json:"conditionId"`
+	Slug                         string         `json:"slug"`
+	TwitterCardImage             string         `json:"twitterCardImage"`
+	ResolutionSource             string         `json:"resolutionSource"`
+	EndDate                      time.Time      `json:"endDate" time_format:"2026-03-31T12:00:00Z"`
+	Category                     string         `json:"category"`
+	AmmType                      string         `json:"ammType"`
+	Liquidity                    string         `json:"liquidity"` // String to preserve precision
+	SponsorName                  string         `json:"sponsorName"`
+	SponsorImage                 string         `json:"sponsorImage"`
+	StartDate                    time.Time      `json:"startDate" time_format:"2026-03-31T12:00:00Z"`
+	XAxisValue                   string         `json:"xAxisValue"`
+	YAxisValue                   string         `json:"yAxisValue"`
+	DenominationToken            string         `json:"denominationToken"`
+	Fee                          string         `json:"fee"` // String to preserve precision
+	Image                        string         `json:"image"`
+	Icon                         string         `json:"icon"`
+	LowerBound                   string         `json:"lowerBound"`
+	UpperBound                   string         `json:"upperBound"`
+	Description                  string         `json:"description"`
+	Outcomes                     string         `json:"outcomes"`
+	OutcomePrices                string         `json:"outcomePrices"`
+	Volume                       string         `json:"volume"` // String to preserve precision
+	Active                       bool           `json:"active"`
+	MarketType                   string         `json:"marketType"`
+	FormatType                   string         `json:"formatType"`
+	LowerBoundDate               string         `json:"lowerBoundDate"`
+	UpperBoundDate               string         `json:"upperBoundDate"`
+	Closed                       bool           `json:"closed"`
+	MarketMakerAddress           string         `json:"marketMakerAddress"`
+	CreatedBy                    int64          `json:"createdBy"`
+	UpdatedBy                    int64          `json:"updatedBy"`
+	CreatedAt                    time.Time      `json:"createdAt" time_format:"2025-03-26T14:44:31.96609Z"`
+	UpdatedAt                    time.Time      `json:"updatedAt" time_format:"2025-03-26T14:44:31.96609Z"`
+	ClosedTime                   string         `json:"closedTime"`
+	WideFormat                   bool           `json:"wideFormat"`
+	New                          bool           `json:"new"`
+	MailchimpTag                 string         `json:"mailchimpTag"`
+	Featured                     bool           `json:"featured"`
+	Archived                     bool           `json:"archived"`
+	ResolvedBy                   string         `json:"resolvedBy"`
+	Restricted                   bool           `json:"restricted"`
+	MarketGroup                  int64          `json:"marketGroup"`
+	GroupItemTitle               string         `json:"groupItemTitle"`
+	GroupItemThreshold           string         `json:"groupItemThreshold"`
+	QuestionID                   string         `json:"questionID"`
+	UmaEndDate                   string         `json:"umaEndDate"`
+	EnableOrderBook              bool           `json:"enableOrderBook"`
+	OrderPriceMinTickSize        float64        `json:"orderPriceMinTickSize"`
+	OrderMinSize                 float64        `json:"orderMinSize"`
+	UmaResolutionStatus          string         `json:"umaResolutionStatus"`
+	CurationOrder                int64          `json:"curationOrder"`
+	VolumeNum                    float64        `json:"volumeNum"`
+	LiquidityNum                 float64        `json:"liquidityNum"`
+	EndDateIso                   string         `json:"endDateIso"`
+	StartDateIso                 string         `json:"startDateIso"`
+	UmaEndDateIso                string         `json:"umaEndDateIso"`
+	HasReviewedDates             bool           `json:"hasReviewedDates"`
+	ReadyForCron                 bool           `json:"readyForCron"`
+	CommentsEnabled              bool           `json:"commentsEnabled"`
+	Volume24hr                   float64        `json:"volume24hr"`
+	Volume1wk                    float64        `json:"volume1wk"`
+	Volume1mo                    float64        `json:"volume1mo"`
+	Volume1yr                    float64        `json:"volume1yr"`
+	GameStartTime                string         `json:"gameStartTime"`
+	SecondsDelay                 int64          `json:"secondsDelay"`
+	ClobTokenIds                 string         `json:"clobTokenIds"`
+	DisqusThread                 string         `json:"disqusThread"`
+	ShortOutcomes                string         `json:"shortOutcomes"`
+	TeamAID                      string         `json:"teamAID"`
+	TeamBID                      string         `json:"teamBID"`
+	UmaBond                      string         `json:"umaBond"`
+	UmaReward                    string         `json:"umaReward"`
+	FpmmLive                     bool           `json:"fpmmLive"`
+	Volume24hrAmm                float64        `json:"volume24hrAmm"`
+	Volume1wkAmm                 float64        `json:"volume1wkAmm"`
+	Volume1moAmm                 float64        `json:"volume1moAmm"`
+	Volume1yrAmm                 float64        `json:"volume1yrAmm"`
+	Volume24hrClob               float64        `json:"volume24hrClob"`
+	Volume1wkClob                float64        `json:"volume1wkClob"`
+	Volume1moClob                float64        `json:"volume1moClob"`
+	Volume1yrClob                float64        `json:"volume1yrClob"`
+	VolumeAmm                    float64        `json:"volumeAmm"`
+	VolumeClob                   float64        `json:"volumeClob"`
+	LiquidityAmm                 float64        `json:"liquidityAmm"`
+	LiquidityClob                float64        `json:"liquidityClob"`
+	MakerBaseFee                 int64          `json:"makerBaseFee"`
+	TakerBaseFee                 int64          `json:"takerBaseFee"`
+	CustomLiveness               int64          `json:"customLiveness"`
+	AcceptingOrders              bool           `json:"acceptingOrders"`
+	NotificationsEnabled         bool           `json:"notificationsEnabled"`
+	Score                        int64          `json:"score"`
+	ImageOptimized               ImageOptimized `json:"imageOptimized"`
+	IconOptimized                ImageOptimized `json:"iconOptimized"`
+	Creator                      string         `json:"creator"`
+	Ready                        bool           `json:"ready"`
+	Funded                       bool           `json:"funded"`
+	PastSlugs                    string         `json:"pastSlugs"`
+	ReadyTimestamp               time.Time      `json:"readyTimestamp"`
+	FundedTimestamp              time.Time      `json:"fundedTimestamp"`
+	AcceptingOrdersTimestamp     time.Time      `json:"acceptingOrdersTimestamp"`
+	Competitive                  float64        `json:"competitive"`
+	RewardsMinSize               float64        `json:"rewardsMinSize"`
+	RewardsMaxSpread             float64        `json:"rewardsMaxSpread"`
+	Spread                       float64        `json:"spread"`
+	AutomaticallyResolved        bool           `json:"automaticallyResolved"`
+	OneDayPriceChange            float64        `json:"oneDayPriceChange"`
+	OneHourPriceChange           float64        `json:"oneHourPriceChange"`
+	OneWeekPriceChange           float64        `json:"oneWeekPriceChange"`
+	OneMonthPriceChange          float64        `json:"oneMonthPriceChange"`
+	OneYearPriceChange           float64        `json:"oneYearPriceChange"`
+	LastTradePrice               float64        `json:"lastTradePrice"`
+	BestBid                      float64        `json:"bestBid"`
+	BestAsk                      float64        `json:"bestAsk"`
+	AutomaticallyActive          bool           `json:"automaticallyActive"`
+	ClearBookOnStart             bool           `json:"clearBookOnStart"`
+	ChartColor                   string         `json:"chartColor"`
+	SeriesColor                  string         `json:"seriesColor"`
+	ShowGmpSeries                bool           `json:"showGmpSeries"`
+	ShowGmpOutcome               bool           `json:"showGmpOutcome"`
+	ManualActivation             bool           `json:"manualActivation"`
+	NegRiskOther                 bool           `json:"negRiskOther"`
+	GameID                       string         `json:"gameId"`
+	GroupItemRange               string         `json:"groupItemRange"`
+	SportsMarketType             string         `json:"sportsMarketType"`
+	Line                         float64        `json:"line"`
+	UmaResolutionStatuses        string         `json:"umaResolutionStatuses"`
+	PendingDeployment            bool           `json:"pendingDeployment"`
+	Deploying                    bool           `json:"deploying"`
+	DeployingTimestamp           time.Time      `json:"deployingTimestamp"`
 	ScheduledDeploymentTimestamp time.Time      `json:"scheduledDeploymentTimestamp"`
-	RfqEnabled                  bool            `json:"rfqEnabled"`
-	EventStartTime              time.Time       `json:"eventStartTime"`
+	RfqEnabled                   bool           `json:"rfqEnabled"`
+	EventStartTime               time.Time      `json:"eventStartTime"`
 }
 
 type ImageOptimized struct {
@@ -172,93 +172,93 @@ type ImageOptimized struct {
 }
 
 type PlyMktEvent struct {
-	ID                           string              `json:"id"`
-	Ticker                       string              `json:"ticker"`
-	Slug                         string              `json:"slug"`
-	Title                        string              `json:"title"`
-	Subtitle                     string              `json:"subtitle"`
-	Description                  string              `json:"description"`
-	ResolutionSource             string              `json:"resolutionSource"`
-	StartDate                    time.Time           `json:"startDate"`
-	CreationDate                 time.Time           `json:"creationDate"`
-	EndDate                      time.Time           `json:"endDate"`
-	Image                        string              `json:"image"`
-	Icon                         string              `json:"icon"`
-	Active                       bool                `json:"active"`
-	Closed                       bool                `json:"closed"`
-	Archived                     bool                `json:"archived"`
-	New                          bool                `json:"new"`
-	Featured                     bool                `json:"featured"`
-	Restricted                   bool                `json:"restricted"`
-	Liquidity                    float64             `json:"liquidity"`
-	Volume                       float64             `json:"volume"`
-	OpenInterest                 float64             `json:"openInterest"`
-	SortBy                       string              `json:"sortBy"`
-	Category                     string              `json:"category"`
-	Subcategory                  string              `json:"subcategory"`
-	IsTemplate                   bool                `json:"isTemplate"`
-	TemplateVariables            string              `json:"templateVariables"`
-	PublishedAt                  string              `json:"published_at"`
-	CreatedBy                    string              `json:"createdBy"`
-	UpdatedBy                    string              `json:"updatedBy"`
-	CreatedAt                    time.Time           `json:"createdAt"`
-	UpdatedAt                    time.Time           `json:"updatedAt"`
-	CommentsEnabled              bool                `json:"commentsEnabled"`
-	Competitive                  float64             `json:"competitive"`
-	Volume24hr                   float64             `json:"volume24hr"`
-	Volume1wk                    float64             `json:"volume1wk"`
-	Volume1mo                    float64             `json:"volume1mo"`
-	Volume1yr                    float64             `json:"volume1yr"`
-	FeaturedImage                string              `json:"featuredImage"`
-	DisqusThread                 string              `json:"disqusThread"`
-	ParentEvent                  string              `json:"parentEvent"`
-	EnableOrderBook              bool                `json:"enableOrderBook"`
-	LiquidityAmm                 float64             `json:"liquidityAmm"`
-	LiquidityClob                float64             `json:"liquidityClob"`
-	NegRisk                      bool                `json:"negRisk"`
-	NegRiskMarketID              string              `json:"negRiskMarketID"`
-	NegRiskFeeBips               int                 `json:"negRiskFeeBips"`
-	CommentCount                 int                 `json:"commentCount"`
-	ImageOptimized               ImageOptimized      `json:"imageOptimized"`
-	IconOptimized                ImageOptimized      `json:"iconOptimized"`
-	FeaturedImageOptimized       ImageOptimized      `json:"featuredImageOptimized"`
-	SubEvents                    []string            `json:"subEvents"`
-	Markets                      []*PlyMktMarket      `json:"markets"`
-	Categories                   string              `json:"categories"`
-	Collections                  string              `json:"collections"`
-	Tags                         []*PlyMktTag        `json:"tags"`
-	Cyom                         bool                `json:"cyom"`
-	ClosedTime                   time.Time           `json:"closedTime"`
-	ShowAllOutcomes              bool                `json:"showAllOutcomes"`
-	ShowMarketImages             bool                `json:"showMarketImages"`
-	AutomaticallyResolved        bool                `json:"automaticallyResolved"`
-	EnableNegRisk                bool                `json:"enableNegRisk"`
-	AutomaticallyActive          bool                `json:"automaticallyActive"`
-	EventDate                    string              `json:"eventDate"`
-	StartTime                    time.Time           `json:"startTime"`
-	EventWeek                    int                 `json:"eventWeek"`
-	SeriesSlug                   string              `json:"seriesSlug"`
-	Score                        string              `json:"score"`
-	Elapsed                      string              `json:"elapsed"`
-	Period                       string              `json:"period"`
-	Live                         bool                `json:"live"`
-	Ended                        bool                `json:"ended"`
-	FinishedTimestamp            time.Time           `json:"finishedTimestamp"`
-	GmpChartMode                 string              `json:"gmpChartMode"`
-	TweetCount                   int                 `json:"tweetCount"`
-	Chats                        []*Chat              `json:"chats"`
-	FeaturedOrder                int                 `json:"featuredOrder"`
-	EstimateValue                bool                `json:"estimateValue"`
-	CantEstimate                 bool                `json:"cantEstimate"`
-	EstimatedValue               string              `json:"estimatedValue"`
-	SpreadsMainLine              float64             `json:"spreadsMainLine"`
-	TotalsMainLine               float64             `json:"totalsMainLine"`
-	CarouselMap                  string              `json:"carouselMap"`
-	PendingDeployment            bool                `json:"pendingDeployment"`
-	Deploying                    bool                `json:"deploying"`
-	DeployingTimestamp           time.Time           `json:"deployingTimestamp"`
-	ScheduledDeploymentTimestamp time.Time           `json:"scheduledDeploymentTimestamp"`
-	GameStatus                   string              `json:"gameStatus"`
+	ID                           string          `json:"id"`
+	Ticker                       string          `json:"ticker"`
+	Slug                         string          `json:"slug"`
+	Title                        string          `json:"title"`
+	Subtitle                     string          `json:"subtitle"`
+	Description                  string          `json:"description"`
+	ResolutionSource             string          `json:"resolutionSource"`
+	StartDate                    time.Time       `json:"startDate"`
+	CreationDate                 time.Time       `json:"creationDate"`
+	EndDate                      time.Time       `json:"endDate"`
+	Image                        string          `json:"image"`
+	Icon                         string          `json:"icon"`
+	Active                       bool            `json:"active"`
+	Closed                       bool            `json:"closed"`
+	Archived                     bool            `json:"archived"`
+	New                          bool            `json:"new"`
+	Featured                     bool            `json:"featured"`
+	Restricted                   bool            `json:"restricted"`
+	Liquidity                    float64         `json:"liquidity"`
+	Volume                       float64         `json:"volume"`
+	OpenInterest                 float64         `json:"openInterest"`
+	SortBy                       string          `json:"sortBy"`
+	Category                     string          `json:"category"`
+	Subcategory                  string          `json:"subcategory"`
+	IsTemplate                   bool            `json:"isTemplate"`
+	TemplateVariables            string          `json:"templateVariables"`
+	PublishedAt                  string          `json:"published_at"`
+	CreatedBy                    string          `json:"createdBy"`
+	UpdatedBy                    string          `json:"updatedBy"`
+	CreatedAt                    time.Time       `json:"createdAt"`
+	UpdatedAt                    time.Time       `json:"updatedAt"`
+	CommentsEnabled              bool            `json:"commentsEnabled"`
+	Competitive                  float64         `json:"competitive"`
+	Volume24hr                   float64         `json:"volume24hr"`
+	Volume1wk                    float64         `json:"volume1wk"`
+	Volume1mo                    float64         `json:"volume1mo"`
+	Volume1yr                    float64         `json:"volume1yr"`
+	FeaturedImage                string          `json:"featuredImage"`
+	DisqusThread                 string          `json:"disqusThread"`
+	ParentEvent                  string          `json:"parentEvent"`
+	EnableOrderBook              bool            `json:"enableOrderBook"`
+	LiquidityAmm                 float64         `json:"liquidityAmm"`
+	LiquidityClob                float64         `json:"liquidityClob"`
+	NegRisk                      bool            `json:"negRisk"`
+	NegRiskMarketID              string          `json:"negRiskMarketID"`
+	NegRiskFeeBips               int             `json:"negRiskFeeBips"`
+	CommentCount                 int             `json:"commentCount"`
+	ImageOptimized               ImageOptimized  `json:"imageOptimized"`
+	IconOptimized                ImageOptimized  `json:"iconOptimized"`
+	FeaturedImageOptimized       ImageOptimized  `json:"featuredImageOptimized"`
+	SubEvents                    []string        `json:"subEvents"`
+	Markets                      []*PlyMktMarket `json:"markets"`
+	Categories                   string          `json:"categories"`
+	Collections                  string          `json:"collections"`
+	Tags                         []*PlyMktTag    `json:"tags"`
+	Cyom                         bool            `json:"cyom"`
+	ClosedTime                   time.Time       `json:"closedTime"`
+	ShowAllOutcomes              bool            `json:"showAllOutcomes"`
+	ShowMarketImages             bool            `json:"showMarketImages"`
+	AutomaticallyResolved        bool            `json:"automaticallyResolved"`
+	EnableNegRisk                bool            `json:"enableNegRisk"`
+	AutomaticallyActive          bool            `json:"automaticallyActive"`
+	EventDate                    string          `json:"eventDate"`
+	StartTime                    time.Time       `json:"startTime"`
+	EventWeek                    int             `json:"eventWeek"`
+	SeriesSlug                   string          `json:"seriesSlug"`
+	Score                        string          `json:"score"`
+	Elapsed                      string          `json:"elapsed"`
+	Period                       string          `json:"period"`
+	Live                         bool            `json:"live"`
+	Ended                        bool            `json:"ended"`
+	FinishedTimestamp            time.Time       `json:"finishedTimestamp"`
+	GmpChartMode                 string          `json:"gmpChartMode"`
+	TweetCount                   int             `json:"tweetCount"`
+	Chats                        []*Chat         `json:"chats"`
+	FeaturedOrder                int             `json:"featuredOrder"`
+	EstimateValue                bool            `json:"estimateValue"`
+	CantEstimate                 bool            `json:"cantEstimate"`
+	EstimatedValue               string          `json:"estimatedValue"`
+	SpreadsMainLine              float64         `json:"spreadsMainLine"`
+	TotalsMainLine               float64         `json:"totalsMainLine"`
+	CarouselMap                  string          `json:"carouselMap"`
+	PendingDeployment            bool            `json:"pendingDeployment"`
+	Deploying                    bool            `json:"deploying"`
+	DeployingTimestamp           time.Time       `json:"deployingTimestamp"`
+	ScheduledDeploymentTimestamp time.Time       `json:"scheduledDeploymentTimestamp"`
+	GameStatus                   string          `json:"gameStatus"`
 }
 
 type EventCreator struct {
@@ -309,19 +309,17 @@ type Category struct {
 }
 
 type PlyMktTag struct {
-	ID          string    `json:"id"`
-	Label       string    `json:"label"`
-	Slug        string    `json:"slug"`
-	ForceShow   bool      `json:"forceShow"`
-	PublishedAt string    `json:"publishedAt"`
-	CreatedBy   int       `json:"createdBy"`
-	UpdatedBy   int       `json:"updatedBy"`
+	ID           string    `json:"id"`
+	Label        string    `json:"label"`
+	Slug         string    `json:"slug"`
+	ForceShow    bool      `json:"forceShow"`
+	PublishedAt  string    `json:"publishedAt"`
+	CreatedBy    int       `json:"createdBy"`
+	UpdatedBy    int       `json:"updatedBy"`
 	CreatedAtPly time.Time `json:"createdAt"`
 	UpdatedAtPly time.Time `json:"updatedAt"`
-	ForceHide   bool      `json:"forceHide"`
-	ParentTagID string
-	SportSlug   string
-	SportID     string
+	ForceHide    bool      `json:"forceHide"`
+	ParentCategory string
 }
 
 type PlyMktUserPosition struct {
@@ -363,18 +361,14 @@ type OrderbookItem struct {
 
 type PlyMktPriceHistory struct {
 	Timestamp int64   `json:"t"` // Unix timestamp key from CLOB usually
-	Price     float64 `json:"p"` 
-	High      float64 `json:"h"` // Keeping for compat if needed, but primary is t, p
-	Low       float64 `json:"l"`
-	Close     float64 `json:"c"`
-	Volume    float64 `json:"v"`
+	Price     float64 `json:"p"`
 	MarketID  string  `json:"-"`
 	TokenID   string  `json:"-"`
 }
 
 type PlyMktPricePoint struct {
-	Timestamp int64       `json:"t"`
-	Price     interface{} `json:"p"` // Can be string or float
+	Timestamp int64   `json:"t"`
+	Price     float64 `json:"p"`
 }
 
 // API Endpoints
@@ -392,11 +386,11 @@ var (
 )
 
 type ReqDetails struct {
-	URL      string
-	Method   string
-	Headers  map[string]string
-	Body     io.Reader
-	Params   url.Values
+	URL       string
+	Method    string
+	Headers   map[string]string
+	Body      io.Reader
+	Params    url.Values
 	Paginated bool
 }
 
@@ -455,7 +449,7 @@ type PlyMktLeaderboardEntry struct {
 	XUsername     string  `json:"xUsername"`
 	VerifiedBadge bool    `json:"verifiedBadge"`
 	// Additional fields we might want to track metadata
-	Period        string  `json:"-"` 
+	Period string `json:"-"`
 }
 
 type PlyMktLeaderboardParams struct {
@@ -471,7 +465,7 @@ type PlyMktHolderEntry struct {
 	ProxyWallet           string  `json:"proxyWallet"`
 	Pseudonym             string  `json:"pseudonym"`
 	Name                  string  `json:"name"` // Added based on feedback
-	Amount                float64 `json:"amount"` 
+	Amount                float64 `json:"amount"`
 	Bio                   string  `json:"bio"`
 	ProfileImage          string  `json:"profileImage"`
 	ProfileImageOptimized string  `json:"profileImageOptimized"`
@@ -499,10 +493,10 @@ type PlyMktUser struct {
 }
 
 type PlyMktHolderRecord struct {
-	TokenID               string  `json:"tokenID"`
-	ProxyWallet           string  `json:"proxyWallet"`
-	Amount                float64 `json:"amount"`
-	UpdatedAt             time.Time `json:"updatedAt"`
+	TokenID     string    `json:"tokenID"`
+	ProxyWallet string    `json:"proxyWallet"`
+	Amount      float64   `json:"amount"`
+	UpdatedAt   time.Time `json:"updatedAt"`
 }
 
 // PlyMktHoldersBundle groups users and holders for atomic saving
@@ -591,29 +585,29 @@ func (ply *PlyMktService) GetHoldersReqs(ctx context.Context, marketIDs []string
 	// API docs say "market: comma-separated list of condition IDs".
 	// Gamma market ID usually IS the condition ID or close mapping?
 	// Note: API doc says "condition IDs". Our `PlyMktMarket.ConditionID`.
-	
+
 	// We'll chunk to be safe, e.g. 20 markets per request?
 	// User didn't specify batch size, but usually 20-50 is safe for comma lists.
 	// Let's use 20.
-	
+
 	var reqs []*fetcher.Request
 	chunkSize := 20
-	
+
 	for i := 0; i < len(marketIDs); i += chunkSize {
 		end := i + chunkSize
 		if end > len(marketIDs) {
 			end = len(marketIDs)
 		}
 		chunk := marketIDs[i:end]
-		
+
 		q := u.Query()
 		q.Set("market", strings.Join(chunk, ","))
 		q.Set("limit", "20") // Max per token
-		
+
 		// Copy URL
 		reqURL := *u
 		reqURL.RawQuery = q.Encode()
-		
+
 		reqs = append(reqs, &fetcher.Request{
 			URL:    reqURL.String(),
 			Method: "GET",
@@ -626,9 +620,10 @@ func (ply *PlyMktService) GetHoldersReqs(ctx context.Context, marketIDs []string
 			},
 		})
 	}
-	
+
 	return reqs, nil
 }
+
 type PlyMktTeam struct {
 	ID           int    `json:"id"`
 	Name         string `json:"name"`
@@ -676,20 +671,20 @@ func (ply *PlyMktService) GetDiscoveryReqs(ctx context.Context) ([]*fetcher.Requ
 	if !ok {
 		return nil, fmt.Errorf("gamma endpoint not configured")
 	}
-	
+
 	// Base URL for events
 	u, err := url.Parse(gammaEndpoint)
 	if err != nil {
 		return nil, err
 	}
 	u = u.JoinPath("/events")
-	
+
 	// Query Params: active=true, closed=false (implied by active?), archived=false
 	// User said "active events".
 	// We'll return an initial request that triggers pagination in the Processor/Fetcher loop.
 	limit := 300
 	offset := 0
-	
+
 	var reqs []*fetcher.Request
 	// Initial request
 	q := u.Query()
@@ -700,37 +695,20 @@ func (ply *PlyMktService) GetDiscoveryReqs(ctx context.Context) ([]*fetcher.Requ
 	q.Set("archived", "false")
 	q.Set("order", "volume")
 	q.Set("ascending", "false")
-	
+
 	fullURL := *u
 	fullURL.RawQuery = q.Encode()
-	
+
 	reqs = append(reqs, &fetcher.Request{
-		URL: fullURL.String(),
-		Method: "GET",
+		URL:     fullURL.String(),
+		Method:  "GET",
 		Headers: map[string]string{"Content-Type": "application/json"},
 	})
-	
+
 	return reqs, nil
 }
 
 func (ply *PlyMktService) GetSportsReqs(ctx context.Context) ([]*fetcher.Request, error) {
-	//sportsCats := map[string]int {
-	//	"football": 0,
-	//	"basketball": 0,
-	//	"hockey": 0,
-	//	"tennis": 0,
-	//	"esports": 0,
-	//	"baseball": 0,
-	//	"soccer": 0,
-	//	"cricket": 0,
-	//	"rugby": 0,
-	//	"golf": 0,
-	//	"ufc": 0,
-	//	"f1": 0,
-	//	"chess": 0,
-	//	"boxing": 0,
-	//	"pickleball": 0
-	//}
 	gammaEndpoint, ok := config.DefaultEndpoints["gamma"].(string)
 	if !ok {
 		return nil, fmt.Errorf("gamma endpoint not configured")
@@ -882,7 +860,7 @@ func BuildEnrichedOrderFilledsQuery(marketIds []string) string {
 	if len(marketIds) > 0 {
 		whereClause = "{ id_gt: $lastId, market_in: $marketIds }"
 	}
-	
+
 	return fmt.Sprintf(`enrichedOrderFilleds(
 		first: $first
 		where: %s
@@ -907,35 +885,35 @@ func BuildEnrichedOrderFilledsQuery(marketIds []string) string {
 }
 
 type PlyMktCondition struct {
-    ID                   string     `json:"id"`
-    Oracle               string     `json:"oracle"`               // Bytes → string
-    OutcomeSlotCount     int        `json:"outcomeSlotCount"`
-    PayoutDenominator    string     `json:"payoutDenominator"`
-    PayoutNumerators     []string   `json:"payoutNumerators"`
-    Payouts              []string   `json:"payouts"`              // Final redemption multipliers
-    QuestionId           string     `json:"questionId"`           // Bytes → string
-    ResolutionHash       string     `json:"resolutionHash"`
-    ResolutionTimestamp  string     `json:"resolutionTimestamp"`
+	ID                  string   `json:"id"`
+	Oracle              string   `json:"oracle"` // Bytes → string
+	OutcomeSlotCount    int      `json:"outcomeSlotCount"`
+	PayoutDenominator   string   `json:"payoutDenominator"`
+	PayoutNumerators    []string `json:"payoutNumerators"`
+	Payouts             []string `json:"payouts"`    // Final redemption multipliers
+	QuestionId          string   `json:"questionId"` // Bytes → string
+	ResolutionHash      string   `json:"resolutionHash"`
+	ResolutionTimestamp string   `json:"resolutionTimestamp"`
 }
 
 type PlyMktAccount struct {
-    ID                     string             `json:"id"`
-    CreationTimestamp      string             `json:"creationTimestamp"`
-    LastSeenTimestamp      string             `json:"lastSeenTimestamp"`
-    CollateralVolume       string             `json:"collateralVolume"`
-    NumTrades              string             `json:"numTrades"`
-    ScaledCollateralVolume string             `json:"scaledCollateralVolume"`
-    LastTradedTimestamp    string             `json:"lastTradedTimestamp"`
-    Profit                 string             `json:"profit"`
-    ScaledProfit           string             `json:"scaledProfit"`
+	ID                     string `json:"id"`
+	CreationTimestamp      string `json:"creationTimestamp"`
+	LastSeenTimestamp      string `json:"lastSeenTimestamp"`
+	CollateralVolume       string `json:"collateralVolume"`
+	NumTrades              string `json:"numTrades"`
+	ScaledCollateralVolume string `json:"scaledCollateralVolume"`
+	LastTradedTimestamp    string `json:"lastTradedTimestamp"`
+	Profit                 string `json:"profit"`
+	ScaledProfit           string `json:"scaledProfit"`
 }
 
 type PlyMktEnrichedOrderFilledEvent struct {
-	ID        string `json:"id"`    // Tx hash + order hash
-	Price     string `json:"price"` // Fill price
-	Side      string `json:"side"`  // Maker or taker
-	Size      string `json:"size"`  // Fill size
-	Maker     struct { // added liquidity by posting order side = "buy" (they took liquidity)
+	ID    string   `json:"id"`    // Tx hash + order hash
+	Price string   `json:"price"` // Fill price
+	Side  string   `json:"side"`  // Maker or taker
+	Size  string   `json:"size"`  // Fill size
+	Maker struct { // added liquidity by posting order side = "buy" (they took liquidity)
 		ID string `json:"id"`
 	} `json:"maker"`
 	Taker struct { // removed liquidity by taking order side = "sell" (they added liquidity)
@@ -944,9 +922,9 @@ type PlyMktEnrichedOrderFilledEvent struct {
 	Market struct {
 		ID string `json:"id"`
 	} `json:"market"`
-	Timestamp string `json:"timestamp"`
+	Timestamp       string `json:"timestamp"`
 	TransactionHash string `json:"transactionHash"`
-    OrderHash       string `json:"orderHash"`
+	OrderHash       string `json:"orderHash"`
 }
 
 type PlyMktOrderFilledEvent struct {
@@ -966,32 +944,32 @@ type PlyMktOrderFilledEvent struct {
 	TransactionHash string `json:"transactionHash"`
 }
 
-var targets = map[string]struct{
-	path string
+var targets = map[string]struct {
+	path   string
 	entity string
 }{
 	"conditions": {
-		path: "/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC", // Example path, or use ID from stub
+		path:   "/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC", // Example path, or use ID from stub
 		entity: "conditions",
 	},
 	"orderFilledEvents": {
-		path: "/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC",
+		path:   "/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC",
 		entity: "orderFilledEvents",
 	},
 	"enrichedOrderFilleds": {
-		path: "/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC",
+		path:   "/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC",
 		entity: "enrichedOrderFilleds",
 	},
 	"accounts": {
-		path: "/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC",
+		path:   "/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC",
 		entity: "accounts",
 	},
 	"fpmms": {
-		path: "/6c58N5U4MtQE2Y8njfVrrAfRykzfqajMGeTMEvMmskVz", 
+		path:   "/6c58N5U4MtQE2Y8njfVrrAfRykzfqajMGeTMEvMmskVz",
 		entity: "fpmms",
 	},
 	"userPositions": {
-		path: "/6c58N5U4MtQE2Y8njfVrrAfRykzfqajMGeTMEvMmskVz", 
+		path:   "/6c58N5U4MtQE2Y8njfVrrAfRykzfqajMGeTMEvMmskVz",
 		entity: "userPositions",
 	},
 }
@@ -1007,7 +985,7 @@ func (ply *PlyMktService) GetPriceHistoryReq(tokenID string, fidelity int, start
 		return nil, err
 	}
 	u = u.JoinPath("/prices-history")
-	
+
 	q := u.Query()
 	q.Set("market", tokenID)
 	q.Set("interval", "max") // Use 'max' to get all available history
@@ -1034,20 +1012,20 @@ func (ply *PlyMktService) GetPriceHistoryReq(tokenID string, fidelity int, start
 func (ply *PlyMktService) BuildTempRequests(targetsList []string) ([]*fetcher.Request, error) {
 	var reqs []*fetcher.Request
 	for _, target := range targetsList {
-        // Default vars stub
-        vars := map[string]any{
-            "first": 1000,
-            "lastId": "",
-        }
-        // Need to construct URL stub using logic or just pass a placeholder if this function isn't used
-        // It seems this function is a legacy backup? Let's fix signature anyway.
-        // It was calling gqlRequestBuilder(target, host, path, entity) BEFORE I changed signature 
-        // to gqlRequestBuilder(key, fullURL, entityQuery, vars).
-        
-        host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
-        u, _ := url.Parse(host)
-        u = u.JoinPath(targets[target].path)
-        
+		// Default vars stub
+		vars := map[string]any{
+			"first":  1000,
+			"lastId": "",
+		}
+		// Need to construct URL stub using logic or just pass a placeholder if this function isn't used
+		// It seems this function is a legacy backup? Let's fix signature anyway.
+		// It was calling gqlRequestBuilder(target, host, path, entity) BEFORE I changed signature
+		// to gqlRequestBuilder(key, fullURL, entityQuery, vars).
+
+		host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
+		u, _ := url.Parse(host)
+		u = u.JoinPath(targets[target].path)
+
 		if req, err := ply.gqlRequestBuilder(target, u.String(), SubgraphEntities[target], vars); err != nil {
 			return nil, err
 		} else {
@@ -1066,60 +1044,60 @@ func (ply *PlyMktService) GetSubgraphReqs(ctx context.Context, targetsList []str
 
 // GetSubgraphReqsWithOpts generates subgraph requests with optional volume threshold.
 func (ply *PlyMktService) GetSubgraphReqsWithOpts(ctx context.Context, targetsList []string, startIds map[string]string, accountsMinVolume string) ([]*fetcher.Request, error) {
-    // Determine Host
-    host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
-    useGateway := ply.Cfg.SubgraphAPIKey != ""
-    
+	// Determine Host
+	host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
+	useGateway := ply.Cfg.SubgraphAPIKey != ""
+
 	var reqs []*fetcher.Request
-    
+
 	for _, target := range targetsList {
-        // Construct URL
-        path := targets[target].path
-        var endpointURL string
-        
-        if useGateway && len(ply.Cfg.SubgraphAPIKey) > 0 {
-            // Gateway Format: https://gateway.thegraph.com/api/[KEY]/subgraphs/id/[ID]
-            // Path contains slash? remove strict leading slash if double
-            cleanPath := strings.TrimPrefix(path, "/")
-            endpointURL = fmt.Sprintf("https://gateway.thegraph.com/api/%s/subgraphs/id/%s", ply.Cfg.SubgraphAPIKey, cleanPath)
-        } else {
-            // Legacy / Hosted Service Format: [HOST]/[PATH]
-            u, _ := url.Parse(host)
-            u = u.JoinPath(path)
-            endpointURL = u.String()
-        }
+		// Construct URL
+		path := targets[target].path
+		var endpointURL string
+
+		if useGateway && len(ply.Cfg.SubgraphAPIKey) > 0 {
+			// Gateway Format: https://gateway.thegraph.com/api/[KEY]/subgraphs/id/[ID]
+			// Path contains slash? remove strict leading slash if double
+			cleanPath := strings.TrimPrefix(path, "/")
+			endpointURL = fmt.Sprintf("https://gateway.thegraph.com/api/%s/subgraphs/id/%s", ply.Cfg.SubgraphAPIKey, cleanPath)
+		} else {
+			// Legacy / Hosted Service Format: [HOST]/[PATH]
+			u, _ := url.Parse(host)
+			u = u.JoinPath(path)
+			endpointURL = u.String()
+		}
 
 		// Default variables
 		vars := map[string]any{
-			"first": 1000,
+			"first":  1000,
 			"lastId": "",
 		}
-        
-        // Add filter for accounts - use provided threshold or default to $100
-        if target == "accounts" {
-            if accountsMinVolume != "" {
-                vars["scaledCollateralVolumeGte"] = accountsMinVolume
-            } else {
-                vars["scaledCollateralVolumeGte"] = "100" // Default $100 minimum
-            }
-        }
-        
-        // Check for resume ID
-        if startIds != nil {
-            if sid, ok := startIds[target]; ok && sid != "" {
-                vars["lastId"] = sid
-                ply.Logger.Info("resuming sync", slog.String("target", target), slog.String("start_id", sid))
-            }
-        }
-		
+
+		// Add filter for accounts - use provided threshold or default to $100
+		if target == "accounts" {
+			if accountsMinVolume != "" {
+				vars["scaledCollateralVolumeGte"] = accountsMinVolume
+			} else {
+				vars["scaledCollateralVolumeGte"] = "100" // Default $100 minimum
+			}
+		}
+
+		// Check for resume ID
+		if startIds != nil {
+			if sid, ok := startIds[target]; ok && sid != "" {
+				vars["lastId"] = sid
+				ply.Logger.Info("resuming sync", slog.String("target", target), slog.String("start_id", sid))
+			}
+		}
+
 		if req, err := ply.gqlRequestBuilder(target, endpointURL, SubgraphEntities[target], vars); err != nil {
 			return nil, err
 		} else {
-            // Cap accounts sync to 10 pages (10,000 accounts)
-            if target == "accounts" {
-                req.Metadata["MaxPages"] = "20"
-                req.Metadata["CurrentPage"] = "1"
-            }
+			// Cap accounts sync to 10 pages (10,000 accounts)
+			if target == "accounts" {
+				req.Metadata["MaxPages"] = "20"
+				req.Metadata["CurrentPage"] = "1"
+			}
 			reqs = append(reqs, req)
 		}
 	}
@@ -1130,59 +1108,59 @@ func (ply *PlyMktService) GetSubgraphReqsWithOpts(ctx context.Context, targetsLi
 // GetTop500AccountsReq returns a request to fetch the top 500 accounts by scaledCollateralVolume.
 // Use the response to calculate the average volume as a threshold for subsequent queries.
 func (ply *PlyMktService) GetTop500AccountsReq(ctx context.Context) (*fetcher.Request, error) {
-    host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
-    useGateway := ply.Cfg.SubgraphAPIKey != ""
-    path := targets["accounts"].path
-    var endpointURL string
-    
-    if useGateway && len(ply.Cfg.SubgraphAPIKey) > 0 {
-        cleanPath := strings.TrimPrefix(path, "/")
-        endpointURL = fmt.Sprintf("https://gateway.thegraph.com/api/%s/subgraphs/id/%s", ply.Cfg.SubgraphAPIKey, cleanPath)
-    } else {
-        u, _ := url.Parse(host)
-        u = u.JoinPath(path)
-        endpointURL = u.String()
-    }
+	host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
+	useGateway := ply.Cfg.SubgraphAPIKey != ""
+	path := targets["accounts"].path
+	var endpointURL string
 
-    // Query for top 100 accounts without any volume filter
-    query := `accounts(first: 500, orderBy: scaledCollateralVolume, orderDirection: desc) {
+	if useGateway && len(ply.Cfg.SubgraphAPIKey) > 0 {
+		cleanPath := strings.TrimPrefix(path, "/")
+		endpointURL = fmt.Sprintf("https://gateway.thegraph.com/api/%s/subgraphs/id/%s", ply.Cfg.SubgraphAPIKey, cleanPath)
+	} else {
+		u, _ := url.Parse(host)
+		u = u.JoinPath(path)
+		endpointURL = u.String()
+	}
+
+	// Query for top 100 accounts without any volume filter
+	query := `accounts(first: 500, orderBy: scaledCollateralVolume, orderDirection: desc) {
         id
         scaledCollateralVolume
     }`
-    
-    vars := map[string]any{}
-    
-    fullQuery := fmt.Sprintf(`query Top500Accounts {
+
+	vars := map[string]any{}
+
+	fullQuery := fmt.Sprintf(`query Top500Accounts {
         %s
     }`, query)
-    
-    return ply.buildGQLRequest(endpointURL, "top500accounts", fullQuery, vars, false)
+
+	return ply.buildGQLRequest(endpointURL, "top500accounts", fullQuery, vars, false)
 }
 
 // CalculateAvgVolume calculates the average scaledCollateralVolume from a list of accounts.
 // Returns the average as a string suitable for use in subsequent queries.
 func CalculateAvgVolume(accounts []PlyMktAccount) string {
-    if len(accounts) == 0 {
-        return "100" // Fallback default
-    }
-    
-    var total float64
-    for _, acc := range accounts {
-        // Parse the scaledCollateralVolume string to float
-        if vol, err := parseScaledVolume(acc.ScaledCollateralVolume); err == nil {
-            total += vol
-        }
-    }
-    
-    avg := total / float64(len(accounts))
-    // Return as integer string (truncated)
-    return fmt.Sprintf("%.0f", avg)
+	if len(accounts) == 0 {
+		return "100" // Fallback default
+	}
+
+	var total float64
+	for _, acc := range accounts {
+		// Parse the scaledCollateralVolume string to float
+		if vol, err := parseScaledVolume(acc.ScaledCollateralVolume); err == nil {
+			total += vol
+		}
+	}
+
+	avg := total / float64(len(accounts))
+	// Return as integer string (truncated)
+	return fmt.Sprintf("%.0f", avg)
 }
 
 func parseScaledVolume(s string) (float64, error) {
-    var val float64
-    _, err := fmt.Sscanf(s, "%f", &val)
-    return val, err
+	var val float64
+	_, err := fmt.Sscanf(s, "%f", &val)
+	return val, err
 }
 
 // GetWhalePositionsReqs generates requests for specific user IDs.
@@ -1190,20 +1168,20 @@ func (ply *PlyMktService) GetWhalePositionsReqs(ctx context.Context, userIDs []s
 	if len(userIDs) == 0 {
 		return nil, nil
 	}
-    
-    // Determine URL
-    host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
-    useGateway := ply.Cfg.SubgraphAPIKey != ""
-    path := targets["userPositions"].path
-    var endpointURL string
-    if useGateway && len(ply.Cfg.SubgraphAPIKey) > 0 {
-        cleanPath := strings.TrimPrefix(path, "/")
-        endpointURL = fmt.Sprintf("https://gateway.thegraph.com/api/%s/subgraphs/id/%s", ply.Cfg.SubgraphAPIKey, cleanPath)
-    } else {
-        u, _ := url.Parse(host)
-        u = u.JoinPath(path)
-        endpointURL = u.String()
-    }
+
+	// Determine URL
+	host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
+	useGateway := ply.Cfg.SubgraphAPIKey != ""
+	path := targets["userPositions"].path
+	var endpointURL string
+	if useGateway && len(ply.Cfg.SubgraphAPIKey) > 0 {
+		cleanPath := strings.TrimPrefix(path, "/")
+		endpointURL = fmt.Sprintf("https://gateway.thegraph.com/api/%s/subgraphs/id/%s", ply.Cfg.SubgraphAPIKey, cleanPath)
+	} else {
+		u, _ := url.Parse(host)
+		u = u.JoinPath(path)
+		endpointURL = u.String()
+	}
 
 	query := `userPositions(
 		first: $first
@@ -1220,11 +1198,11 @@ func (ply *PlyMktService) GetWhalePositionsReqs(ctx context.Context, userIDs []s
 		realizedPnl
 		totalBought
 	}`
-	
+
 	// Variables
 	vars := map[string]any{
-		"first": 1000,
-		"lastId": "",
+		"first":   1000,
+		"lastId":  "",
 		"userIds": userIDs,
 	}
 
@@ -1236,7 +1214,7 @@ func (ply *PlyMktService) GetWhalePositionsReqs(ctx context.Context, userIDs []s
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Tag as filtered so processor knows to maintain filters on next page
 	req.Metadata["UserFiltered"] = "true"
 	// Store user IDs in metadata? Too large.
@@ -1264,19 +1242,19 @@ func (ply *PlyMktService) GetWhalePositionsReqs(ctx context.Context, userIDs []s
 	*/
 	// IT HARDCODES VARIABLES!
 	// It obliterates `$userIds`.
-	
+
 	// I need to fix `processor.go` to preserve existing variables.
 	// But `fetcher.Request` doesn't expose them struct-wise.
 	// I should pass json serialized variables in Metadata for easier restoration?
 	// OR use `json.Unmarshal` on `OriginalRequest.Body` (we need a copy of body).
 	// `fetcher.Response.Request.Body` is likely exhausted/closed.
 	// We have `OriginalRequest` in `Output`. Processor receives `resp`. `resp.Request` is the original *Request object*.
-	
+
 	// `fetcher.go` might not copy the body for us into the Response object.
 	// But wait, `processor.go` Re-Marshals `bodyData`.
-	
+
 	// FIX: I will pass the Variables map as a JSON string in Metadata `GraphqlVariables`.
-	
+
 	varsBytes, _ := json.Marshal(vars)
 	req.Metadata["GraphqlVariables"] = string(varsBytes)
 
@@ -1304,50 +1282,50 @@ func (ply *PlyMktService) gqlRequestBuilder(key, fullURL, entityQuery string, va
 		}
 		varDecls = append(varDecls, fmt.Sprintf("$%s: %s", varName, gqlType))
 	}
-	
+
 	// Sort for consistent ordering
 	sort.Strings(varDecls)
 	varDeclStr := strings.Join(varDecls, ", ")
-	
+
 	// Wrapper for query
 	fullQuery := fmt.Sprintf(`query MyQuery(%s) {
 		%s
 	}`, varDeclStr, entityQuery)
-	
+
 	return ply.buildGQLRequest(fullURL, key, fullQuery, vars, true)
 }
 
 func (ply *PlyMktService) buildGQLRequest(fullURL, key, query string, vars map[string]any, cursorPagination bool) (*fetcher.Request, error) {
 	bodyData := map[string]any{
-		"query": query,
+		"query":     query,
 		"variables": vars,
 	}
-	
+
 	bodyBytes, err := json.Marshal(bodyData)
 	if err != nil {
 		ply.Logger.Error("failed to marshal body", slog.String("entity", key))
 		return nil, err
 	}
-	
+
 	cursorStr := "false"
 	if cursorPagination {
 		cursorStr = "true"
 	}
-	
+
 	// Serialize variables to Metadata for pagination persistence
 	varsBytes, _ := json.Marshal(vars)
 
 	return &fetcher.Request{
-		URL: fullURL,
+		URL:    fullURL,
 		Method: "POST",
 		Headers: map[string]string{
 			"Content-Type": "application/json",
 		},
 		Body: bytes.NewReader(bodyBytes),
 		Metadata: map[string]string{
-			"Type": "subgraph",
-			"Entity": key,
-			"GraphqlQuery": query,
+			"Type":             "subgraph",
+			"Entity":           key,
+			"GraphqlQuery":     query,
 			"GraphqlVariables": string(varsBytes),
 			"CursorPagination": cursorStr,
 		},
@@ -1383,7 +1361,7 @@ func (ply *PlyMktService) buildGQLRequest(fullURL, key, query string, vars map[s
 //   scaledCollateralSellVolume
 //   scaledCollateralBuyVolume
 //   collateralBuyVolume
-//   collateralSellVolume	
+//   collateralSellVolume
 // }
 //}
 //   transactions(
@@ -1434,7 +1412,7 @@ func (ply *PlyMktService) buildGQLRequest(fullURL, key, query string, vars map[s
 //    scaledProfit
 //  }
 //}
-//	
+//
 //{
 //  orderFilledEvents(first: 10, orderBy: id, orderDirection: asc, skip: 10) {
 //    fee
@@ -1509,53 +1487,54 @@ func (ply *PlyMktService) buildGQLRequest(fullURL, key, query string, vars map[s
 //  }
 //}
 
+//	{
+//	 redemptions {
+//	   id
+//	   condition
+//	   indexSets
+//	   payout
+//	   redeemer
+//	   timestamp
+//	 }
+//	}
 //
-//{
-//  redemptions {
-//    id
-//    condition
-//    indexSets
-//    payout
-//    redeemer
-//    timestamp
-//  }
-//}
+// {
 //
-//{	
-//  splits {
-//    id
-//    timestamp
-//    stakeholder
-//    condition
-//    amount
-//  }
-//}	// GetWhaleFillsReqs generates requests for trade history of specific user IDs.
+//	 splits {
+//	   id
+//	   timestamp
+//	   stakeholder
+//	   condition
+//	   amount
+//	 }
+//	}	// GetWhaleFillsReqs generates requests for trade history of specific user IDs.
+//
 // It fetches EnrichedOrderFilledEvents where the user is either the Maker or the Taker.
 func (ply *PlyMktService) GetWhaleFillsReqs(ctx context.Context, userIDs []string) ([]*fetcher.Request, error) {
 	if len(userIDs) == 0 {
 		return nil, nil
 	}
 
-    // Determine URL
-    host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
-    useGateway := ply.Cfg.SubgraphAPIKey != ""
-    path := targets["enrichedOrderFilleds"].path
-    var endpointURL string
-    if useGateway && len(ply.Cfg.SubgraphAPIKey) > 0 {
-        cleanPath := strings.TrimPrefix(path, "/")
-        endpointURL = fmt.Sprintf("https://gateway.thegraph.com/api/%s/subgraphs/id/%s", ply.Cfg.SubgraphAPIKey, cleanPath)
-    } else {
-        u, _ := url.Parse(host)
-        u = u.JoinPath(path)
-        endpointURL = u.String()
-    }
-    
-    // Query Template
-    // Note: We use orderBy: id for stable pagination.
-    // We already have "enrichedOrderFilleds" in SubgraphEntities but that's a generic one.
-    // We construct filtering queries manually here.
-    
-    queryTemplate := `enrichedOrderFilleds(
+	// Determine URL
+	host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
+	useGateway := ply.Cfg.SubgraphAPIKey != ""
+	path := targets["enrichedOrderFilleds"].path
+	var endpointURL string
+	if useGateway && len(ply.Cfg.SubgraphAPIKey) > 0 {
+		cleanPath := strings.TrimPrefix(path, "/")
+		endpointURL = fmt.Sprintf("https://gateway.thegraph.com/api/%s/subgraphs/id/%s", ply.Cfg.SubgraphAPIKey, cleanPath)
+	} else {
+		u, _ := url.Parse(host)
+		u = u.JoinPath(path)
+		endpointURL = u.String()
+	}
+
+	// Query Template
+	// Note: We use orderBy: id for stable pagination.
+	// We already have "enrichedOrderFilleds" in SubgraphEntities but that's a generic one.
+	// We construct filtering queries manually here.
+
+	queryTemplate := `enrichedOrderFilleds(
         first: $first
         where: { id_gt: $lastId, %s: $userIds }
         orderBy: id
@@ -1571,100 +1550,100 @@ func (ply *PlyMktService) GetWhaleFillsReqs(ctx context.Context, userIDs []strin
         market { id }
     }`
 
-    vars := map[string]any{
-        "first": 500,
-        "lastId": "",
-        "userIds": userIDs,
-    }
-    
-    var reqs []*fetcher.Request
-    
-    // Request 1: As Maker
-    queryMaker := fmt.Sprintf(queryTemplate, "maker_in")
-    fullQueryMaker := fmt.Sprintf(`query WhalesAsMakers($first: Int, $lastId: String, $userIds: [String!]) {
+	vars := map[string]any{
+		"first":   500,
+		"lastId":  "",
+		"userIds": userIDs,
+	}
+
+	var reqs []*fetcher.Request
+
+	// Request 1: As Maker
+	queryMaker := fmt.Sprintf(queryTemplate, "maker_in")
+	fullQueryMaker := fmt.Sprintf(`query WhalesAsMakers($first: Int, $lastId: String, $userIds: [String!]) {
         %s
     }`, queryMaker)
-    
-    reqMaker, err := ply.buildGQLRequest(endpointURL, "enrichedOrderFilleds", fullQueryMaker, vars, true)
-    if err != nil {
-        return nil, err
-    }
-    // Tag for processor
-    reqMaker.Metadata["UserFiltered"] = "true"
-    reqs = append(reqs, reqMaker)
-    
-    // Request 2: As Taker
-    queryTaker := fmt.Sprintf(queryTemplate, "taker_in")
-    fullQueryTaker := fmt.Sprintf(`query WhalesAsTakers($first: Int, $lastId: String, $userIds: [String!]) {
+
+	reqMaker, err := ply.buildGQLRequest(endpointURL, "enrichedOrderFilleds", fullQueryMaker, vars, true)
+	if err != nil {
+		return nil, err
+	}
+	// Tag for processor
+	reqMaker.Metadata["UserFiltered"] = "true"
+	reqs = append(reqs, reqMaker)
+
+	// Request 2: As Taker
+	queryTaker := fmt.Sprintf(queryTemplate, "taker_in")
+	fullQueryTaker := fmt.Sprintf(`query WhalesAsTakers($first: Int, $lastId: String, $userIds: [String!]) {
         %s
     }`, queryTaker)
-    
-    // Important: We need a fresh map for vars to avoid reference issues if buildGQL modifies it (it shouldn't, but safer)
-    varsTaker := map[string]any{
-        "first": 500,
-        "lastId": "",
-        "userIds": userIDs,
-    }
-    
-    reqTaker, err := ply.buildGQLRequest(endpointURL, "enrichedOrderFilleds", fullQueryTaker, varsTaker, true)
-     if err != nil {
-        return nil, err
-    }
-    reqTaker.Metadata["UserFiltered"] = "true"
-    reqs = append(reqs, reqTaker)
 
-    return reqs, nil
+	// Important: We need a fresh map for vars to avoid reference issues if buildGQL modifies it (it shouldn't, but safer)
+	varsTaker := map[string]any{
+		"first":   500,
+		"lastId":  "",
+		"userIds": userIDs,
+	}
+
+	reqTaker, err := ply.buildGQLRequest(endpointURL, "enrichedOrderFilleds", fullQueryTaker, varsTaker, true)
+	if err != nil {
+		return nil, err
+	}
+	reqTaker.Metadata["UserFiltered"] = "true"
+	reqs = append(reqs, reqTaker)
+
+	return reqs, nil
 }
 
 // GetMarketFillsReqs builds targeted requests for enriched order fills for specific markets.
 func (ply *PlyMktService) GetMarketFillsReqs(ctx context.Context, marketIDs []string) ([]*fetcher.Request, error) {
-    if len(marketIDs) == 0 {
+	if len(marketIDs) == 0 {
 		return nil, nil
 	}
 
-    host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
-    useGateway := ply.Cfg.SubgraphAPIKey != ""
-    path := targets["enrichedOrderFilleds"].path
-    var endpointURL string
-    
-    if useGateway && len(ply.Cfg.SubgraphAPIKey) > 0 {
-        cleanPath := strings.TrimPrefix(path, "/")
-        endpointURL = fmt.Sprintf("https://gateway.thegraph.com/api/%s/subgraphs/id/%s", ply.Cfg.SubgraphAPIKey, cleanPath)
-    } else {
-        u, _ := url.Parse(host)
-        u = u.JoinPath(path)
-        endpointURL = u.String()
-    }
-    
-    // Batch markets into groups of 50
-    batchSize := 50
-    var reqs []*fetcher.Request
-    
-    for i := 0; i < len(marketIDs); i += batchSize {
-        end := i + batchSize
-        if end > len(marketIDs) {
-            end = len(marketIDs)
-        }
-        chunk := marketIDs[i:end]
-        
-        queryContent := BuildEnrichedOrderFilledsQuery(chunk)
-        
-        fullQuery := fmt.Sprintf(`query ActiveMarketFills($first: Int, $lastId: String, $marketIds: [String!]) {
+	host := ply.Cfg.Services.PlyMkt.Endpoints["subgraph"].(string)
+	useGateway := ply.Cfg.SubgraphAPIKey != ""
+	path := targets["enrichedOrderFilleds"].path
+	var endpointURL string
+
+	if useGateway && len(ply.Cfg.SubgraphAPIKey) > 0 {
+		cleanPath := strings.TrimPrefix(path, "/")
+		endpointURL = fmt.Sprintf("https://gateway.thegraph.com/api/%s/subgraphs/id/%s", ply.Cfg.SubgraphAPIKey, cleanPath)
+	} else {
+		u, _ := url.Parse(host)
+		u = u.JoinPath(path)
+		endpointURL = u.String()
+	}
+
+	// Batch markets into groups of 50
+	batchSize := 50
+	var reqs []*fetcher.Request
+
+	for i := 0; i < len(marketIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(marketIDs) {
+			end = len(marketIDs)
+		}
+		chunk := marketIDs[i:end]
+
+		queryContent := BuildEnrichedOrderFilledsQuery(chunk)
+
+		fullQuery := fmt.Sprintf(`query ActiveMarketFills($first: Int, $lastId: String, $marketIds: [String!]) {
             %s
         }`, queryContent)
-        
-        vars := map[string]any{
-            "first": 500,
-            "lastId": "",
-            "marketIds": chunk,
-        }
-        
-        req, err := ply.buildGQLRequest(endpointURL, "enrichedOrderFilleds", fullQuery, vars, true)
-        if err != nil {
-            return nil, err
-        }
-        reqs = append(reqs, req)
-    }
-    
-    return reqs, nil
+
+		vars := map[string]any{
+			"first":     500,
+			"lastId":    "",
+			"marketIds": chunk,
+		}
+
+		req, err := ply.buildGQLRequest(endpointURL, "enrichedOrderFilleds", fullQuery, vars, true)
+		if err != nil {
+			return nil, err
+		}
+		reqs = append(reqs, req)
+	}
+
+	return reqs, nil
 }

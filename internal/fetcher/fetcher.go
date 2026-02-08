@@ -120,6 +120,7 @@ func (f *Fetcher) doRequest(ctx context.Context, httpReq *http.Request) (*Respon
 	if err != nil {
 		return nil, err
 	}
+	// TODO: need to remove this since the processor's already reading, but is it ok to pass http.Response.Body and Request?
 	defer httpResp.Body.Close()
 
 	body, err := io.ReadAll(httpResp.Body)
@@ -204,22 +205,24 @@ func (f *Fetcher) Fetch(ctx context.Context, inputReqDetails *Request) (*Respons
 				if firstVal, ok := vars["first"]; ok {
 					var current int
 					switch v := firstVal.(type) {
-					case float64: current = int(v)
-					case int: current = v
+					case float64:
+						current = int(v)
+					case int:
+						current = v
 					}
 
 					// If current batch size exceeds global limit, clamp it
 					if current > limitCap {
-						f.logger.Info("clamping batch size to global limit", 
-							slog.Int("original", current), 
+						f.logger.Info("clamping batch size to global limit",
+							slog.Int("original", current),
 							slog.Int("limit", limitCap))
-						
+
 						vars["first"] = limitCap
-						
+
 						// Rewrite Body
 						if query, qOk := inputReqDetails.Metadata["GraphqlQuery"]; qOk {
 							newBodyData := map[string]any{
-								"query": query,
+								"query":     query,
 								"variables": vars,
 							}
 							if newBytes, err := json.Marshal(newBodyData); err == nil {
@@ -283,28 +286,30 @@ func (f *Fetcher) Fetch(ctx context.Context, inputReqDetails *Request) (*Respons
 				// Trigger Backoff
 				f.mu.Lock()
 				f.backoffUntil = time.Now().Add(15 * time.Second)
-				
+
 				// Adaptive Limit Reduction
 				if f.globalLimit > 1000 {
 					f.globalLimit = 1000 // Snap to safe standard limit first
 				} else if f.globalLimit > 10 {
 					f.globalLimit = int(float64(f.globalLimit) * 0.5) // Halve limit
-					if f.globalLimit < 10 { f.globalLimit = 10 }
+					if f.globalLimit < 10 {
+						f.globalLimit = 10
+					}
 				}
 				newLimit := f.globalLimit
 				f.mu.Unlock()
 
-				err = fmt.Errorf("subgraph indexer unavailable, backing off until %s (new limit: %d)", 
+				err = fmt.Errorf("subgraph indexer unavailable, backing off until %s (new limit: %d)",
 					f.backoffUntil.Format(time.RFC3339), newLimit)
 				f.logger.Warn(err.Error())
-				
+
 				// Proceed to retry loop (which will respect backoff and limit cap on next attempt)
 			} else {
 				// Success
 				return resp, nil
 			}
 		}
-		
+
 		// Error occurred (timeout or status 500+)
 		// Check for specific Subgraph errors in the body if available (sometimes 200 OK returns errors, but here we are in error block?)
 		// Actually, Fetcher.doRequest returns error for 500+.
@@ -315,7 +320,7 @@ func (f *Fetcher) Fetch(ctx context.Context, inputReqDetails *Request) (*Respons
 		// So checking for "indexer not available" must happen inside the 'if err == nil' block or inside a new check.
 		// The current code returns immediately if err == nil.
 		// I need to modify that path to inspect the body for GraphQL errors.
-		
+
 		lastErr = err
 	}
 
@@ -405,21 +410,21 @@ func (f *Fetcher) BuildNextPageRequest(req *Request, itemCount int) *Request {
 		if err == nil {
 			newBody = bytes.NewReader(b)
 		} else {
-            f.logger.Error("failed to marshal graphql body", slog.String("error", err.Error()))
-            return nil
-        }
+			f.logger.Error("failed to marshal graphql body", slog.String("error", err.Error()))
+			return nil
+		}
 	} else {
 		// For standard REST requests, update the URL query params
 		parsedURL.RawQuery = newParams.Encode()
 	}
-		// For standard requests, we might need to reset the body if it was read?
-		// But usually GET params handle pagination.
-		// If it's a POST with a body that stays static, we'd need to re-read it.
-		// `req.Body` is an io.Reader. If it was consumed, we can't reuse it easily unless we buffered it.
-		// However, for standard REST pagination (GET), Body is usually nil.
-		// If we are here, and it's NOT a GraphQL template, we assume standard GET or body is irrelevant/static?
-		// Let's assume standard GET behavior for now unless template is present.
-	
+	// For standard requests, we might need to reset the body if it was read?
+	// But usually GET params handle pagination.
+	// If it's a POST with a body that stays static, we'd need to re-read it.
+	// `req.Body` is an io.Reader. If it was consumed, we can't reuse it easily unless we buffered it.
+	// However, for standard REST pagination (GET), Body is usually nil.
+	// If we are here, and it's NOT a GraphQL template, we assume standard GET or body is irrelevant/static?
+	// Let's assume standard GET behavior for now unless template is present.
+
 	// Create next request
 	nextReq := &Request{
 		URL:      parsedURL.String(),
