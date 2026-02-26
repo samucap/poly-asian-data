@@ -32,6 +32,12 @@ CREATE TABLE IF NOT EXISTS tags (
 );
 
 -- Deferrable Constraint to allow circular references during transaction
+-- Ensure any existing sports.primary_tag_id exist in tags so ADD CONSTRAINT does not fail
+INSERT INTO tags (id)
+SELECT DISTINCT primary_tag_id FROM sports
+WHERE primary_tag_id IS NOT NULL AND primary_tag_id <> ''
+ON CONFLICT (id) DO NOTHING;
+
 ALTER TABLE sports DROP CONSTRAINT IF EXISTS fk_sports_primary_tag;
 ALTER TABLE sports ADD CONSTRAINT fk_sports_primary_tag 
     FOREIGN KEY (primary_tag_id) REFERENCES tags(id) 

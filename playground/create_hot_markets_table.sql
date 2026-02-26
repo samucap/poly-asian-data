@@ -10,13 +10,17 @@ CREATE TABLE IF NOT EXISTS hot_markets_vol (
     spread          DOUBLE PRECISION,
     price_change_1d DOUBLE PRECISION,
     score           DOUBLE PRECISION,
-    clob_token_ids  JSONB,
+    clob_token_ids  TEXT,
     active          BOOLEAN,
     closed          BOOLEAN,
     last_fetched    TIMESTAMPTZ     DEFAULT NOW(),
     rank_in_batch   INTEGER,        -- Deprecated in favor of rank? Or keep as alias?
     rank            INTEGER,        -- Rank within the specific category list
     category        TEXT            NOT NULL DEFAULT 'global'
+    raw_data        JSONB
+    end_date        TIMESTAMPTZ
+    start_date      TIMESTAMPTZ
+    outcomePrices   TEXT
 );
 
 -- 2. Convert to Hypertable

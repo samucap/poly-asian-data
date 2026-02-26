@@ -1045,22 +1045,9 @@ func (p *Processor) processPricesHistory(resp *fetcher.Response) (*Output, error
 
 	var items []services.PlyMktPriceHistory
 	for _, pt := range points {
-		var priceVal float64
-		// Handle interface{} for Price
-		switch v := pt.Price.(type) {
-		case float64:
-			priceVal = v
-		case string:
-			if val, err := strconv.ParseFloat(v, 64); err == nil {
-				priceVal = val
-			}
-		case int:
-			priceVal = float64(v)
-		}
-
 		items = append(items, services.PlyMktPriceHistory{
 			Timestamp: pt.Timestamp,
-			Price:     priceVal,
+			Price:     pt.Price,
 			TokenID:   tokenID,
 			MarketID:  marketID,
 		})

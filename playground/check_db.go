@@ -10,7 +10,7 @@ import (
 	"github.com/joho/godotenv"
 )
 
-func main() {
+func dbChecker() {
 	_ = godotenv.Load()
 	dbConnString := os.Getenv("POSTGRES_URL")
 	if dbConnString == "" {

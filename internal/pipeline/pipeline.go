@@ -135,7 +135,7 @@ func (p *Pipeline) RunSportsTagsSync() {
 		return
 	}
 
-	for i, req := range reqs {
+	for _, req := range reqs {
 		p.logger.Info("Submitting request", slog.String("url", req.URL))
 		if err := p.fetcherPool.SubmitAndThenWait(req); err != nil {
 			p.logger.Error("failed to submit req", slog.Any("error", err))

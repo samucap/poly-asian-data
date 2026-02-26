@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -13,7 +14,6 @@ import (
 	"os/signal"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -63,9 +63,10 @@ type MarketFilter struct {
 	MaxN          int     // e.g., 600
 }
 
-type scoredMarket struct {
-	Market *services.PlyMktMarket
-	Score  float64
+type EventFilter struct {
+	MinVolume24hr float64 // e.g., 50000.0
+	MinLiquidity  float64 // e.g., 30000.0 (use LiquidityClob if available)
+	MaxN          int     // e.g., 100 (top events to keep)
 }
 
 func main() {
@@ -93,13 +94,14 @@ func main() {
 		dbConnString = fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", user, password, host, port, dbName)
 	}
 
-	fetchInterval := 10 * time.Minute
+	fetchInterval := 5 * time.Minute
 	if intervalStr := os.Getenv("REFRESH_INTERVAL"); intervalStr != "" {
 		if d, err := time.ParseDuration(intervalStr); err == nil {
 			fetchInterval = d
 		}
 	}
 
+	// TODO: make this configurable
 	platformEstDailyVol := 850_000_000.0 // Updated for 2026 averages (~$6B weekly)
 	if volStr := os.Getenv("PLATFORM_EST_DAILY_VOL"); volStr != "" {
 		if v, err := strconv.ParseFloat(volStr, 64); err == nil {
@@ -132,38 +134,57 @@ func main() {
 		MinLiquidity:  30000.0, // $30k+ liquidity
 		MaxSpread:     0.05,    // 5% or less
 		MinVolatility: 0.01,    // at least 1% daily change
-		MaxN:          600,     // top 600
+		MaxN:          500,     // top 500
+	}
+
+	eventFilter := EventFilter{
+		MinVolume24hr: 10000.0, // $10k+ 24h volume for events
+		MinLiquidity:  5000.0,  // $5k+ liquidity for events
+		MaxN:          100,     // top 100 events
 	}
 
 	// 4. Fetch Categories and Start Refresh Loops
 	var wg sync.WaitGroup
+	var topCats []*services.PlyMktTag
 
-	cats, err := fetchCategories(ctx, cl)
-	if err != nil {
-		logging.Error(fmt.Sprintf("Failed to fetch categories: %v", err))
-		os.Exit(1)
-	}
+	dbCats, maxUpdated := fetchTagsFromDB(ctx, dbPool)
+	if len(dbCats) > 0 && time.Since(maxUpdated) < 24*time.Hour {
+		logging.Info(fmt.Sprintf("Loaded %d TOP tags from database (last updated %s ago)", len(dbCats), time.Since(maxUpdated).Round(time.Minute)))
+		topCats = dbCats
+	} else {
+		if len(dbCats) == 0 {
+			logging.Info("No top tags found in DB (or table missing). Fetching from API...")
+		} else {
+			logging.Info(fmt.Sprintf("Tags in DB are older than 24h (%s old). Fetching from API...", time.Since(maxUpdated).Round(time.Hour)))
+		}
 
-	// Save tags to database
-	if err := upsertTags(ctx, dbPool, cats); err != nil {
-		logging.Error(fmt.Sprintf("Failed to upsert tags: %v", err))
-	}
+		cats, err := fetchCategories(ctx, cl)
+		if err != nil {
+			logging.Error(fmt.Sprintf("Failed to fetch categories: %v", err))
+			os.Exit(1)
+		}
 
-	topCats := make([]*services.PlyMktTag, 0, len(cats))
-	for _, cat := range cats {
-		if cat.ParentCategory == "102982" && (cat.Slug == "sports" || cat.Slug == "politics" || cat.Slug == "crypto") {
-			topCats = append(topCats, cat)
+		// Save tags to database
+		if err := upsertTags(ctx, dbPool, cats); err != nil {
+			logging.Error(fmt.Sprintf("Failed to upsert tags: %v", err))
+		}
+
+		for _, cat := range cats {
+			if cat.ParentTagID == "102982" {
+				topCats = append(topCats, cat)
+			}
 		}
 	}
 
 	// Start a refresh loop for each top category
-	for _, cat := range topCats {
-		wg.Add(1)
-		go func(cat *services.PlyMktTag) {
-			defer wg.Done()
-			StartMarketRefreshLoop(ctx, dbPool, cl, filter, fetchInterval, platformEstDailyVol, cat.Label, cat.ID)
-		}(cat)
-	}
+	// TODO: is fetching all events without tag_id amount to the same number of events as iterating
+	// through all categories and fetching events for each? cuz if they're the same then we prolly
+	// dont need to fetch events for each category, just paginate events without categories?
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		StartMarketRefreshLoop(ctx, dbPool, cl, filter, eventFilter, topCats, fetchInterval, platformEstDailyVol, "", "")
+	}()
 
 	// 5. Handle Shutdown
 	quit := make(chan os.Signal, 1)
@@ -190,13 +211,18 @@ func main() {
 }
 
 // StartMarketRefreshLoop runs the fetch-rank-upsert cycle periodically
-func StartMarketRefreshLoop(ctx context.Context, db *pgxpool.Pool, client *http.Client, filter MarketFilter, interval time.Duration, platformEstDailyVol float64, category string, tagID string) {
+func StartMarketRefreshLoop(ctx context.Context, db *pgxpool.Pool, client *http.Client, filter MarketFilter, eventFilter EventFilter, cats []*services.PlyMktTag, interval time.Duration, platformEstDailyVol float64, category string, tagID string) {
+	// Run once immediately
+	logging.Info(fmt.Sprintf("Starting initial market refresh for category='%s' (tagID=%s)...", category, tagID))
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	// Run once immediately
-	logging.Info(fmt.Sprintf("Starting initial market refresh for category='%s' (tagID=%s)...", category, tagID))
-	refreshMarketsOnce(ctx, db, client, filter, platformEstDailyVol, category, tagID)
+	start := time.Now()
+	refreshMarketsOnce(ctx, db, client, filter, eventFilter, cats, platformEstDailyVol, category, tagID)
+	elapsed := time.Since(start)
+	nextRun := time.Now().Add(interval)
+	logging.Info(fmt.Sprintf("[>>] Refresh cycle completed in %s. Next run at %s (%s from now)",
+		elapsed.Round(time.Second), nextRun.Format("15:04:05"), interval))
 
 	for {
 		select {
@@ -205,12 +231,17 @@ func StartMarketRefreshLoop(ctx context.Context, db *pgxpool.Pool, client *http.
 			return
 		case <-ticker.C:
 			logging.Info(fmt.Sprintf("Starting periodic market refresh for category='%s'...", category))
-			refreshMarketsOnce(ctx, db, client, filter, platformEstDailyVol, category, tagID)
+			start := time.Now()
+			refreshMarketsOnce(ctx, db, client, filter, eventFilter, cats, platformEstDailyVol, category, tagID)
+			elapsed := time.Since(start)
+			nextRun := time.Now().Add(interval)
+			logging.Info(fmt.Sprintf("[>>] Refresh cycle completed in %s. Next run at %s (%s from now)",
+				elapsed.Round(time.Second), nextRun.Format("15:04:05"), interval))
 		}
 	}
 }
 
-func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Client, filter MarketFilter, platformEstDailyVol float64, category string, tagID string) {
+func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Client, filter MarketFilter, eventFilter EventFilter, cats []*services.PlyMktTag, platformEstDailyVol float64, category string, tagID string) {
 	gammaBase := "https://gamma-api.polymarket.com/events"
 	u, err := url.Parse(gammaBase)
 	if err != nil {
@@ -220,14 +251,15 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 	q := u.Query()
 	q.Set("closed", "false")
 	q.Set("active", "true")
+	q.Set("archived", "false")
 	q.Set("order", "volume24hr")
 	q.Set("ascending", "false")
 	q.Set("include_chat", "false")
-	q.Set("related_tags", "true")
 	if tagID != "" {
 		q.Set("tag_id", tagID)
-	} else if category != "global" {
-		q.Set("slug", category)
+		if tagID == "100215" {
+			q.Set("related_tags", "true")
+		}
 	}
 	u.RawQuery = q.Encode()
 	evsUrl := u
@@ -243,48 +275,160 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 	}
 	logging.Info(fmt.Sprintf("Fetched %d events, extracting markets...", len(events)))
 	for _, e := range events {
-		mkts = append(mkts, e.Markets...)
-	}
-	logging.Info(fmt.Sprintf("Extracted %d markets from %d events", len(mkts), len(events)))
+		currCat := ""
+		for _, tag := range e.Tags {
+			for _, cat := range cats {
+				if tag.ID == cat.ID {
+					currCat = cat.ID
+					break
+				}
+			}
 
-	// Client-side filter if no tagID (fallback safety)
-	targetMkts := mkts
-	if category != "global" && tagID == "" {
-		var safeList []*services.PlyMktMarket
-		for _, m := range mkts {
-			if strings.EqualFold(m.Category, category) {
-				safeList = append(safeList, m)
+			if currCat != "" {
+				break
 			}
 		}
-		targetMkts = safeList
-		logging.Info(fmt.Sprintf("Client-side filtered %d markets (from %d) for category '%s'", len(targetMkts), len(mkts), category))
-	}
 
-	// Rank and filter
-	rankedMkts := RankMarkets(targetMkts, filter)
-
-	// Log
-	LogMarketStats(rankedMkts, len(mkts), fetchTime, platformEstDailyVol)
-
-	// Upsert events (for sports)
-	if err := upsertEvents(ctx, db, events, fetchTime); err != nil {
-		logging.Error(fmt.Sprintf("Failed to upsert events: %v", err))
-	} else {
-		logging.Info(fmt.Sprintf("Upserted %d events", len(events)))
-	}
-
-	// Upsert markets
-	if len(rankedMkts) > 0 {
-		if err := upsertMarkets(ctx, db, rankedMkts, fetchTime, category); err != nil {
-			logging.Error(fmt.Sprintf("Failed to upsert markets: %v", err))
-		} else {
-			logging.Info(fmt.Sprintf("Upserted %d markets (category=%s)", len(rankedMkts), category))
+		for _, currMkt := range e.Markets {
+			if currMkt.EnableOrderBook == true && currMkt.AcceptingOrders == true && currMkt.Active == true && currMkt.Closed == false {
+				currMkt.Category = currCat
+				mkts = append(mkts, currMkt)
+			}
 		}
 	}
+	logging.Info(fmt.Sprintf("Extracted %d markets from %d events", len(mkts), len(events)))
+	mapper := map[string]string{}
+	for _, c := range cats {
+		mapper[c.ID] = c.Slug
+	}
+	byCat := map[string][]*services.PlyMktMarket{}
+	for _, m := range mkts {
+		byCat[mapper[m.Category]] = append(byCat[mapper[m.Category]], m)
+	}
+
+	// Rank and filter markets
+	// TODO: review rankings
+	var conditionIDs []string
+	var clobTokens []clobToken
+	marketByCondition := map[string]*HotMarket{}
+
+	rankedSportsMkts := RankMarkets(byCat["sports"], filter)
+	for _, m := range rankedSportsMkts {
+		conditionIDs = append(conditionIDs, m.ConditionID)
+		marketByCondition[m.ConditionID] = m
+
+		// Parse clobTokenIds JSON array: e.g. ["token1","token2"]
+		var tokenIDs []string
+		if err := json.Unmarshal([]byte(m.ClobTokenIds), &tokenIDs); err == nil {
+			for _, tid := range tokenIDs {
+				clobTokens = append(clobTokens, clobToken{TokenID: tid, MarketID: m.ConditionID})
+			}
+		}
+	}
+	logging.Info(fmt.Sprintf("Aggregated %d conditionIDs, %d clobTokens from %d ranked sports markets", len(conditionIDs), len(clobTokens), len(rankedSportsMkts)))
+
+	// --- Fetch Open Interest and map to markets ---
+	if len(conditionIDs) > 0 {
+		oiData, err := fetchOpenInterest(client, conditionIDs)
+		if err != nil {
+			logging.Error(fmt.Sprintf("Failed to fetch open interest: %v", err))
+		} else {
+			for _, oi := range oiData {
+				if hm, ok := marketByCondition[oi.Market]; ok {
+					hm.OpenInterest = oi.Value
+				}
+			}
+			logging.Info(fmt.Sprintf("Mapped open interest for %d markets", len(oiData)))
+		}
+	}
+
+	// --- Fetch Trades and upsert ---
+	if len(conditionIDs) > 0 {
+		trades, err := fetchTrades(client, conditionIDs)
+		if err != nil {
+			logging.Error(fmt.Sprintf("Failed to fetch trades: %v", err))
+		} else {
+			logging.Info(fmt.Sprintf("Fetched %d trades", len(trades)))
+			if err := upsertTrades(ctx, db, trades); err != nil {
+				logging.Error(fmt.Sprintf("Failed to upsert trades: %v", err))
+			}
+		}
+	}
+
+	// --- Fetch Prices History (concurrent, one per token) and upsert ---
+	if len(clobTokens) > 0 {
+		allPrices := fetchPricesHistoryConcurrent(client, clobTokens, 5) // fidelity=5
+		logging.Info(fmt.Sprintf("Fetched %d price history points across %d tokens", len(allPrices), len(clobTokens)))
+		if len(allPrices) > 0 {
+			if err := upsertPricesHistory(ctx, db, allPrices); err != nil {
+				logging.Error(fmt.Sprintf("Failed to upsert prices history: %v", err))
+			}
+		}
+	}
+
+	// --- Fetch Orderbooks and upsert snapshots ---
+	if len(clobTokens) > 0 {
+		tokenIDs := make([]string, len(clobTokens))
+		tokenToMarket := map[string]string{}
+		for i, ct := range clobTokens {
+			tokenIDs[i] = ct.TokenID
+			tokenToMarket[ct.TokenID] = ct.MarketID
+		}
+		snapshots, err := fetchOrderbooks(client, tokenIDs, tokenToMarket)
+		if err != nil {
+			logging.Error(fmt.Sprintf("Failed to fetch orderbooks: %v", err))
+		} else {
+			logging.Info(fmt.Sprintf("Fetched %d orderbook snapshots", len(snapshots)))
+			if err := upsertOrderbookSnapshots(ctx, db, snapshots); err != nil {
+				logging.Error(fmt.Sprintf("Failed to upsert orderbook snapshots: %v", err))
+			}
+		}
+	}
+
+	// Log market stats
+	LogMarketStats(rankedSportsMkts, len(byCat["sports"]), fetchTime, platformEstDailyVol)
+
+	// Rank and filter events
+	//rankedEvents := RankEvents(events, eventFilter)
+	//if rankedEvents == nil {
+	//	rankedEvents = []*services.PlyMktEvent{}
+	//}
+
+	// Upsert events (for sports) - only top ranked events
+	//if err := upsertHotEvents(ctx, db, rankedEvents, fetchTime); err != nil {
+	//	logging.Error(fmt.Sprintf("Failed to upsert events: %v", err))
+	//} else {
+	//	logging.Info(fmt.Sprintf("Upserted %d hot_events (ranked from %d total)", len(rankedEvents), len(events)))
+	//}
+
+	// Upsert markets
+	if len(rankedSportsMkts) > 0 {
+		if err := upsertMarkets(ctx, db, rankedSportsMkts, fetchTime, "sports"); err != nil {
+			logging.Error(fmt.Sprintf("Failed to upsert markets: %v", err))
+		} else {
+			logging.Info(fmt.Sprintf("Upserted %d markets (category=%s)", len(rankedSportsMkts), "sports"))
+		}
+	}
+
+	// Upsert plymkt events
+	//if err := upsertPlyMktEvents(ctx, db, events); err != nil {
+	//	logging.Error(fmt.Sprintf("Failed to upsert plymkt events: %v", err))
+	//} else {
+	//	logging.Info(fmt.Sprintf("Upserted %d plymktEvents", len(events)))
+	//}
+}
+
+type HotMarket struct {
+	services.PlyMktMarket
+	Score       float64   `json:"-" db:"score"`
+	LastFetched time.Time `json:"-" db:"last_fetched"`
+	RankInBatch int       `json:"-" db:"rank_in_batch"`
+	Rank        int       `json:"-" db:"rank"`
+	Time        time.Time `json:"-" db:"time"`
 }
 
 // RankMarkets filters, computes scores, sorts by score desc, and returns top N
-func RankMarkets(markets []*services.PlyMktMarket, filter MarketFilter) []*services.PlyMktMarket {
+func RankMarkets(markets []*services.PlyMktMarket, filter MarketFilter) []*HotMarket {
 	var candidates []*services.PlyMktMarket
 	maxVol24hr, maxLiq, maxVol, maxVola := 0.0, 0.0, 0.0, 0.0
 
@@ -332,17 +476,31 @@ func RankMarkets(markets []*services.PlyMktMarket, filter MarketFilter) []*servi
 		return nil
 	}
 
-	sort.Slice(candidates, func(i, j int) bool {
-		return ComputeScore(*candidates[i], maxVals) > ComputeScore(*candidates[j], maxVals)
+	now := time.Now()
+	var scored []*HotMarket
+	for _, m := range candidates {
+		scored = append(scored, &HotMarket{
+			PlyMktMarket: *m,
+			Score:        ComputeScore(*m, maxVals),
+			Time:         now,
+			LastFetched:  now,
+		})
+	}
+
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].Score > scored[j].Score
 	})
 
-	if len(candidates) > filter.MaxN {
-		return candidates[:filter.MaxN]
+	if len(scored) > filter.MaxN {
+		return scored[:filter.MaxN]
 	}
-	return candidates
+
+	return scored
 }
 
-// ComputeScore returns a 0-1 normalized score (higher = more desirable)
+// ComputeScore – sports-tuned version (medium-short holding bias)
+// Ranks Polymarket markets for opportunity (higher = more attractive)
+// Focus: recent activity, tight execution, time-left sweet spot ~4–21 days
 func ComputeScore(m services.PlyMktMarket, maxVals struct {
 	MaxVol24hr    float64
 	MaxLiquidity  float64
@@ -353,46 +511,47 @@ func ComputeScore(m services.PlyMktMarket, maxVals struct {
 		return 0.0
 	}
 
-	// Weights (tunable via env for flexibility)
-	wVol24hr := 0.45
+	// ────────────────────────────────────────────────
+	// Weights – sports bias (tunable via env vars)
+	// ────────────────────────────────────────────────
+	wVol24hr := 0.45    // recent momentum/news reaction – core for sports
+	wLiquidity := 0.25  // enter/exit without huge slippage
+	wSpread := 0.15     // tight markets = better fills & lower cost
+	wVolatility := 0.08 // repricing speed from news/line moves
+	wTimeLeft := 0.07   // structural: avoid too short or too far
+
+	// Env overrides (for testing / regime changes)
 	if v := os.Getenv("SCORE_W_VOL24HR"); v != "" {
 		wVol24hr, _ = strconv.ParseFloat(v, 64)
 	}
-	wLiq := 0.25
 	if v := os.Getenv("SCORE_W_LIQ"); v != "" {
-		wLiq, _ = strconv.ParseFloat(v, 64)
+		wLiquidity, _ = strconv.ParseFloat(v, 64)
 	}
-	wVola := 0.10
-	if v := os.Getenv("SCORE_W_VOLA"); v != "" {
-		wVola, _ = strconv.ParseFloat(v, 64)
-	}
-	wVol := 0.15
-	if v := os.Getenv("SCORE_W_VOL"); v != "" {
-		wVol, _ = strconv.ParseFloat(v, 64)
-	}
-	wSpread := 0.05
 	if v := os.Getenv("SCORE_W_SPREAD"); v != "" {
 		wSpread, _ = strconv.ParseFloat(v, 64)
 	}
+	if v := os.Getenv("SCORE_W_VOLA"); v != "" {
+		wVolatility, _ = strconv.ParseFloat(v, 64)
+	}
+	if v := os.Getenv("SCORE_W_TIMELEFT"); v != "" {
+		wTimeLeft, _ = strconv.ParseFloat(v, 64)
+	}
 
+	// ────────────────────────────────────────────────
+	// Normalized features [0,1]
+	// ────────────────────────────────────────────────
 	vol24hrNorm := 0.0
 	if maxVals.MaxVol24hr > 0 {
 		vol24hrNorm = math.Min(m.Volume24hr/maxVals.MaxVol24hr, 1.0)
 	}
 
 	liq := m.LiquidityClob
-	if liq == 0 {
-		liq, _ = strconv.ParseFloat(m.Liquidity, 64)
+	if liq <= 0 {
+		liq, _ = strconv.ParseFloat(m.Liquidity, 64) // fallback
 	}
 	liqNorm := 0.0
 	if maxVals.MaxLiquidity > 0 {
 		liqNorm = math.Min(liq/maxVals.MaxLiquidity, 1.0)
-	}
-
-	vol, _ := strconv.ParseFloat(m.Volume, 64)
-	volNorm := 0.0
-	if maxVals.MaxVol > 0 {
-		volNorm = math.Min(vol/maxVals.MaxVol, 1.0)
 	}
 
 	volaNorm := 0.0
@@ -401,30 +560,175 @@ func ComputeScore(m services.PlyMktMarket, maxVals struct {
 		volaNorm = math.Min(volatility/maxVals.MaxVolatility, 1.0)
 	}
 
+	// Spread penalty: harsh on wide spreads (sports can gap hard)
 	spreadPenalty := 1.0
-	if m.Spread > 0 {
-		spreadPenalty = math.Max(0.0, 1.0-(m.Spread/0.10))
+	if m.Spread > 0.003 { // penalize above ~0.3%
+		spreadPenalty = math.Max(0.10, 1.0-math.Log1p(m.Spread*200)/math.Log1p(8))
+		// ~0.5% spread → ~0.55 factor; 2% → ~0.18
 	}
 
-	// New: Penalty for old markets (favor fresh ones; age in days)
-	// TODO: review this
-	startTime := m.EventStartTime
-	if m.GameID != "" {
-		parsedTime, err := time.Parse("2006-01-02 15:04:05-0700", m.GameStartTime)
-		if err != nil {
-			return 0
+	// ────────────────────────────────────────────────
+	// Time-left factor (key for sports – peaked window)
+	// ────────────────────────────────────────────────
+	timeLeftDays := 999.0 // default = no strong penalty
+	if !m.EndDate.IsZero() {
+		timeLeft := time.Until(m.EndDate).Hours() / 24
+		if timeLeft > 0 {
+			timeLeftDays = timeLeft
+		} else {
+			return 0.0 // already past resolution
 		}
-		startTime = parsedTime
 	}
 
-	ageDays := time.Since(startTime).Hours() / 24
-	agePenalty := math.Max(0.5, 1.0-(ageDays/90.0)) // Decay over ~3 months
+	timeLeftFactor := 1.0
+	if timeLeftDays < 4 {
+		timeLeftFactor = math.Max(0.10, timeLeftDays/4.0) // sharp drop very close
+	} else if timeLeftDays <= 21 {
+		timeLeftFactor = 1.0 + 0.15*(21-timeLeftDays)/17 // slight peak near 10–15d
+	} else if timeLeftDays > 45 {
+		timeLeftFactor = math.Max(0.45, 1.0-(timeLeftDays-45)/90.0) // decay for long-dated
+	}
 
-	score := (vol24hrNorm*wVol24hr +
-		liqNorm*wLiq +
-		volaNorm*wVola +
-		volNorm*wVol +
-		spreadPenalty*wSpread) * agePenalty
+	// ────────────────────────────────────────────────
+	// Age / freshness (milder for sports – new info appears late)
+	// ────────────────────────────────────────────────
+	ageDays := 999.0
+	startTime := m.EventStartTime // or GameStartTime for sports
+	if m.GameStartTime != "" {
+		parsed, err := time.Parse("2006-01-02 15:04:05-0700", m.GameStartTime)
+		if err == nil {
+			startTime = parsed
+		}
+	}
+	if !startTime.IsZero() {
+		ageDays = time.Since(startTime).Hours() / 24
+	}
+	ageFactor := 1.0
+	if ageDays > 30 { // discount very old markets
+		ageFactor = math.Max(0.60, 1.0-(ageDays-30)/90.0)
+	}
+
+	// ────────────────────────────────────────────────
+	// Composite
+	// ────────────────────────────────────────────────
+	baseScore := (vol24hrNorm*wVol24hr +
+		liqNorm*wLiquidity +
+		volaNorm*wVolatility +
+		spreadPenalty*wSpread +
+		timeLeftFactor*wTimeLeft)
+
+	score := baseScore * ageFactor
+
+	// Clamp
+	score = math.Max(0.0, math.Min(1.2, score)) // slight headroom
+
+	return score
+}
+
+// RankEvents filters, computes scores, sorts by score desc, and returns top N events
+func RankEvents(events []*services.PlyMktEvent, filter EventFilter) []*services.PlyMktEvent {
+	var candidates []*services.PlyMktEvent
+	maxVol24hr, maxLiq, maxVol := 0.0, 0.0, 0.0
+
+	for _, e := range events {
+		// Use liquidity (already float64)
+		liq := e.LiquidityClob
+		if liq == 0 {
+			liq = e.Liquidity
+		}
+
+		// Use volume (already float64)
+		vol := e.Volume
+
+		// Filter out events that don't meet minimum criteria
+		if e.Volume24hr < filter.MinVolume24hr || liq < filter.MinLiquidity {
+			continue
+		}
+
+		candidates = append(candidates, e)
+
+		// Track maximum values for normalization
+		if e.Volume24hr > maxVol24hr {
+			maxVol24hr = e.Volume24hr
+		}
+		if liq > maxLiq {
+			maxLiq = liq
+		}
+		if vol > maxVol {
+			maxVol = vol
+		}
+	}
+
+	maxVals := struct {
+		MaxVol24hr   float64
+		MaxLiquidity float64
+		MaxVol       float64
+	}{maxVol24hr, maxLiq, maxVol}
+
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// Sort by score descending
+	sort.Slice(candidates, func(i, j int) bool {
+		return ComputeEventScore(*candidates[i], maxVals) > ComputeEventScore(*candidates[j], maxVals)
+	})
+
+	// Return top N events
+	if len(candidates) > filter.MaxN {
+		return candidates[:filter.MaxN]
+	}
+	return candidates
+}
+
+// ComputeEventScore returns a 0-1 normalized score for events (higher = more desirable)
+func ComputeEventScore(e services.PlyMktEvent, maxVals struct {
+	MaxVol24hr   float64
+	MaxLiquidity float64
+	MaxVol       float64
+}) float64 {
+	if !e.Active || e.Closed {
+		return 0.0
+	}
+
+	// Weights (tunable via env for flexibility)
+	wVol24hr := 0.50
+	if v := os.Getenv("EVENT_SCORE_W_VOL24HR"); v != "" {
+		wVol24hr, _ = strconv.ParseFloat(v, 64)
+	}
+	wLiq := 0.30
+	if v := os.Getenv("EVENT_SCORE_W_LIQ"); v != "" {
+		wLiq, _ = strconv.ParseFloat(v, 64)
+	}
+	wVol := 0.20
+	if v := os.Getenv("EVENT_SCORE_W_VOL"); v != "" {
+		wVol, _ = strconv.ParseFloat(v, 64)
+	}
+
+	// Normalize volume metrics
+	vol24hrNorm := 0.0
+	if maxVals.MaxVol24hr > 0 {
+		vol24hrNorm = math.Min(e.Volume24hr/maxVals.MaxVol24hr, 1.0)
+	}
+
+	// Use and normalize liquidity
+	liq := e.LiquidityClob
+	if liq == 0 {
+		liq = e.Liquidity
+	}
+	liqNorm := 0.0
+	if maxVals.MaxLiquidity > 0 {
+		liqNorm = math.Min(liq/maxVals.MaxLiquidity, 1.0)
+	}
+
+	// Use and normalize total volume
+	vol := e.Volume
+	volNorm := 0.0
+	if maxVals.MaxVol > 0 {
+		volNorm = math.Min(vol/maxVals.MaxVol, 1.0)
+	}
+
+	score := vol24hrNorm*wVol24hr + liqNorm*wLiq + volNorm*wVol
 
 	return score
 }
@@ -444,7 +748,7 @@ func fetchCategories(ctx context.Context, client *http.Client) ([]*services.PlyM
 		return nil, err
 	}
 	for _, tag := range tags {
-		tag.ParentCategory = catsID
+		tag.ParentTagID = catsID
 		cats = append(cats, tag)
 
 		u, err = url.Parse(fmt.Sprintf("%s/%s%s", tagsBase, tag.ID, relatedPath))
@@ -457,7 +761,7 @@ func fetchCategories(ctx context.Context, client *http.Client) ([]*services.PlyM
 			return nil, err
 		}
 		for _, relatedTag := range related {
-			relatedTag.ParentCategory = tag.ID
+			relatedTag.ParentTagID = tag.ID
 		}
 
 		cats = append(cats, related...)
@@ -509,23 +813,16 @@ func upsertTags(ctx context.Context, db *pgxpool.Pool, categories []*services.Pl
 
 	// First, queue all parent category tags
 	if len(categories) > 0 {
-		logging.Info(fmt.Sprintf("First tag: ID=%s, Label=%s, Slug=%s, ParentCategory=%s", categories[0].ID, categories[0].Label, categories[0].Slug, categories[0].ParentCategory))
+		logging.Info(fmt.Sprintf("First tag: ID=%s, Label=%s, Slug=%s, ParentCategory=%s", categories[0].ID, categories[0].Label, categories[0].Slug, categories[0].ParentTagID))
 	}
 	for _, t := range categories {
-
-		// Parent category: parent_tag_id is NULL or the catsID (102982)
-		var parentID *string
-		if t.ParentCategory != "" {
-			parentID = &t.ParentCategory
-		}
-
 		batch.Queue(sql,
 			t.ID,
 			t.Label,
 			t.Slug,
 			t.ForceShow,
 			t.ForceHide,
-			parentID,
+			t.ParentTagID,
 			now,
 			now,
 		)
@@ -547,7 +844,7 @@ func upsertTags(ctx context.Context, db *pgxpool.Pool, categories []*services.Pl
 			// Log the problematic tag data
 			if i < len(categories) {
 				tag := categories[i]
-				logging.Error(fmt.Sprintf("Problematic tag: ID=%s, Label=%s, ParentCategory=%s", tag.ID, tag.Label, tag.ParentCategory))
+				logging.Error(fmt.Sprintf("Problematic tag: ID=%s, Label=%s, ParentCategory=%s", tag.ID, tag.Label, tag.ParentTagID))
 			}
 			return fmt.Errorf("error executing batch item %d: %w", i, err)
 		}
@@ -557,8 +854,152 @@ func upsertTags(ctx context.Context, db *pgxpool.Pool, categories []*services.Pl
 	return nil
 }
 
+// fetchTagsFromDB reads top tags from the database and returns them along with the exact time of the most recently updated record.
+func fetchTagsFromDB(ctx context.Context, db *pgxpool.Pool) ([]*services.PlyMktTag, time.Time) {
+	var tags []*services.PlyMktTag
+	var maxUpdatedAt time.Time
+
+	// Graceful try: table might not exist
+	query := `SELECT id, label, slug, force_show, force_hide, parent_tag_id, updated_at FROM tags WHERE parent_tag_id = '102982'`
+	rows, err := db.Query(ctx, query)
+	if err != nil {
+		return nil, time.Time{}
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var t services.PlyMktTag
+		var parentID *string
+		var updatedAt time.Time
+		err := rows.Scan(&t.ID, &t.Label, &t.Slug, &t.ForceShow, &t.ForceHide, &parentID, &updatedAt)
+		if err != nil {
+			return nil, time.Time{}
+		}
+		if parentID != nil {
+			t.ParentTagID = *parentID
+		}
+		if updatedAt.After(maxUpdatedAt) {
+			maxUpdatedAt = updatedAt
+		}
+		tags = append(tags, &t)
+	}
+
+	return tags, maxUpdatedAt
+}
+
+// upsertPlyMktEvents inserts/updates events into the plymkt_events table
+func upsertPlyMktEvents(ctx context.Context, db *pgxpool.Pool, events []*services.PlyMktEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	batch := &pgx.Batch{}
+
+	sql := `
+		INSERT INTO plymkt_events (
+			id, ticker, slug, title, description, start_date, end_date, category,
+			image, icon, active, closed, archived, new, featured, restricted,
+			liquidity, volume, volume_24hr, volume_1wk, volume_1mo, volume_1yr,
+			liquidity_clob, competitive, neg_risk, neg_risk_market_id, comment_count,
+			enable_order_book, series_slug, live, ended, creator_id,
+			created_at, updated_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8,
+			$9, $10, $11, $12, $13, $14, $15, $16,
+			$17, $18, $19, $20, $21, $22,
+			$23, $24, $25, $26, $27,
+			$28, $29, $30, $31, $32,
+			$33, $34
+		)
+		ON CONFLICT (id) DO UPDATE SET
+			ticker = EXCLUDED.ticker,
+			slug = EXCLUDED.slug,
+			title = EXCLUDED.title,
+			description = EXCLUDED.description,
+			start_date = EXCLUDED.start_date,
+			end_date = EXCLUDED.end_date,
+			category = EXCLUDED.category,
+			image = EXCLUDED.image,
+			icon = EXCLUDED.icon,
+			active = EXCLUDED.active,
+			closed = EXCLUDED.closed,
+			archived = EXCLUDED.archived,
+			new = EXCLUDED.new,
+			featured = EXCLUDED.featured,
+			restricted = EXCLUDED.restricted,
+			liquidity = EXCLUDED.liquidity,
+			volume = EXCLUDED.volume,
+			volume_24hr = EXCLUDED.volume_24hr,
+			volume_1wk = EXCLUDED.volume_1wk,
+			volume_1mo = EXCLUDED.volume_1mo,
+			volume_1yr = EXCLUDED.volume_1yr,
+			liquidity_clob = EXCLUDED.liquidity_clob,
+			competitive = EXCLUDED.competitive,
+			neg_risk = EXCLUDED.neg_risk,
+			neg_risk_market_id = EXCLUDED.neg_risk_market_id,
+			comment_count = EXCLUDED.comment_count,
+			enable_order_book = EXCLUDED.enable_order_book,
+			series_slug = EXCLUDED.series_slug,
+			live = EXCLUDED.live,
+			ended = EXCLUDED.ended,
+			creator_id = EXCLUDED.creator_id,
+			updated_at = EXCLUDED.updated_at;
+	`
+
+	for _, e := range events {
+		batch.Queue(sql,
+			e.ID,              // id
+			e.Ticker,          // ticker
+			e.Slug,            // slug
+			e.Title,           // title
+			e.Description,     // description
+			e.StartDate,       // start_date
+			e.EndDate,         // end_date
+			e.Category,        // category
+			e.Image,           // image
+			e.Icon,            // icon
+			e.Active,          // active
+			e.Closed,          // closed
+			e.Archived,        // archived
+			e.New,             // new
+			e.Featured,        // featured
+			e.Restricted,      // restricted
+			e.Liquidity,       // liquidity
+			e.Volume,          // volume
+			e.Volume24hr,      // volume_24hr
+			e.Volume1wk,       // volume_1wk
+			e.Volume1mo,       // volume_1mo
+			e.Volume1yr,       // volume_1yr
+			e.LiquidityClob,   // liquidity_clob
+			e.Competitive,     // competitive
+			e.NegRisk,         // neg_risk
+			e.NegRiskMarketID, // neg_risk_market_id
+			e.CommentCount,    // comment_count
+			e.EnableOrderBook, // enable_order_book
+			e.SeriesSlug,      // series_slug
+			false,             // live (default)
+			false,             // ended (default)
+			e.CreatedBy,       // creator_id
+			e.CreatedAt,       // created_at
+			time.Now(),        // updated_at
+		)
+	}
+
+	br := db.SendBatch(ctx, batch)
+	defer br.Close()
+
+	for i := 0; i < len(events); i++ {
+		_, err := br.Exec()
+		if err != nil {
+			return fmt.Errorf("error executing batch item %d: %w", i, err)
+		}
+	}
+
+	return nil
+}
+
 // upsertMarkets inserts the ranked markets into the hot_markets_vol hypertable
-func upsertMarkets(ctx context.Context, db *pgxpool.Pool, markets []*services.PlyMktMarket, t time.Time, category string) error {
+func upsertMarkets(ctx context.Context, db *pgxpool.Pool, markets []*HotMarket, t time.Time, category string) error {
 	// We use COPY or batch inserts for efficiency?
 	// Or just a loop with Prepare/Exec for simplicity since N is small (~100-600).
 	// A batch with pgx is best.
@@ -592,101 +1033,18 @@ func upsertMarkets(ctx context.Context, db *pgxpool.Pool, markets []*services.Pl
 	// Note: ON CONFLICT ... DO UPDATE is technically not needed if we insert with unique timestamps per batch or if 'time' is part of PK and we assume no collision within same Fetch call.
 	// But it's good safety.
 
-	// Need to recalculate scores or pass them in?
-	// RankMarkets returns []*PlyMktMarket, but the scores are lost in result (internal step).
-	// Ideally RankMarkets should return the struct with score, but to minimize refactoring, we can re-compute or attach it.
-	// Or better: Modify RankMarkets to return `[]ScoredMarket`?
-	// For minimal invasion, I'll just re-compute the score here using the same function since it's deterministic.
-	// However, RankMarkets internal logic for normalization uses max values of the *candidates*.
-	// Re-computing here without the full candidate set max-values might slightly differ.
-	// BUT: `Ground.go` is a script. Let's do a quick hack: Re-calculate RankMarkets logic effectively?
-	// No, that's wasteful.
-	//
-	// OPTION A: Change RankMarkets signature.
-	// OPTION B: Assume score is not critical for DB, or compute a "Standalone Score".
-	//
-	// Let's go with OPTION A: I will modify RankMarkets to return `[]*services.PlyMktMarket` but I will attach the score to the object if possible?
-	// `PlyMktMarket` struct has a `Score` field (int64) but our score is float64.
-	//
-	// Let's just update `RankMarkets` to return `[]scoredMarket` (the internal private struct) and make it public or just return a new struct.
-	// Actually, strictly speaking the user asked to "Upsert logic... computed score".
-	// I'll leave `RankMarkets` as is to avoid breaking signatures if used elsewhere (it's a playground script though).
-	// I will just re-compute the score "roughly" or just assume 0 for now to keep it simple, OR cleaner:
-	//
-	// I'll make `RankMarkets` receive a helper callback or just inline the score calc.
-	// Actually, `Score` in `PlyMktMarket` json is `int64`.
-	// I'll just skip the score in DB or compute it locally.
-	// Wait, the prompt says "computed score".
-	// I will modify `RankMarkets` to store the score in the `PlyMktMarket.Score` field (casted to int64 * 1000 maybe?) or just ignore it.
-	//
-	// Better: I will copy the minimal normalization logic here. It's fast.
-
-	// Max vals for score normalization (approximate from this batch)
-	maxVol24hr, maxLiq, maxVol, maxVola := 0.0, 0.0, 0.0, 0.0
-	for _, m := range markets {
-		if m.Volume24hr > maxVol24hr {
-			maxVol24hr = m.Volume24hr
-		}
-
-		liq := m.LiquidityClob
-		if liq == 0 {
-			if val, err := strconv.ParseFloat(m.Liquidity, 64); err == nil {
-				liq = val
-			}
-		}
-		if liq > maxLiq {
-			maxLiq = liq
-		}
-
-		vol, _ := strconv.ParseFloat(m.Volume, 64)
-		if vol > maxVol {
-			maxVol = vol
-		}
-
-		vola := math.Abs(m.OneDayPriceChange)
-		if vola > maxVola {
-			maxVola = vola
-		}
-	}
-
-	maxVals := struct {
-		MaxVol24hr    float64
-		MaxLiquidity  float64
-		MaxVol        float64
-		MaxVolatility float64
-	}{maxVol24hr, maxLiq, maxVol, maxVola}
-
 	for i, m := range markets {
-		// Re-compute score
-		score := ComputeScore(*m, maxVals)
-
-		// Safe parsing for fields
-		liq := m.LiquidityClob
-		if liq == 0 {
-			if val, err := strconv.ParseFloat(m.Liquidity, 64); err == nil {
-				liq = val
-			}
-		}
-
-		volTotal, _ := strconv.ParseFloat(m.Volume, 64)
-
-		// JSONB for ClobTokenIds
-		// m.ClobTokenIds is a string in the struct?
-		// services.PlyMktMarket definition says: `ClobTokenIds string \`json:"clobTokenIds"\``
-		// Wait, if it's a string in the struct ("[\"token1\", \"token2\"]"), we can just pass it as string/bytes to JSONB.
-		// If it's already a JSON string, PGX should handle it if we cast or just pass as string.
-
 		batch.Queue(sql,
 			t,                   // time
 			m.ID,                // market_id
 			m.Question,          // question
 			m.Volume24hr,        // volume_24hr
-			volTotal,            // volume_total
+			m.VolumeNum,         // volume_total
 			m.LiquidityClob,     // liquidity_clob
-			liq,                 // liquidity_fallback
+			m.LiquidityNum,      // liquidity_fallback
 			m.Spread,            // spread
 			m.OneDayPriceChange, // price_change_1d
-			score,               // score
+			m.Score,             // score
 			m.ClobTokenIds,      // clob_token_ids (jsonb)
 			m.Active,            // active
 			m.Closed,            // closed
@@ -710,8 +1068,8 @@ func upsertMarkets(ctx context.Context, db *pgxpool.Pool, markets []*services.Pl
 	return nil
 }
 
-// upsertEvents inserts events into the hot_events hypertable
-func upsertEvents(ctx context.Context, db *pgxpool.Pool, events []*services.PlyMktEvent, t time.Time) error {
+// upsertHotEvents inserts events into the hot_events hypertable
+func upsertHotEvents(ctx context.Context, db *pgxpool.Pool, events []*services.PlyMktEvent, t time.Time) error {
 	batch := &pgx.Batch{}
 
 	sql := `
@@ -820,7 +1178,7 @@ func upsertEvents(ctx context.Context, db *pgxpool.Pool, events []*services.PlyM
 
 // LogMarketStats prints detailed stats on the ranked/filtered markets
 // Call this after RankMarkets(markets, filter)
-func LogMarketStats(selected []*services.PlyMktMarket, rawCount int, fetchTime time.Time, platformDailyVolEstimate float64) {
+func LogMarketStats(selected []*HotMarket, rawCount int, fetchTime time.Time, platformDailyVolEstimate float64) {
 	if len(selected) == 0 {
 		logging.Info(fmt.Sprintf("[MARKET STATS %s] No markets passed filters (raw fetched: %d)", fetchTime.Format(time.RFC3339), rawCount))
 		return
@@ -925,6 +1283,402 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// =============================================================================
+// Market Data Fetchers & Upsert Functions
+// =============================================================================
+
+// --- Open Interest ---
+
+type oiResponse struct {
+	Market string  `json:"market"`
+	Value  float64 `json:"value"`
+}
+
+// fetchOpenInterest fetches open interest for the given conditionIDs in batches,
+// using FetchPaginated for each batch chunk.
+func fetchOpenInterest(client *http.Client, conditionIDs []string) ([]*oiResponse, error) {
+	const batchSize = 50
+	var allOI []*oiResponse
+
+	for i := 0; i < len(conditionIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(conditionIDs) {
+			end = len(conditionIDs)
+		}
+		chunk := conditionIDs[i:end]
+
+		u, _ := url.Parse("https://data-api.polymarket.com/oi")
+		q := u.Query()
+		for _, id := range chunk {
+			q.Add("market", id)
+		}
+		u.RawQuery = q.Encode()
+
+		// OI endpoint returns all results at once, no real pagination needed
+		batch, err := FetchPaginated[oiResponse](client, u, 500, 0)
+		if err != nil {
+			return allOI, fmt.Errorf("OI fetch error: %w", err)
+		}
+		allOI = append(allOI, batch...)
+	}
+	return allOI, nil
+}
+
+// --- Trades ---
+
+// fetchTrades fetches trades for the given conditionIDs in batches,
+// using FetchPaginated for each batch chunk.
+func fetchTrades(client *http.Client, conditionIDs []string) ([]*services.PlyMktTrade, error) {
+	const batchSize = 20
+	var allTrades []*services.PlyMktTrade
+
+	for i := 0; i < len(conditionIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(conditionIDs) {
+			end = len(conditionIDs)
+		}
+		chunk := conditionIDs[i:end]
+
+		u, _ := url.Parse("https://data-api.polymarket.com/trades")
+		q := u.Query()
+		q.Set("takerOnly", "true")
+		for _, id := range chunk {
+			q.Add("market", id)
+		}
+		u.RawQuery = q.Encode()
+
+		batch, err := FetchPaginated[services.PlyMktTrade](client, u, 100, 0)
+		if err != nil {
+			logging.Error(fmt.Sprintf("trades fetch error for chunk %d: %v", i/batchSize, err))
+			continue // skip this chunk, try the rest
+		}
+		allTrades = append(allTrades, batch...)
+		time.Sleep(250 * time.Millisecond)
+	}
+	return allTrades, nil
+}
+
+func upsertTrades(ctx context.Context, db *pgxpool.Pool, trades []*services.PlyMktTrade) error {
+	if len(trades) == 0 {
+		return nil
+	}
+
+	// Create table if not exists
+	createSQL := `CREATE TABLE IF NOT EXISTS trades (
+		transaction_hash TEXT PRIMARY KEY,
+		proxy_wallet     TEXT,
+		side             TEXT,
+		asset            TEXT,
+		condition_id     TEXT,
+		size             INTEGER,
+		price            INTEGER,
+		timestamp        INTEGER,
+		title            TEXT,
+		slug             TEXT,
+		icon             TEXT,
+		event_slug       TEXT,
+		outcome          TEXT,
+		outcome_index    INTEGER,
+		name             TEXT,
+		pseudonym        TEXT,
+		created_at       TIMESTAMPTZ DEFAULT NOW()
+	)`
+	if _, err := db.Exec(ctx, createSQL); err != nil {
+		return fmt.Errorf("failed to create trades table: %w", err)
+	}
+
+	batch := &pgx.Batch{}
+	sql := `INSERT INTO trades (transaction_hash, proxy_wallet, side, asset, condition_id, size, price, timestamp, title, slug, icon, event_slug, outcome, outcome_index, name, pseudonym)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+		ON CONFLICT (transaction_hash) DO NOTHING`
+
+	for _, t := range trades {
+		batch.Queue(sql,
+			t.TransactionHash, t.ProxyWallet, t.Side, t.Asset, t.ConditionId,
+			t.Size, t.Price, t.Timestamp, t.Title, t.Slug, t.Icon, t.EventSlug,
+			t.Outcome, t.OutcomeIndex, t.Name, t.Pseudonym,
+		)
+	}
+
+	br := db.SendBatch(ctx, batch)
+	defer br.Close()
+	for i := 0; i < batch.Len(); i++ {
+		if _, err := br.Exec(); err != nil {
+			return fmt.Errorf("trades batch item %d error: %w", i, err)
+		}
+	}
+	logging.Info(fmt.Sprintf("Upserted %d trades", len(trades)))
+	return nil
+}
+
+// --- Prices History ---
+
+type clobToken struct {
+	TokenID  string
+	MarketID string
+}
+
+// fetchPricesHistoryConcurrent fetches prices-history for all tokens concurrently
+// with a semaphore to limit concurrency.
+func fetchPricesHistoryConcurrent(client *http.Client, tokens []clobToken, fidelity int) []services.PlyMktPriceHistory {
+	var mu sync.Mutex
+	var allPrices []services.PlyMktPriceHistory
+	sem := make(chan struct{}, 5) // max 5 concurrent requests
+	var wg sync.WaitGroup
+	now := time.Now().Unix()
+
+	for _, tok := range tokens {
+		wg.Add(1)
+		go func(t clobToken) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			u, _ := url.Parse("https://clob.polymarket.com/prices-history")
+			q := u.Query()
+			q.Set("market", t.TokenID)
+			q.Set("interval", "1d")
+			q.Set("fidelity", strconv.Itoa(fidelity))
+			u.RawQuery = q.Encode()
+
+			resp, err := client.Get(u.String())
+			if err != nil {
+				logging.Error(fmt.Sprintf("prices-history fetch error for token %s: %v", t.TokenID[:16], err))
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				logging.Error(fmt.Sprintf("prices-history bad status %d for token %s", resp.StatusCode, t.TokenID[:16]))
+				return
+			}
+
+			var wrapper struct {
+				History []services.PlyMktPriceHistory `json:"history"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
+				logging.Error(fmt.Sprintf("prices-history decode error for token %s: %v", t.TokenID[:16], err))
+				return
+			}
+
+			// Enrich with metadata
+			for i := range wrapper.History {
+				wrapper.History[i].TokenID = t.TokenID
+				wrapper.History[i].MarketID = t.MarketID
+				wrapper.History[i].Fidelity = fidelity
+				wrapper.History[i].UpdatedAt = now
+			}
+
+			mu.Lock()
+			allPrices = append(allPrices, wrapper.History...)
+			mu.Unlock()
+		}(tok)
+	}
+	wg.Wait()
+	return allPrices
+}
+
+func upsertPricesHistory(ctx context.Context, db *pgxpool.Pool, prices []services.PlyMktPriceHistory) error {
+	if len(prices) == 0 {
+		return nil
+	}
+
+	// Ensure table has the right columns (idempotent migration)
+	createSQL := `CREATE TABLE IF NOT EXISTS prices_history (
+		token_id     TEXT         NOT NULL,
+		timestamp    BIGINT       NOT NULL,
+		price        DOUBLE PRECISION NOT NULL,
+		market_id    TEXT,
+		fidelity_min INTEGER,
+		updated_at   BIGINT,
+		PRIMARY KEY (token_id, timestamp)
+	)`
+	if _, err := db.Exec(ctx, createSQL); err != nil {
+		return fmt.Errorf("failed to ensure prices_history table: %w", err)
+	}
+
+	sql := `INSERT INTO prices_history (token_id, timestamp, price, market_id, fidelity_min, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6)
+		ON CONFLICT (token_id, timestamp) DO UPDATE SET price = EXCLUDED.price, updated_at = EXCLUDED.updated_at`
+
+	// Send in sub-batches if large
+	const maxBatch = 500
+	for i := 0; i < len(prices); i += maxBatch {
+		end := i + maxBatch
+		if end > len(prices) {
+			end = len(prices)
+		}
+		subBatch := &pgx.Batch{}
+		for j := i; j < end; j++ {
+			p := prices[j]
+			subBatch.Queue(sql, p.TokenID, p.Timestamp, p.Price, p.MarketID, p.Fidelity, p.UpdatedAt)
+		}
+		br := db.SendBatch(ctx, subBatch)
+		for k := 0; k < subBatch.Len(); k++ {
+			if _, err := br.Exec(); err != nil {
+				br.Close()
+				return fmt.Errorf("prices_history batch item %d error: %w", i+k, err)
+			}
+		}
+		br.Close()
+	}
+
+	logging.Info(fmt.Sprintf("Upserted %d prices_history rows", len(prices)))
+	return nil
+}
+
+// --- Orderbooks ---
+
+type orderbookSnapshot struct {
+	Time          time.Time
+	MarketID      string
+	TokenID       string
+	BestBid       float64
+	BestAsk       float64
+	Imbalance     float64
+	TotalBidDepth float64
+	TotalAskDepth float64
+	DepthJSON     []byte // marshalled bids+asks
+	RawJSON       []byte // full response
+}
+
+type orderbookLevel struct {
+	Price string `json:"price"`
+	Size  string `json:"size"`
+}
+
+type orderbookResponse struct {
+	AssetID string           `json:"asset_id"`
+	Bids    []orderbookLevel `json:"bids"`
+	Asks    []orderbookLevel `json:"asks"`
+}
+
+func fetchOrderbooks(client *http.Client, tokenIDs []string, tokenToMarket map[string]string) ([]orderbookSnapshot, error) {
+	const batchSize = 50
+	var allSnapshots []orderbookSnapshot
+	now := time.Now()
+
+	for i := 0; i < len(tokenIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(tokenIDs) {
+			end = len(tokenIDs)
+		}
+		chunk := tokenIDs[i:end]
+
+		// Build POST body: [{"token_id": "..."}, ...]
+		type tokenReq struct {
+			TokenID string `json:"token_id"`
+		}
+		var payload []tokenReq
+		for _, tid := range chunk {
+			payload = append(payload, tokenReq{TokenID: tid})
+		}
+		bodyBytes, _ := json.Marshal(payload)
+
+		req, _ := http.NewRequest("POST", "https://clob.polymarket.com/books", bytes.NewReader(bodyBytes))
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return allSnapshots, fmt.Errorf("orderbook fetch error: %w", err)
+		}
+
+		var books []orderbookResponse
+		if err := json.NewDecoder(resp.Body).Decode(&books); err != nil {
+			resp.Body.Close()
+			return allSnapshots, fmt.Errorf("orderbook decode error: %w", err)
+		}
+		resp.Body.Close()
+
+		for _, book := range books {
+			snap := orderbookSnapshot{
+				Time:     now,
+				TokenID:  book.AssetID,
+				MarketID: tokenToMarket[book.AssetID],
+			}
+
+			// Compute best_bid, total_bid_depth
+			for _, bid := range book.Bids {
+				price, _ := strconv.ParseFloat(bid.Price, 64)
+				size, _ := strconv.ParseFloat(bid.Size, 64)
+				snap.TotalBidDepth += size
+				if price > snap.BestBid {
+					snap.BestBid = price
+				}
+			}
+
+			// Compute best_ask, total_ask_depth
+			snap.BestAsk = math.MaxFloat64
+			for _, ask := range book.Asks {
+				price, _ := strconv.ParseFloat(ask.Price, 64)
+				size, _ := strconv.ParseFloat(ask.Size, 64)
+				snap.TotalAskDepth += size
+				if price < snap.BestAsk {
+					snap.BestAsk = price
+				}
+			}
+			if len(book.Asks) == 0 {
+				snap.BestAsk = 0
+			}
+
+			// Compute imbalance
+			totalDepth := snap.TotalBidDepth + snap.TotalAskDepth
+			if totalDepth > 0 {
+				snap.Imbalance = snap.TotalBidDepth / totalDepth
+			}
+
+			// Serialize depth + raw
+			depthData := map[string]interface{}{
+				"bids": book.Bids,
+				"asks": book.Asks,
+			}
+			snap.DepthJSON, _ = json.Marshal(depthData)
+			snap.RawJSON, _ = json.Marshal(book)
+
+			allSnapshots = append(allSnapshots, snap)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return allSnapshots, nil
+}
+
+func upsertOrderbookSnapshots(ctx context.Context, db *pgxpool.Pool, snapshots []orderbookSnapshot) error {
+	if len(snapshots) == 0 {
+		return nil
+	}
+
+	batch := &pgx.Batch{}
+	sql := `INSERT INTO orderbook_snapshots (time, market_id, token_id, best_bid, best_ask, imbalance, total_bid_depth, total_ask_depth, depth_json, raw_response_json)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		ON CONFLICT (time, market_id, token_id) DO UPDATE SET
+			best_bid = EXCLUDED.best_bid,
+			best_ask = EXCLUDED.best_ask,
+			imbalance = EXCLUDED.imbalance,
+			total_bid_depth = EXCLUDED.total_bid_depth,
+			total_ask_depth = EXCLUDED.total_ask_depth,
+			depth_json = EXCLUDED.depth_json,
+			raw_response_json = EXCLUDED.raw_response_json`
+
+	for _, s := range snapshots {
+		batch.Queue(sql,
+			s.Time, s.MarketID, s.TokenID,
+			s.BestBid, s.BestAsk, s.Imbalance,
+			s.TotalBidDepth, s.TotalAskDepth,
+			s.DepthJSON, s.RawJSON,
+		)
+	}
+
+	br := db.SendBatch(ctx, batch)
+	defer br.Close()
+	for i := 0; i < batch.Len(); i++ {
+		if _, err := br.Exec(); err != nil {
+			return fmt.Errorf("orderbook_snapshots batch item %d error: %w", i, err)
+		}
+	}
+	logging.Info(fmt.Sprintf("Upserted %d orderbook snapshots", len(snapshots)))
+	return nil
 }
 
 // FetchPaginated is a generic function to fetch all pages of a resource

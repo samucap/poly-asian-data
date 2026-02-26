@@ -21,7 +21,6 @@ import (
 
 type PlyMktMarket struct {
 	ID                           string         `json:"id"`
-	EventID                      string         `json:"eventId"` // Added for relationship
 	Question                     string         `json:"question"`
 	ConditionID                  string         `json:"conditionId"`
 	Slug                         string         `json:"slug"`
@@ -156,6 +155,7 @@ type PlyMktMarket struct {
 	ScheduledDeploymentTimestamp time.Time      `json:"scheduledDeploymentTimestamp"`
 	RfqEnabled                   bool           `json:"rfqEnabled"`
 	EventStartTime               time.Time      `json:"eventStartTime"`
+	OpenInterest                 float64        `json:"-"` // Set from /oi endpoint, not from Gamma JSON
 }
 
 type ImageOptimized struct {
@@ -309,17 +309,20 @@ type Category struct {
 }
 
 type PlyMktTag struct {
-	ID             string    `json:"id"`
-	Label          string    `json:"label"`
-	Slug           string    `json:"slug"`
-	ForceShow      bool      `json:"forceShow"`
-	PublishedAt    string    `json:"publishedAt"`
-	CreatedBy      int       `json:"createdBy"`
-	UpdatedBy      int       `json:"updatedBy"`
-	CreatedAtPly   time.Time `json:"createdAt"`
-	UpdatedAtPly   time.Time `json:"updatedAt"`
-	ForceHide      bool      `json:"forceHide"`
-	ParentCategory string
+	ID           string    `json:"id"`
+	Label        string    `json:"label"`
+	Slug         string    `json:"slug"`
+	ForceShow    bool      `json:"forceShow"`
+	PublishedAt  string    `json:"publishedAt"`
+	CreatedBy    int       `json:"createdBy"`
+	UpdatedBy    int       `json:"updatedBy"`
+	CreatedAtPly time.Time `json:"createdAt"`
+	UpdatedAtPly time.Time `json:"updatedAt"`
+	ForceHide    bool      `json:"forceHide"`
+	// Derived or from API; used by processor/saver for sport link and hierarchy
+	SportSlug   string `json:"sportSlug"`
+	SportID     string `json:"-"`
+	ParentTagID string `json:"parentTagId"`
 }
 
 type PlyMktUserPosition struct {
@@ -360,17 +363,34 @@ type OrderbookItem struct {
 }
 
 type PlyMktPriceHistory struct {
-	Timestamp int64   `json:"t"` // Unix timestamp key from CLOB usually
-	Price     float64 `json:"p"`
-	MarketID  string  `json:"-"`
-	TokenID   string  `json:"-"`
-	Interval  string  `json:"-"` //?? do i need this? just wondering how to dedupe price entries
-	Fidelity  string  `json:"-"`
+	TokenID   string  `json:"-"  db:"token_id"`     // clobTokenId (PK part 1)
+	Timestamp int64   `json:"t"  db:"timestamp"`    // Unix seconds (PK part 2)
+	Price     float64 `json:"p"  db:"price"`        // Probability/price [0,1]
+	MarketID  string  `json:"-"  db:"market_id"`    // Gamma market conditionId for joins
+	Fidelity  int     `json:"-"  db:"fidelity_min"` // Resolution in minutes (e.g. 5, 60)
+	UpdatedAt int64   `json:"-"  db:"updated_at"`   // Unix seconds when row was last upserted
 }
 
-type PlyMktPricePoint struct {
-	Timestamp int64   `json:"t"`
-	Price     float64 `json:"p"`
+type PlyMktTrade struct {
+	ProxyWallet           string  `json:"proxyWallet"`
+	Side                  string  `json:"side"`
+	Asset                 string  `json:"asset"`
+	ConditionId           string  `json:"conditionId"`
+	Size                  float64 `json:"size"`
+	Price                 float64 `json:"price"`
+	Timestamp             int64   `json:"timestamp"`
+	Title                 string  `json:"title"`
+	Slug                  string  `json:"slug"`
+	Icon                  string  `json:"icon"`
+	EventSlug             string  `json:"eventSlug"`
+	Outcome               string  `json:"outcome"`
+	OutcomeIndex          int     `json:"outcomeIndex"`
+	Name                  string  `json:"name"`
+	Pseudonym             string  `json:"pseudonym"`
+	Bio                   string  `json:"bio"`
+	ProfileImage          string  `json:"profileImage"`
+	ProfileImageOptimized string  `json:"profileImageOptimized"`
+	TransactionHash       string  `json:"transactionHash"`
 }
 
 // API Endpoints
@@ -720,32 +740,22 @@ func (ply *PlyMktService) GetSportsReqs(ctx context.Context) ([]*fetcher.Request
 		return nil, err
 	}
 
-	limit := 500
-	defaultOffset := 0
-	targets := map[string]targetDetails{
-		"tags": {
-			path: "/tags",
-		},
-		"sports": {
-			path: "/sports",
-		},
-		"teams": {
-			path: "/teams",
-		},
+	// Order matters: tags first (sports.primary_tag_id FK references tags), then sports, then teams
+	targets := []struct {
+		path  string
+		limit int
+	}{
+		{path: "/tags", limit: 300},
+		{path: "/sports", limit: 500},
+		{path: "/teams", limit: 500},
 	}
 
 	var reqs []*fetcher.Request
-
+	offset := 0
 	for _, target := range targets {
 		currQuery := url.Values{}
-		if target.path == "/tags" {
-			limit = 300
-		} else if target.path == "/teams" {
-			limit = 500
-		}
-
-		currQuery.Add("limit", fmt.Sprintf("%d", limit))
-		currQuery.Add("offset", fmt.Sprintf("%d", defaultOffset))
+		currQuery.Add("limit", fmt.Sprintf("%d", target.limit))
+		currQuery.Add("offset", fmt.Sprintf("%d", offset))
 		fullURL := baseUrl.JoinPath(target.path)
 		fullURL.RawQuery = currQuery.Encode()
 
@@ -756,7 +766,7 @@ func (ply *PlyMktService) GetSportsReqs(ctx context.Context) ([]*fetcher.Request
 			Params:  fullURL.Query(),
 		}
 		reqs = append(reqs, r)
-		defaultOffset += limit
+		offset += target.limit
 	}
 
 	return reqs, nil
