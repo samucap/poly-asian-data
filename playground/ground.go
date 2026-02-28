@@ -102,7 +102,7 @@ func main() {
 	}
 
 	// TODO: make this configurable
-	platformEstDailyVol := 850_000_000.0 // Updated for 2026 averages (~$6B weekly)
+	platformEstDailyVol := 24_000_000_000.0 // Updated for 2026 averages (~$6B weekly)
 	if volStr := os.Getenv("PLATFORM_EST_DAILY_VOL"); volStr != "" {
 		if v, err := strconv.ParseFloat(volStr, 64); err == nil {
 			platformEstDailyVol = v
@@ -130,8 +130,8 @@ func main() {
 
 	// 3. Setup Filter (updated thresholds for 2026 scales)
 	filter := MarketFilter{
-		MinVolume24hr: 50000.0, // $50k+ 24h volume
-		MinLiquidity:  30000.0, // $30k+ liquidity
+		MinVolume24hr: 30000.0, // $30k+ 24h volume
+		MinLiquidity:  15000.0, // $15k+ liquidity
 		MaxSpread:     0.05,    // 5% or less
 		MinVolatility: 0.01,    // at least 1% daily change
 		MaxN:          500,     // top 500
@@ -177,9 +177,6 @@ func main() {
 	}
 
 	// Start a refresh loop for each top category
-	// TODO: is fetching all events without tag_id amount to the same number of events as iterating
-	// through all categories and fetching events for each? cuz if they're the same then we prolly
-	// dont need to fetch events for each category, just paginate events without categories?
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -307,7 +304,6 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 	}
 
 	// Rank and filter markets
-	// TODO: review rankings
 	var conditionIDs []string
 	var clobTokens []clobToken
 	marketByCondition := map[string]*HotMarket{}
@@ -506,7 +502,8 @@ func ComputeScore(m services.PlyMktMarket, maxVals struct {
 	MaxLiquidity  float64
 	MaxVol        float64
 	MaxVolatility float64
-}) float64 {
+},
+) float64 {
 	if !m.Active || m.Closed || len(m.ClobTokenIds) == 0 {
 		return 0.0
 	}
@@ -686,7 +683,8 @@ func ComputeEventScore(e services.PlyMktEvent, maxVals struct {
 	MaxVol24hr   float64
 	MaxLiquidity float64
 	MaxVol       float64
-}) float64 {
+},
+) float64 {
 	if !e.Active || e.Closed {
 		return 0.0
 	}
