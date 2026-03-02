@@ -101,14 +101,6 @@ func main() {
 		}
 	}
 
-	// TODO: make this configurable
-	platformEstDailyVol := 24_000_000_000.0 // Updated for 2026 averages (~$6B weekly)
-	if volStr := os.Getenv("PLATFORM_EST_DAILY_VOL"); volStr != "" {
-		if v, err := strconv.ParseFloat(volStr, 64); err == nil {
-			platformEstDailyVol = v
-		}
-	}
-
 	// 2. Initialize Resources
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -135,12 +127,6 @@ func main() {
 		MaxSpread:     0.05,    // 5% or less
 		MinVolatility: 0.01,    // at least 1% daily change
 		MaxN:          500,     // top 500
-	}
-
-	eventFilter := EventFilter{
-		MinVolume24hr: 10000.0, // $10k+ 24h volume for events
-		MinLiquidity:  5000.0,  // $5k+ liquidity for events
-		MaxN:          100,     // top 100 events
 	}
 
 	// 4. Fetch Categories and Start Refresh Loops
@@ -180,7 +166,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		StartMarketRefreshLoop(ctx, dbPool, cl, filter, eventFilter, topCats, fetchInterval, platformEstDailyVol, "", "")
+		StartMarketRefreshLoop(ctx, dbPool, cl, filter, topCats, fetchInterval)
 	}()
 
 	// 5. Handle Shutdown
@@ -208,14 +194,14 @@ func main() {
 }
 
 // StartMarketRefreshLoop runs the fetch-rank-upsert cycle periodically
-func StartMarketRefreshLoop(ctx context.Context, db *pgxpool.Pool, client *http.Client, filter MarketFilter, eventFilter EventFilter, cats []*services.PlyMktTag, interval time.Duration, platformEstDailyVol float64, category string, tagID string) {
+func StartMarketRefreshLoop(ctx context.Context, db *pgxpool.Pool, client *http.Client, filter MarketFilter, cats []*services.PlyMktTag, interval time.Duration) {
 	// Run once immediately
-	logging.Info(fmt.Sprintf("Starting initial market refresh for category='%s' (tagID=%s)...", category, tagID))
+	logging.Info("Starting initial market refresh...")
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	start := time.Now()
-	refreshMarketsOnce(ctx, db, client, filter, eventFilter, cats, platformEstDailyVol, category, tagID)
+	refreshMarketsOnce(ctx, db, client, filter, cats)
 	elapsed := time.Since(start)
 	nextRun := time.Now().Add(interval)
 	logging.Info(fmt.Sprintf("[>>] Refresh cycle completed in %s. Next run at %s (%s from now)",
@@ -224,12 +210,12 @@ func StartMarketRefreshLoop(ctx context.Context, db *pgxpool.Pool, client *http.
 	for {
 		select {
 		case <-ctx.Done():
-			logging.Info(fmt.Sprintf("Stopping market refresh loop for category='%s'...", category))
+			logging.Info("Stopping market refresh loop...")
 			return
 		case <-ticker.C:
-			logging.Info(fmt.Sprintf("Starting periodic market refresh for category='%s'...", category))
+			logging.Info("Starting periodic market refresh...")
 			start := time.Now()
-			refreshMarketsOnce(ctx, db, client, filter, eventFilter, cats, platformEstDailyVol, category, tagID)
+			refreshMarketsOnce(ctx, db, client, filter, cats)
 			elapsed := time.Since(start)
 			nextRun := time.Now().Add(interval)
 			logging.Info(fmt.Sprintf("[>>] Refresh cycle completed in %s. Next run at %s (%s from now)",
@@ -238,7 +224,7 @@ func StartMarketRefreshLoop(ctx context.Context, db *pgxpool.Pool, client *http.
 	}
 }
 
-func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Client, filter MarketFilter, eventFilter EventFilter, cats []*services.PlyMktTag, platformEstDailyVol float64, category string, tagID string) {
+func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Client, filter MarketFilter, cats []*services.PlyMktTag) {
 	gammaBase := "https://gamma-api.polymarket.com/events"
 	u, err := url.Parse(gammaBase)
 	if err != nil {
@@ -252,16 +238,9 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 	q.Set("order", "volume24hr")
 	q.Set("ascending", "false")
 	q.Set("include_chat", "false")
-	if tagID != "" {
-		q.Set("tag_id", tagID)
-		if tagID == "100215" {
-			q.Set("related_tags", "true")
-		}
-	}
 	u.RawQuery = q.Encode()
 	evsUrl := u
 
-	var mkts []*services.PlyMktMarket
 	var events []*services.PlyMktEvent
 	fetchTime := time.Now()
 
@@ -271,36 +250,28 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 		return
 	}
 	logging.Info(fmt.Sprintf("Fetched %d events, extracting markets...", len(events)))
+	catMapper := map[string]string{}
+	for _, c := range cats {
+		catMapper[c.ID] = c.Slug
+	}
+
+	byCat := map[string][]*services.PlyMktMarket{}
 	for _, e := range events {
 		currCat := ""
 		for _, tag := range e.Tags {
-			for _, cat := range cats {
-				if tag.ID == cat.ID {
-					currCat = cat.ID
-					break
-				}
-			}
-
-			if currCat != "" {
+			if _, ok := catMapper[tag.Slug]; ok {
+				currCat = tag.Slug
 				break
 			}
 		}
 
-		for _, currMkt := range e.Markets {
-			if currMkt.EnableOrderBook == true && currMkt.AcceptingOrders == true && currMkt.Active == true && currMkt.Closed == false {
+		for i := range e.Markets {
+			currMkt := e.Markets[i]
+			if currMkt.EnableOrderBook == true && currMkt.AcceptingOrders == true && currMkt.Active == true && currMkt.Closed == false && currMkt.ClosedTime == "" {
 				currMkt.Category = currCat
-				mkts = append(mkts, currMkt)
+				byCat[currCat] = append(byCat[currCat], currMkt)
 			}
 		}
-	}
-	logging.Info(fmt.Sprintf("Extracted %d markets from %d events", len(mkts), len(events)))
-	mapper := map[string]string{}
-	for _, c := range cats {
-		mapper[c.ID] = c.Slug
-	}
-	byCat := map[string][]*services.PlyMktMarket{}
-	for _, m := range mkts {
-		byCat[mapper[m.Category]] = append(byCat[mapper[m.Category]], m)
 	}
 
 	// Rank and filter markets
@@ -308,6 +279,7 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 	var clobTokens []clobToken
 	marketByCondition := map[string]*HotMarket{}
 
+	// TODO: need to get spread, fee
 	rankedSportsMkts := RankMarkets(byCat["sports"], filter)
 	for _, m := range rankedSportsMkts {
 		conditionIDs = append(conditionIDs, m.ConditionID)
@@ -321,7 +293,6 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 			}
 		}
 	}
-	logging.Info(fmt.Sprintf("Aggregated %d conditionIDs, %d clobTokens from %d ranked sports markets", len(conditionIDs), len(clobTokens), len(rankedSportsMkts)))
 
 	// --- Fetch Open Interest and map to markets ---
 	if len(conditionIDs) > 0 {
@@ -365,12 +336,7 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 	// --- Fetch Orderbooks and upsert snapshots ---
 	if len(clobTokens) > 0 {
 		tokenIDs := make([]string, len(clobTokens))
-		tokenToMarket := map[string]string{}
-		for i, ct := range clobTokens {
-			tokenIDs[i] = ct.TokenID
-			tokenToMarket[ct.TokenID] = ct.MarketID
-		}
-		snapshots, err := fetchOrderbooks(client, tokenIDs, tokenToMarket)
+		snapshots, err := fetchOrderbooks(client, tokenIDs)
 		if err != nil {
 			logging.Error(fmt.Sprintf("Failed to fetch orderbooks: %v", err))
 		} else {
@@ -382,7 +348,7 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 	}
 
 	// Log market stats
-	LogMarketStats(rankedSportsMkts, len(byCat["sports"]), fetchTime, platformEstDailyVol)
+	LogMarketStats(rankedSportsMkts, len(byCat["sports"]), fetchTime)
 
 	// Rank and filter events
 	//rankedEvents := RankEvents(events, eventFilter)
@@ -414,6 +380,8 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 	//}
 }
 
+// TODO: this is redundant.. just put these extra fields in PlyMktMarket
+// and top markets will be the ones with these fields set or another maybe
 type HotMarket struct {
 	services.PlyMktMarket
 	Score       float64   `json:"-" db:"score"`
@@ -486,10 +454,6 @@ func RankMarkets(markets []*services.PlyMktMarket, filter MarketFilter) []*HotMa
 	sort.Slice(scored, func(i, j int) bool {
 		return scored[i].Score > scored[j].Score
 	})
-
-	if len(scored) > filter.MaxN {
-		return scored[:filter.MaxN]
-	}
 
 	return scored
 }
@@ -578,7 +542,7 @@ func ComputeScore(m services.PlyMktMarket, maxVals struct {
 	}
 
 	timeLeftFactor := 1.0
-	if timeLeftDays < 4 {
+	if timeLeftDays < 3 {
 		timeLeftFactor = math.Max(0.10, timeLeftDays/4.0) // sharp drop very close
 	} else if timeLeftDays <= 21 {
 		timeLeftFactor = 1.0 + 0.15*(21-timeLeftDays)/17 // slight peak near 10–15d
@@ -618,115 +582,6 @@ func ComputeScore(m services.PlyMktMarket, maxVals struct {
 
 	// Clamp
 	score = math.Max(0.0, math.Min(1.2, score)) // slight headroom
-
-	return score
-}
-
-// RankEvents filters, computes scores, sorts by score desc, and returns top N events
-func RankEvents(events []*services.PlyMktEvent, filter EventFilter) []*services.PlyMktEvent {
-	var candidates []*services.PlyMktEvent
-	maxVol24hr, maxLiq, maxVol := 0.0, 0.0, 0.0
-
-	for _, e := range events {
-		// Use liquidity (already float64)
-		liq := e.LiquidityClob
-		if liq == 0 {
-			liq = e.Liquidity
-		}
-
-		// Use volume (already float64)
-		vol := e.Volume
-
-		// Filter out events that don't meet minimum criteria
-		if e.Volume24hr < filter.MinVolume24hr || liq < filter.MinLiquidity {
-			continue
-		}
-
-		candidates = append(candidates, e)
-
-		// Track maximum values for normalization
-		if e.Volume24hr > maxVol24hr {
-			maxVol24hr = e.Volume24hr
-		}
-		if liq > maxLiq {
-			maxLiq = liq
-		}
-		if vol > maxVol {
-			maxVol = vol
-		}
-	}
-
-	maxVals := struct {
-		MaxVol24hr   float64
-		MaxLiquidity float64
-		MaxVol       float64
-	}{maxVol24hr, maxLiq, maxVol}
-
-	if len(candidates) == 0 {
-		return nil
-	}
-
-	// Sort by score descending
-	sort.Slice(candidates, func(i, j int) bool {
-		return ComputeEventScore(*candidates[i], maxVals) > ComputeEventScore(*candidates[j], maxVals)
-	})
-
-	// Return top N events
-	if len(candidates) > filter.MaxN {
-		return candidates[:filter.MaxN]
-	}
-	return candidates
-}
-
-// ComputeEventScore returns a 0-1 normalized score for events (higher = more desirable)
-func ComputeEventScore(e services.PlyMktEvent, maxVals struct {
-	MaxVol24hr   float64
-	MaxLiquidity float64
-	MaxVol       float64
-},
-) float64 {
-	if !e.Active || e.Closed {
-		return 0.0
-	}
-
-	// Weights (tunable via env for flexibility)
-	wVol24hr := 0.50
-	if v := os.Getenv("EVENT_SCORE_W_VOL24HR"); v != "" {
-		wVol24hr, _ = strconv.ParseFloat(v, 64)
-	}
-	wLiq := 0.30
-	if v := os.Getenv("EVENT_SCORE_W_LIQ"); v != "" {
-		wLiq, _ = strconv.ParseFloat(v, 64)
-	}
-	wVol := 0.20
-	if v := os.Getenv("EVENT_SCORE_W_VOL"); v != "" {
-		wVol, _ = strconv.ParseFloat(v, 64)
-	}
-
-	// Normalize volume metrics
-	vol24hrNorm := 0.0
-	if maxVals.MaxVol24hr > 0 {
-		vol24hrNorm = math.Min(e.Volume24hr/maxVals.MaxVol24hr, 1.0)
-	}
-
-	// Use and normalize liquidity
-	liq := e.LiquidityClob
-	if liq == 0 {
-		liq = e.Liquidity
-	}
-	liqNorm := 0.0
-	if maxVals.MaxLiquidity > 0 {
-		liqNorm = math.Min(liq/maxVals.MaxLiquidity, 1.0)
-	}
-
-	// Use and normalize total volume
-	vol := e.Volume
-	volNorm := 0.0
-	if maxVals.MaxVol > 0 {
-		volNorm = math.Min(vol/maxVals.MaxVol, 1.0)
-	}
-
-	score := vol24hrNorm*wVol24hr + liqNorm*wLiq + volNorm*wVol
 
 	return score
 }
@@ -1176,7 +1031,7 @@ func upsertHotEvents(ctx context.Context, db *pgxpool.Pool, events []*services.P
 
 // LogMarketStats prints detailed stats on the ranked/filtered markets
 // Call this after RankMarkets(markets, filter)
-func LogMarketStats(selected []*HotMarket, rawCount int, fetchTime time.Time, platformDailyVolEstimate float64) {
+func LogMarketStats(selected []*HotMarket, rawCount int, fetchTime time.Time) {
 	if len(selected) == 0 {
 		logging.Info(fmt.Sprintf("[MARKET STATS %s] No markets passed filters (raw fetched: %d)", fetchTime.Format(time.RFC3339), rawCount))
 		return
@@ -1225,13 +1080,9 @@ func LogMarketStats(selected []*HotMarket, rawCount int, fetchTime time.Time, pl
 
 	// Rough coverage estimate (platform daily vol is approximate; update as you observe)
 	// From recent data: Polymarket ~$100M–$300M/day typical; peaks higher
-	coveragePct := 0.0
-	if platformDailyVolEstimate > 0 {
-		coveragePct = (totalVol24hr / platformDailyVolEstimate) * 100
-	}
 
 	logging.Info(fmt.Sprintf("  Count: %d", len(selected)))
-	logging.Info(fmt.Sprintf("  Total 24h Volume in set: $%.2fM (est coverage: %.1f%% of ~$%.0fM platform daily)", totalVol24hr/1e6, coveragePct, platformDailyVolEstimate/1e6))
+	logging.Info(fmt.Sprintf("  Total 24h Volume in set: $%.2fM", totalVol24hr/1e6))
 	logging.Info(fmt.Sprintf("  Total Liquidity in set: $%.2fM", totalLiquidity/1e6))
 	logging.Info(fmt.Sprintf("  Averages: Vol24hr $%.0f | Liquidity $%.0f | Lifetime Vol $%.0f | Volatility %.2f%% | Spread %.3f", avgVol24hr, avgLiq, avgVol, avgVolatility*100, avgSpread))
 
@@ -1540,6 +1391,8 @@ type orderbookSnapshot struct {
 	TotalAskDepth float64
 	DepthJSON     []byte // marshalled bids+asks
 	RawJSON       []byte // full response
+	NegRisk       bool
+	Timestamp     string
 }
 
 type orderbookLevel struct {
@@ -1548,12 +1401,20 @@ type orderbookLevel struct {
 }
 
 type orderbookResponse struct {
-	AssetID string           `json:"asset_id"`
-	Bids    []orderbookLevel `json:"bids"`
-	Asks    []orderbookLevel `json:"asks"`
+	AssetID   string           `json:"asset_id"`
+	Bids      []orderbookLevel `json:"bids"`
+	Asks      []orderbookLevel `json:"asks"`
+	MarketID  string           `json:"market"`
+	NegRisk   bool             `json:"neg_risk"`
+	Timestamp string           `json:"timestamp"`
 }
 
-func fetchOrderbooks(client *http.Client, tokenIDs []string, tokenToMarket map[string]string) ([]orderbookSnapshot, error) {
+// Build POST body: [{"token_id": "..."}, ...]
+type tokenReq struct {
+	TokenID string `json:"token_id"`
+}
+
+func fetchOrderbooks(client *http.Client, tokenIDs []string) ([]orderbookSnapshot, error) {
 	const batchSize = 50
 	var allSnapshots []orderbookSnapshot
 	now := time.Now()
@@ -1565,10 +1426,6 @@ func fetchOrderbooks(client *http.Client, tokenIDs []string, tokenToMarket map[s
 		}
 		chunk := tokenIDs[i:end]
 
-		// Build POST body: [{"token_id": "..."}, ...]
-		type tokenReq struct {
-			TokenID string `json:"token_id"`
-		}
 		var payload []tokenReq
 		for _, tid := range chunk {
 			payload = append(payload, tokenReq{TokenID: tid})
@@ -1592,9 +1449,11 @@ func fetchOrderbooks(client *http.Client, tokenIDs []string, tokenToMarket map[s
 
 		for _, book := range books {
 			snap := orderbookSnapshot{
-				Time:     now,
-				TokenID:  book.AssetID,
-				MarketID: tokenToMarket[book.AssetID],
+				Time:      now,
+				TokenID:   book.AssetID,
+				MarketID:  book.MarketID,
+				NegRisk:   book.NegRisk,
+				Timestamp: book.Timestamp,
 			}
 
 			// Compute best_bid, total_bid_depth
