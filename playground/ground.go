@@ -52,7 +52,11 @@ func newSecureHTTPClient() *http.Client {
 
 type CategoryData struct {
 	*services.PlyMktTag
-	RelatedTags []*services.PlyMktTag
+	TotalVol     float64
+	TotalVol24hr float64
+	TotalLiq     float64
+	TotalMarkets int
+	RelatedTags  map[string]*CategoryData
 }
 
 type MarketFilter struct {
@@ -121,6 +125,7 @@ func main() {
 	cl := newSecureHTTPClient()
 
 	// 3. Setup Filter (updated thresholds for 2026 scales)
+	// TODO: do we need minSpread ~3%? I think all taker orders have fees (~2%), so spread needs to account for that
 	filter := MarketFilter{
 		MinVolume24hr: 30000.0, // $30k+ 24h volume
 		MinLiquidity:  15000.0, // $15k+ liquidity
@@ -250,42 +255,123 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 		return
 	}
 	logging.Info(fmt.Sprintf("Fetched %d events, extracting markets...", len(events)))
-	catMapper := map[string]string{}
+
+	// Build lookup map for top-level tags
+	topTagByID := map[string]*services.PlyMktTag{}
 	for _, c := range cats {
-		catMapper[c.ID] = c.Slug
+		topTagByID[c.ID] = c
 	}
 
 	byCat := map[string][]*services.PlyMktMarket{}
+	catStats := map[string]*CategoryData{}
+
 	for _, e := range events {
-		currCat := ""
+		// Classify tags into top tag and sub-tags in one pass
+		var topTag *services.PlyMktTag
+		var subTags []*services.PlyMktTag
 		for _, tag := range e.Tags {
-			if _, ok := catMapper[tag.Slug]; ok {
-				currCat = tag.Slug
-				break
+			if t, ok := topTagByID[tag.ID]; ok {
+				topTag = t
+			} else {
+				subTags = append(subTags, tag)
 			}
 		}
 
+		catSlug := ""
+		if topTag != nil {
+			catSlug = topTag.Slug
+		}
+
+		// Initialize category stats once
+		if _, ok := catStats[catSlug]; !ok {
+			catStats[catSlug] = &CategoryData{
+				PlyMktTag:   topTag,
+				RelatedTags: make(map[string]*CategoryData),
+			}
+		}
+		cat := catStats[catSlug]
+
+		// Accumulate per-market directly (eliminates intermediate variables)
 		for i := range e.Markets {
-			currMkt := e.Markets[i]
-			if currMkt.EnableOrderBook == true && currMkt.AcceptingOrders == true && currMkt.Active == true && currMkt.Closed == false && currMkt.ClosedTime == "" {
-				currMkt.Category = currCat
-				byCat[currCat] = append(byCat[currCat], currMkt)
+			m := e.Markets[i]
+			if !m.EnableOrderBook || !m.AcceptingOrders || !m.Active || m.Closed || m.ClosedTime != "" {
+				continue
+			}
+			m.Category = catSlug
+			byCat[catSlug] = append(byCat[catSlug], m)
+
+			// Accumulate into top category
+			cat.TotalVol += m.VolumeClob
+			cat.TotalVol24hr += m.Volume24hrClob
+			cat.TotalLiq += m.LiquidityClob
+			cat.TotalMarkets++
+
+			// Accumulate into each subcategory
+			for _, sub := range subTags {
+				if _, ok := cat.RelatedTags[sub.ID]; !ok {
+					cat.RelatedTags[sub.ID] = &CategoryData{PlyMktTag: sub, RelatedTags: make(map[string]*CategoryData)}
+				}
+				rel := cat.RelatedTags[sub.ID]
+				rel.TotalVol += m.VolumeClob
+				rel.TotalVol24hr += m.Volume24hrClob
+				rel.TotalLiq += m.LiquidityClob
+				rel.TotalMarkets++
 			}
 		}
 	}
 
-	// Rank and filter markets
+	logCategoryStats(catStats)
+
+	// Update tags with aggregated data
+	if err := updateTagsWithAggregates(ctx, db, catStats); err != nil {
+		logging.Error(fmt.Sprintf("Failed to update tags with aggregates: %v", err))
+	}
+
+	// TODO: review hardcoding minVals for categories..
+	catFilters := map[string]MarketFilter{
+		"sports":   {MinVolume24hr: 30000.0, MinLiquidity: 15000.0, MaxSpread: 0.05, MinVolatility: 0.01, MaxN: 300},
+		"crypto":   {MinVolume24hr: 50000.0, MinLiquidity: 25000.0, MaxSpread: 0.03, MinVolatility: 0.015, MaxN: 300},
+		"politics": {MinVolume24hr: 60000.0, MinLiquidity: 30000.0, MaxSpread: 0.04, MinVolatility: 0.01, MaxN: 300},
+		"":         {MinVolume24hr: 20000.0, MinLiquidity: 10000.0, MaxSpread: 0.08, MinVolatility: 0.005, MaxN: 300},
+	}
+
+	rankedByCat := map[string][]*services.PlyMktMarket{}
+	for cat, mkts := range byCat {
+		f, ok := catFilters[cat]
+		if !ok {
+			f = catFilters[""]
+		}
+
+		ranked := RankMarkets(mkts, f)
+		if len(ranked) == 0 {
+			continue
+		}
+		rankedByCat[cat] = ranked
+		LogMarketStats(ranked, len(mkts), cat, fetchTime)
+	}
+
+	for cat, ranked := range rankedByCat {
+		// Fetch OI, Trades, Prices, Orderbooks
+		fetchTopMktsData(ctx, db, client, ranked)
+
+		// Upsert markets to DB
+		if err := upsertMarkets(ctx, db, byCat[cat], fetchTime, cat); err != nil {
+			logging.Error(fmt.Sprintf("Failed to upsert markets (category=%s): %v", cat, err))
+		} else {
+			logging.Info(fmt.Sprintf("Upserted %d markets (category=%s)", len(ranked), cat))
+		}
+	}
+}
+
+func fetchTopMktsData(ctx context.Context, db *pgxpool.Pool, client *http.Client, markets []*services.PlyMktMarket) {
 	var conditionIDs []string
 	var clobTokens []clobToken
-	marketByCondition := map[string]*HotMarket{}
+	marketByCondition := map[string]*services.PlyMktMarket{}
 
-	// TODO: need to get spread, fee
-	rankedSportsMkts := RankMarkets(byCat["sports"], filter)
-	for _, m := range rankedSportsMkts {
+	for _, m := range markets {
 		conditionIDs = append(conditionIDs, m.ConditionID)
 		marketByCondition[m.ConditionID] = m
 
-		// Parse clobTokenIds JSON array: e.g. ["token1","token2"]
 		var tokenIDs []string
 		if err := json.Unmarshal([]byte(m.ClobTokenIds), &tokenIDs); err == nil {
 			for _, tid := range tokenIDs {
@@ -307,10 +393,7 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 			}
 			logging.Info(fmt.Sprintf("Mapped open interest for %d markets", len(oiData)))
 		}
-	}
 
-	// --- Fetch Trades and upsert ---
-	if len(conditionIDs) > 0 {
 		trades, err := fetchTrades(client, conditionIDs)
 		if err != nil {
 			logging.Error(fmt.Sprintf("Failed to fetch trades: %v", err))
@@ -323,6 +406,7 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 	}
 
 	// --- Fetch Prices History (concurrent, one per token) and upsert ---
+	// --- Fetch Orderbooks and upsert snapshots ---
 	if len(clobTokens) > 0 {
 		allPrices := fetchPricesHistoryConcurrent(client, clobTokens, 5) // fidelity=5
 		logging.Info(fmt.Sprintf("Fetched %d price history points across %d tokens", len(allPrices), len(clobTokens)))
@@ -331,10 +415,6 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 				logging.Error(fmt.Sprintf("Failed to upsert prices history: %v", err))
 			}
 		}
-	}
-
-	// --- Fetch Orderbooks and upsert snapshots ---
-	if len(clobTokens) > 0 {
 		tokenIDs := make([]string, len(clobTokens))
 		snapshots, err := fetchOrderbooks(client, tokenIDs)
 		if err != nil {
@@ -346,53 +426,10 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 			}
 		}
 	}
-
-	// Log market stats
-	LogMarketStats(rankedSportsMkts, len(byCat["sports"]), fetchTime)
-
-	// Rank and filter events
-	//rankedEvents := RankEvents(events, eventFilter)
-	//if rankedEvents == nil {
-	//	rankedEvents = []*services.PlyMktEvent{}
-	//}
-
-	// Upsert events (for sports) - only top ranked events
-	//if err := upsertHotEvents(ctx, db, rankedEvents, fetchTime); err != nil {
-	//	logging.Error(fmt.Sprintf("Failed to upsert events: %v", err))
-	//} else {
-	//	logging.Info(fmt.Sprintf("Upserted %d hot_events (ranked from %d total)", len(rankedEvents), len(events)))
-	//}
-
-	// Upsert markets
-	if len(rankedSportsMkts) > 0 {
-		if err := upsertMarkets(ctx, db, rankedSportsMkts, fetchTime, "sports"); err != nil {
-			logging.Error(fmt.Sprintf("Failed to upsert markets: %v", err))
-		} else {
-			logging.Info(fmt.Sprintf("Upserted %d markets (category=%s)", len(rankedSportsMkts), "sports"))
-		}
-	}
-
-	// Upsert plymkt events
-	//if err := upsertPlyMktEvents(ctx, db, events); err != nil {
-	//	logging.Error(fmt.Sprintf("Failed to upsert plymkt events: %v", err))
-	//} else {
-	//	logging.Info(fmt.Sprintf("Upserted %d plymktEvents", len(events)))
-	//}
-}
-
-// TODO: this is redundant.. just put these extra fields in PlyMktMarket
-// and top markets will be the ones with these fields set or another maybe
-type HotMarket struct {
-	services.PlyMktMarket
-	Score       float64   `json:"-" db:"score"`
-	LastFetched time.Time `json:"-" db:"last_fetched"`
-	RankInBatch int       `json:"-" db:"rank_in_batch"`
-	Rank        int       `json:"-" db:"rank"`
-	Time        time.Time `json:"-" db:"time"`
 }
 
 // RankMarkets filters, computes scores, sorts by score desc, and returns top N
-func RankMarkets(markets []*services.PlyMktMarket, filter MarketFilter) []*HotMarket {
+func RankMarkets(markets []*services.PlyMktMarket, filter MarketFilter) []*services.PlyMktMarket {
 	var candidates []*services.PlyMktMarket
 	maxVol24hr, maxLiq, maxVol, maxVola := 0.0, 0.0, 0.0, 0.0
 
@@ -441,21 +478,20 @@ func RankMarkets(markets []*services.PlyMktMarket, filter MarketFilter) []*HotMa
 	}
 
 	now := time.Now()
-	var scored []*HotMarket
 	for _, m := range candidates {
-		scored = append(scored, &HotMarket{
-			PlyMktMarket: *m,
-			Score:        ComputeScore(*m, maxVals),
-			Time:         now,
-			LastFetched:  now,
-		})
+		m.ComputedScore = ComputeScore(*m, maxVals)
+		m.LastFetched = now
 	}
 
-	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].Score > scored[j].Score
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].ComputedScore > candidates[j].ComputedScore
 	})
 
-	return scored
+	if len(candidates) > filter.MaxN {
+		return candidates[:filter.MaxN]
+	}
+
+	return candidates
 }
 
 // ComputeScore – sports-tuned version (medium-short holding bias)
@@ -636,6 +672,10 @@ func upsertTags(ctx context.Context, db *pgxpool.Pool, categories []*services.Pl
 			force_hide BOOLEAN,
 			sport_id UUID,
 			parent_tag_id TEXT,
+			total_vol DOUBLE PRECISION DEFAULT 0,
+			total_vol_24hr DOUBLE PRECISION DEFAULT 0,
+			total_liq DOUBLE PRECISION DEFAULT 0,
+			total_markets INTEGER DEFAULT 0,
 			created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 		);
@@ -648,9 +688,9 @@ func upsertTags(ctx context.Context, db *pgxpool.Pool, categories []*services.Pl
 
 	sql := `
 		INSERT INTO tags (
-			id, label, slug, force_show, force_hide, parent_tag_id, created_at, updated_at
+			id, label, slug, force_show, force_hide, parent_tag_id, total_vol, total_vol_24hr, total_liq, total_markets, created_at, updated_at
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
 		)
 		ON CONFLICT (id) DO UPDATE SET
 			label = EXCLUDED.label,
@@ -658,6 +698,10 @@ func upsertTags(ctx context.Context, db *pgxpool.Pool, categories []*services.Pl
 			force_show = EXCLUDED.force_show,
 			force_hide = EXCLUDED.force_hide,
 			parent_tag_id = EXCLUDED.parent_tag_id,
+			total_vol = EXCLUDED.total_vol,
+			total_vol_24hr = EXCLUDED.total_vol_24hr,
+			total_liq = EXCLUDED.total_liq,
+			total_markets = EXCLUDED.total_markets,
 			updated_at = EXCLUDED.updated_at;
 	`
 
@@ -704,6 +748,61 @@ func upsertTags(ctx context.Context, db *pgxpool.Pool, categories []*services.Pl
 	}
 
 	logging.Info(fmt.Sprintf("Upserted %d tags to database", tagCount))
+	return nil
+}
+
+// updateTagsWithAggregates updates tags with aggregated volume/liquidity/market data
+func updateTagsWithAggregates(ctx context.Context, db *pgxpool.Pool, catStats map[string]*CategoryData) error {
+	if len(catStats) == 0 {
+		return nil
+	}
+
+	batch := &pgx.Batch{}
+
+	sql := `
+		UPDATE tags SET
+			total_vol = $2,
+			total_vol_24hr = $3,
+			total_liq = $4,
+			total_markets = $5,
+			updated_at = NOW()
+		WHERE id = $1
+	`
+
+	// Update top-level categories
+	for _, catData := range catStats {
+		if catData.PlyMktTag != nil {
+			batch.Queue(sql,
+				catData.PlyMktTag.ID,
+				catData.TotalVol,
+				catData.TotalVol24hr,
+				catData.TotalLiq,
+				catData.TotalMarkets,
+			)
+		}
+
+		// Update subcategories
+		for _, subData := range catData.RelatedTags {
+			batch.Queue(sql,
+				subData.PlyMktTag.ID,
+				subData.TotalVol,
+				subData.TotalVol24hr,
+				subData.TotalLiq,
+				subData.TotalMarkets,
+			)
+		}
+	}
+
+	br := db.SendBatch(ctx, batch)
+	defer br.Close()
+
+	for i := 0; i < batch.Len(); i++ {
+		if _, err := br.Exec(); err != nil {
+			return fmt.Errorf("failed to update tag aggregate %d: %w", i, err)
+		}
+	}
+
+	logging.Info(fmt.Sprintf("Updated %d tags with aggregated data", batch.Len()))
 	return nil
 }
 
@@ -851,66 +950,153 @@ func upsertPlyMktEvents(ctx context.Context, db *pgxpool.Pool, events []*service
 	return nil
 }
 
-// upsertMarkets inserts the ranked markets into the hot_markets_vol hypertable
-func upsertMarkets(ctx context.Context, db *pgxpool.Pool, markets []*HotMarket, t time.Time, category string) error {
-	// We use COPY or batch inserts for efficiency?
-	// Or just a loop with Prepare/Exec for simplicity since N is small (~100-600).
-	// A batch with pgx is best.
+// upsertMarkets upserts ranked markets into the plymkt_markets table
+func upsertMarkets(ctx context.Context, db *pgxpool.Pool, markets []*services.PlyMktMarket, t time.Time, category string) error {
+	if len(markets) == 0 {
+		return nil
+	}
 
 	batch := &pgx.Batch{}
 
 	sql := `
-		INSERT INTO hot_markets_vol (
-			time, market_id, question, 
-			volume_24hr, volume_total, 
-			liquidity_clob, liquidity_fallback, 
-			spread, price_change_1d, 
-			score, clob_token_ids, 
-			active, closed, 
-			last_fetched, rank, category
+		INSERT INTO plymkt_markets (
+			id, question, condition_id, slug, resolution_source, end_date,
+			category, liquidity, sponsor_name, start_date, fee, image, icon,
+			description, volume, active, market_type, closed, created_by, updated_by,
+			created_at, updated_at, wide_format, new, featured, archived, restricted,
+			question_id, enable_order_book, order_price_min_tick_size, order_min_size,
+			volume_num, liquidity_num, volume_24hr, volume_1wk, volume_1mo, volume_1yr,
+			clob_token_ids, fpmm_live, volume_24hr_amm, volume_1wk_amm, volume_1mo_amm,
+			volume_1yr_amm, volume_24hr_clob, volume_1wk_clob, volume_1mo_clob,
+			volume_1yr_clob, volume_amm, volume_clob, liquidity_amm, liquidity_clob,
+			maker_base_fee, taker_base_fee, accepting_orders, notifications_enabled,
+			score, creator, ready, funded, ready_timestamp, funded_timestamp,
+			accepting_orders_timestamp, competitive, rewards_min_size, rewards_max_spread,
+			spread, automatically_resolved, one_day_price_change, one_hour_price_change,
+			one_week_price_change, one_month_price_change, one_year_price_change,
+			last_trade_price, best_bid, best_ask, automatically_active, clear_book_on_start,
+			manual_activation, neg_risk_other, game_id, sports_market_type,
+			pending_deployment, deploying, rfq_enabled, event_start_time, computed_score
 		) VALUES (
-			$1, $2, $3, 
-			$4, $5, 
-			$6, $7, 
-			$8, $9, 
-			$10, $11, 
-			$12, $13, 
-			$14, $15, $16
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+			$18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32,
+			$33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47,
+			$48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62,
+			$63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77,
+			$78, $79, $80, $81, $82, $83, $84, $85, $86
 		)
-		ON CONFLICT (time, market_id, category) DO UPDATE SET
+		ON CONFLICT (id) DO UPDATE SET
+			question = EXCLUDED.question,
+			condition_id = EXCLUDED.condition_id,
+			slug = EXCLUDED.slug,
+			resolution_source = EXCLUDED.resolution_source,
+			end_date = EXCLUDED.end_date,
+			category = EXCLUDED.category,
+			liquidity = EXCLUDED.liquidity,
+			sponsor_name = EXCLUDED.sponsor_name,
+			start_date = EXCLUDED.start_date,
+			fee = EXCLUDED.fee,
+			image = EXCLUDED.image,
+			icon = EXCLUDED.icon,
+			description = EXCLUDED.description,
+			volume = EXCLUDED.volume,
+			active = EXCLUDED.active,
+			market_type = EXCLUDED.market_type,
+			closed = EXCLUDED.closed,
+			updated_by = EXCLUDED.updated_by,
+			updated_at = EXCLUDED.updated_at,
+			wide_format = EXCLUDED.wide_format,
+			new = EXCLUDED.new,
+			featured = EXCLUDED.featured,
+			archived = EXCLUDED.archived,
+			restricted = EXCLUDED.restricted,
+			question_id = EXCLUDED.question_id,
+			enable_order_book = EXCLUDED.enable_order_book,
+			order_price_min_tick_size = EXCLUDED.order_price_min_tick_size,
+			order_min_size = EXCLUDED.order_min_size,
+			volume_num = EXCLUDED.volume_num,
+			liquidity_num = EXCLUDED.liquidity_num,
 			volume_24hr = EXCLUDED.volume_24hr,
+			volume_1wk = EXCLUDED.volume_1wk,
+			volume_1mo = EXCLUDED.volume_1mo,
+			volume_1yr = EXCLUDED.volume_1yr,
+			clob_token_ids = EXCLUDED.clob_token_ids,
+			fpmm_live = EXCLUDED.fpmm_live,
+			volume_24hr_amm = EXCLUDED.volume_24hr_amm,
+			volume_1wk_amm = EXCLUDED.volume_1wk_amm,
+			volume_1mo_amm = EXCLUDED.volume_1mo_amm,
+			volume_1yr_amm = EXCLUDED.volume_1yr_amm,
+			volume_24hr_clob = EXCLUDED.volume_24hr_clob,
+			volume_1wk_clob = EXCLUDED.volume_1wk_clob,
+			volume_1mo_clob = EXCLUDED.volume_1mo_clob,
+			volume_1yr_clob = EXCLUDED.volume_1yr_clob,
+			volume_amm = EXCLUDED.volume_amm,
+			volume_clob = EXCLUDED.volume_clob,
+			liquidity_amm = EXCLUDED.liquidity_amm,
+			liquidity_clob = EXCLUDED.liquidity_clob,
+			maker_base_fee = EXCLUDED.maker_base_fee,
+			taker_base_fee = EXCLUDED.taker_base_fee,
+			accepting_orders = EXCLUDED.accepting_orders,
+			notifications_enabled = EXCLUDED.notifications_enabled,
 			score = EXCLUDED.score,
-			last_fetched = EXCLUDED.last_fetched,
-			rank = EXCLUDED.rank;
+			creator = EXCLUDED.creator,
+			ready = EXCLUDED.ready,
+			funded = EXCLUDED.funded,
+			ready_timestamp = EXCLUDED.ready_timestamp,
+			funded_timestamp = EXCLUDED.funded_timestamp,
+			accepting_orders_timestamp = EXCLUDED.accepting_orders_timestamp,
+			competitive = EXCLUDED.competitive,
+			rewards_min_size = EXCLUDED.rewards_min_size,
+			rewards_max_spread = EXCLUDED.rewards_max_spread,
+			spread = EXCLUDED.spread,
+			automatically_resolved = EXCLUDED.automatically_resolved,
+			one_day_price_change = EXCLUDED.one_day_price_change,
+			one_hour_price_change = EXCLUDED.one_hour_price_change,
+			one_week_price_change = EXCLUDED.one_week_price_change,
+			one_month_price_change = EXCLUDED.one_month_price_change,
+			one_year_price_change = EXCLUDED.one_year_price_change,
+			last_trade_price = EXCLUDED.last_trade_price,
+			best_bid = EXCLUDED.best_bid,
+			best_ask = EXCLUDED.best_ask,
+			automatically_active = EXCLUDED.automatically_active,
+			clear_book_on_start = EXCLUDED.clear_book_on_start,
+			manual_activation = EXCLUDED.manual_activation,
+			neg_risk_other = EXCLUDED.neg_risk_other,
+			game_id = EXCLUDED.game_id,
+			sports_market_type = EXCLUDED.sports_market_type,
+			pending_deployment = EXCLUDED.pending_deployment,
+			deploying = EXCLUDED.deploying,
+			rfq_enabled = EXCLUDED.rfq_enabled,
+			event_start_time = EXCLUDED.event_start_time,
+			computed_score = EXCLUDED.computed_score;
 	`
-	// Note: ON CONFLICT ... DO UPDATE is technically not needed if we insert with unique timestamps per batch or if 'time' is part of PK and we assume no collision within same Fetch call.
-	// But it's good safety.
 
-	for i, m := range markets {
+	for _, m := range markets {
+		m.Category = category
 		batch.Queue(sql,
-			t,                   // time
-			m.ID,                // market_id
-			m.Question,          // question
-			m.Volume24hr,        // volume_24hr
-			m.VolumeNum,         // volume_total
-			m.LiquidityClob,     // liquidity_clob
-			m.LiquidityNum,      // liquidity_fallback
-			m.Spread,            // spread
-			m.OneDayPriceChange, // price_change_1d
-			m.Score,             // score
-			m.ClobTokenIds,      // clob_token_ids (jsonb)
-			m.Active,            // active
-			m.Closed,            // closed
-			time.Now(),          // last_fetched
-			i+1,                 // rank
-			category,            // category
+			m.ID, m.Question, m.ConditionID, m.Slug, m.ResolutionSource, m.EndDate,
+			m.Category, m.Liquidity, m.SponsorName, m.StartDate, m.Fee, m.Image, m.Icon,
+			m.Description, m.Volume, m.Active, m.MarketType, m.Closed, m.CreatedBy, m.UpdatedBy,
+			m.CreatedAt, t, m.WideFormat, m.New, m.Featured, m.Archived, m.Restricted,
+			m.QuestionID, m.EnableOrderBook, m.OrderPriceMinTickSize, m.OrderMinSize,
+			m.VolumeNum, m.LiquidityNum, m.Volume24hr, m.Volume1wk, m.Volume1mo, m.Volume1yr,
+			m.ClobTokenIds, m.FpmmLive, m.Volume24hrAmm, m.Volume1wkAmm, m.Volume1moAmm,
+			m.Volume1yrAmm, m.Volume24hrClob, m.Volume1wkClob, m.Volume1moClob,
+			m.Volume1yrClob, m.VolumeAmm, m.VolumeClob, m.LiquidityAmm, m.LiquidityClob,
+			m.MakerBaseFee, m.TakerBaseFee, m.AcceptingOrders, m.NotificationsEnabled,
+			m.Score, m.Creator, m.Ready, m.Funded, m.ReadyTimestamp, m.FundedTimestamp,
+			m.AcceptingOrdersTimestamp, m.Competitive, m.RewardsMinSize, m.RewardsMaxSpread,
+			m.Spread, m.AutomaticallyResolved, m.OneDayPriceChange, m.OneHourPriceChange,
+			m.OneWeekPriceChange, m.OneMonthPriceChange, m.OneYearPriceChange,
+			m.LastTradePrice, m.BestBid, m.BestAsk, m.AutomaticallyActive, m.ClearBookOnStart,
+			m.ManualActivation, m.NegRiskOther, m.GameID, m.SportsMarketType,
+			m.PendingDeployment, m.Deploying, m.RfqEnabled, m.EventStartTime, m.ComputedScore,
 		)
 	}
 
 	br := db.SendBatch(ctx, batch)
 	defer br.Close()
 
-	// Execute
 	for i := 0; i < len(markets); i++ {
 		_, err := br.Exec()
 		if err != nil {
@@ -918,6 +1104,7 @@ func upsertMarkets(ctx context.Context, db *pgxpool.Pool, markets []*HotMarket, 
 		}
 	}
 
+	logging.Info(fmt.Sprintf("Upserted %d markets to plymkt_markets (category=%s)", len(markets), category))
 	return nil
 }
 
@@ -1025,85 +1212,136 @@ func upsertHotEvents(ctx context.Context, db *pgxpool.Pool, events []*services.P
 			return fmt.Errorf("error executing batch item %d: %w", i, err)
 		}
 	}
-
 	return nil
 }
 
 // LogMarketStats prints detailed stats on the ranked/filtered markets
 // Call this after RankMarkets(markets, filter)
-func LogMarketStats(selected []*HotMarket, rawCount int, fetchTime time.Time) {
-	if len(selected) == 0 {
-		logging.Info(fmt.Sprintf("[MARKET STATS %s] No markets passed filters (raw fetched: %d)", fetchTime.Format(time.RFC3339), rawCount))
+func LogMarketStats(ranked []*services.PlyMktMarket, totalMkts int, cat string, fetchTime time.Time) {
+	if len(ranked) == 0 {
+		logging.Info(fmt.Sprintf("[%s] MARKET STATS %s] No markets passed filters (raw events fetched: %d)", cat, fetchTime.Format(time.RFC3339), totalMkts))
 		return
 	}
 
 	now := time.Now()
-	logging.Info(fmt.Sprintf("[MARKET STATS %s] Selected %d markets (from %d raw fetched) | Duration: %v",
-		now.Format(time.RFC3339), len(selected), rawCount, now.Sub(fetchTime)))
+	logging.Info(fmt.Sprintf("[%s] MARKET STATS %s] Selected %d total markets (from %d raw events) | Duration: %v",
+		cat, now.Format(time.RFC3339), len(ranked), totalMkts, now.Sub(fetchTime)))
 
-	// Compute aggregates
-	var totalVol24hr, totalLiquidity, totalVol float64
-	var sumVolatility float64
-	var spreads []float64
-	var volumes24hr []float64
-	var liquidities []float64
+	printAggregateStats := func(selected []*services.PlyMktMarket, prefix string) {
+		var totalVol24hr, totalLiquidity, totalVol float64
+		var sumVolatility float64
+		var spreads []float64
+		var volumes24hr []float64
+		var liquidities []float64
 
-	for _, m := range selected {
-		totalVol24hr += m.Volume24hr
-		liq := m.LiquidityClob
-		if liq == 0 {
-			liq = m.LiquidityNum
+		for _, m := range selected {
+			totalVol24hr += m.Volume24hr
+			liq := m.LiquidityClob
+			if liq == 0 {
+				liq = m.LiquidityNum
+			}
+			totalLiquidity += liq
+			totalVol += m.VolumeNum
+			sumVolatility += math.Abs(m.OneDayPriceChange)
+			spreads = append(spreads, m.Spread)
+			volumes24hr = append(volumes24hr, m.Volume24hr)
+			liquidities = append(liquidities, liq)
 		}
-		totalLiquidity += liq
-		totalVol += m.VolumeNum
-		sumVolatility += math.Abs(m.OneDayPriceChange)
-		spreads = append(spreads, m.Spread)
-		volumes24hr = append(volumes24hr, m.Volume24hr)
-		liquidities = append(liquidities, liq)
+
+		avgVol24hr := totalVol24hr / float64(len(selected))
+		avgLiq := totalLiquidity / float64(len(selected))
+		avgVol := totalVol / float64(len(selected))
+		avgVolatility := sumVolatility / float64(len(selected))
+		avgSpread := medianFloat(spreads)
+
+		sort.Float64s(volumes24hr)
+		sort.Float64s(liquidities)
+		sort.Float64s(spreads)
+
+		medVol24hr := medianFloat(volumes24hr)
+		medLiq := medianFloat(liquidities)
+		p90Vol24hr := percentileFloat(volumes24hr, 0.90)
+		p90Liq := percentileFloat(liquidities, 0.90)
+
+		logging.Info(fmt.Sprintf("%s Count: %d", prefix, len(selected)))
+		logging.Info(fmt.Sprintf("%s Total 24h Volume: $%.2fM", prefix, totalVol24hr/1e6))
+		logging.Info(fmt.Sprintf("%s Total Liquidity: $%.2fM", prefix, totalLiquidity/1e6))
+		logging.Info(fmt.Sprintf("%s Averages: Vol24hr $%.0f | Liquidity $%.0f | Lifetime Vol $%.0f | Volatility %.2f%% | Spread %.3f", prefix, avgVol24hr, avgLiq, avgVol, avgVolatility*100, avgSpread))
+		logging.Info(fmt.Sprintf("%s Medians: Vol24hr $%.0f | Liquidity $%.0f", prefix, medVol24hr, medLiq))
+		logging.Info(fmt.Sprintf("%s P90: Vol24hr $%.0f | Liquidity $%.0f", prefix, p90Vol24hr, p90Liq))
+		logging.Info(fmt.Sprintf("%s Min/Max Vol24hr: $%.0f / $%.2fM", prefix, volumes24hr[0], volumes24hr[len(volumes24hr)-1]/1e6))
 	}
 
-	avgVol24hr := totalVol24hr / float64(len(selected))
-	avgLiq := totalLiquidity / float64(len(selected))
-	avgVol := totalVol / float64(len(selected))
-	avgVolatility := sumVolatility / float64(len(selected))
-	avgSpread := medianFloat(spreads) // or average if preferred
+	// Overall stats for this category
+	logging.Info("  --- OVERALL STATS ---")
+	printAggregateStats(ranked, fmt.Sprintf("    [%s]", cat))
 
-	// Sort for percentiles/min/max
-	sort.Float64s(volumes24hr)
-	sort.Float64s(liquidities)
-	sort.Float64s(spreads)
-
-	medVol24hr := medianFloat(volumes24hr)
-	medLiq := medianFloat(liquidities)
-	p90Vol24hr := percentileFloat(volumes24hr, 0.90)
-	p90Liq := percentileFloat(liquidities, 0.90)
-
-	// Rough coverage estimate (platform daily vol is approximate; update as you observe)
-	// From recent data: Polymarket ~$100M–$300M/day typical; peaks higher
-
-	logging.Info(fmt.Sprintf("  Count: %d", len(selected)))
-	logging.Info(fmt.Sprintf("  Total 24h Volume in set: $%.2fM", totalVol24hr/1e6))
-	logging.Info(fmt.Sprintf("  Total Liquidity in set: $%.2fM", totalLiquidity/1e6))
-	logging.Info(fmt.Sprintf("  Averages: Vol24hr $%.0f | Liquidity $%.0f | Lifetime Vol $%.0f | Volatility %.2f%% | Spread %.3f", avgVol24hr, avgLiq, avgVol, avgVolatility*100, avgSpread))
-
-	logging.Info(fmt.Sprintf("  Medians: Vol24hr $%.0f | Liquidity $%.0f", medVol24hr, medLiq))
-	logging.Info(fmt.Sprintf("  P90: Vol24hr $%.0f | Liquidity $%.0f", p90Vol24hr, p90Liq))
-	logging.Info(fmt.Sprintf("  Min/Max Vol24hr: $%.0f / $%.2fM", volumes24hr[0], volumes24hr[len(volumes24hr)-1]/1e6))
-
-	// Top 5 by volume24hr for quick check
-	logging.Info("  Top 5 markets by 24h volume:")
-	sort.Slice(selected, func(i, j int) bool { return selected[i].Volume24hr > selected[j].Volume24hr })
-	for i := 0; i < min(5, len(selected)); i++ {
-		m := selected[i]
+	// 3. Overall Top 5 by Volume24hr
+	logging.Info("  --- TOP 5 MARKETS OVERALL (by 24h volume) ---")
+	sort.Slice(ranked, func(i, j int) bool { return ranked[i].Volume24hr > ranked[j].Volume24hr })
+	for i := 0; i < min(5, len(ranked)); i++ {
+		m := ranked[i]
 		liq := m.LiquidityClob
 		if liq == 0 {
 			liq = m.LiquidityNum
 		}
-		logging.Info(fmt.Sprintf("    #%d: %s | Vol24hr $%.2fM | Liq $%.2fM | Spread %.3f | Question: %.80s...",
-			i+1, m.ID, m.Volume24hr/1e6, liq/1e6, m.Spread, m.Question))
+		logging.Info(fmt.Sprintf("    #%d [%s]: %s | Vol24hr $%.2fM | Liq $%.2fM | Spread %.3f | Question: %.80s...",
+			i+1, cat, m.ID, m.Volume24hr/1e6, liq/1e6, m.Spread, m.Question))
 	}
 
 	logging.Info("--- End MARKET STATS ---")
+}
+
+func logCategoryStats(catStats map[string]*CategoryData) {
+	logging.Info("=== CATEGORY VOLUME SUMMARY ===")
+
+	// Sort categories by total volume descending
+	type catEntry struct {
+		slug string
+		data *CategoryData
+	}
+	var cats []catEntry
+	for slug, data := range catStats {
+		cats = append(cats, catEntry{slug, data})
+	}
+	sort.Slice(cats, func(i, j int) bool {
+		return cats[i].data.TotalVol > cats[j].data.TotalVol
+	})
+
+	for _, catEntry := range cats {
+		cat := catEntry.data
+		logging.Info(fmt.Sprintf("  [%s] Vol: $%.1fM | Vol24hr: $%.1fM | Liq: $%.1fM | Markets: %d",
+			catEntry.slug,
+			cat.TotalVol/1e6,
+			cat.TotalVol24hr/1e6,
+			cat.TotalLiq/1e6,
+			cat.TotalMarkets))
+
+		// Sort subcategories by volume descending
+		type subEntry struct {
+			slug string
+			data *CategoryData
+		}
+		var subs []subEntry
+		for _, data := range cat.RelatedTags {
+			subSlug := data.PlyMktTag.Slug
+			if data.PlyMktTag.Label != "" {
+				subSlug = data.PlyMktTag.Label
+			}
+			subs = append(subs, subEntry{subSlug, data})
+		}
+		sort.Slice(subs, func(i, j int) bool {
+			return subs[i].data.TotalVol > subs[j].data.TotalVol
+		})
+
+		for _, sub := range subs {
+			logging.Info(fmt.Sprintf("    -> [%s] Vol: $%.1fM | Vol24hr: $%.1fM | Markets: %d",
+				sub.slug,
+				sub.data.TotalVol/1e6,
+				sub.data.TotalVol24hr/1e6,
+				sub.data.TotalMarkets))
+		}
+	}
 }
 
 // Helper: median of sorted float64 slice

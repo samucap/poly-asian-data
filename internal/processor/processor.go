@@ -993,10 +993,10 @@ func (p *Processor) processOrderbook(resp *fetcher.Response) (*Output, error) {
 func (p *Processor) processPricesHistory(resp *fetcher.Response) (*Output, error) {
 	// CLOB API response for history is usually: { "history": [...] } or direct array.
 	type HistoryResponse struct {
-		History []services.PlyMktPricePoint `json:"history"`
+		History []services.PlyMktPriceHistory `json:"history"`
 	}
 
-	var points []services.PlyMktPricePoint
+	var points []services.PlyMktPriceHistory
 
 	// properties from metadata
 	marketID := ""

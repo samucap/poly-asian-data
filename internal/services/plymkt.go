@@ -155,7 +155,10 @@ type PlyMktMarket struct {
 	ScheduledDeploymentTimestamp time.Time      `json:"scheduledDeploymentTimestamp"`
 	RfqEnabled                   bool           `json:"rfqEnabled"`
 	EventStartTime               time.Time      `json:"eventStartTime"`
-	OpenInterest                 float64        `json:"-"` // Set from /oi endpoint, not from Gamma JSON
+	OpenInterest                 float64        `json:"-" db:"oi"` // Set from /oi endpoint, not from Gamma JSON
+	LastFetched                  time.Time      `json:"-" db:"last_fetched"`
+	ComputedScore                float64
+	EventID                      string `json:"-" db:"event_id"`
 }
 
 type ImageOptimized struct {
@@ -320,9 +323,13 @@ type PlyMktTag struct {
 	UpdatedAtPly time.Time `json:"updatedAt"`
 	ForceHide    bool      `json:"forceHide"`
 	// Derived or from API; used by processor/saver for sport link and hierarchy
-	SportSlug   string `json:"sportSlug"`
-	SportID     string `json:"-"`
-	ParentTagID string `json:"parentTagId"`
+	SportSlug    string  `json:"sportSlug"`
+	SportID      string  `json:"-"`
+	ParentTagID  string  `json:"parentTagId"`
+	TotalVol     float64 `json:"totalVol"`
+	TotalVol24hr float64 `json:"totalVol24hr"`
+	TotalLiq     float64 `json:"totalLiq"`
+	TotalMarkets int     `json:"totalMarkets"`
 }
 
 type PlyMktUserPosition struct {
@@ -403,9 +410,7 @@ const (
 // Request/Response Types
 // =============================================================================
 
-var (
-	ErrRequestFailed = errors.New("request failed")
-)
+var ErrRequestFailed = errors.New("request failed")
 
 type ReqDetails struct {
 	URL       string

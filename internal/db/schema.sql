@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS tags (
     force_hide BOOLEAN,
     sport_id UUID REFERENCES sports(id),
     parent_tag_id TEXT REFERENCES tags(id) DEFERRABLE INITIALLY DEFERRED,
+    total_vol DOUBLE PRECISION DEFAULT 0,
+    total_vol_24hr DOUBLE PRECISION DEFAULT 0,
+    total_liq DOUBLE PRECISION DEFAULT 0,
+    total_markets INTEGER DEFAULT 0,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
@@ -181,7 +185,6 @@ CREATE TABLE IF NOT EXISTS plymkt_markets (
     x_axis_value TEXT,
     y_axis_value TEXT,
     denomination_token TEXT,
-    fee TEXT,
     image TEXT,
     icon TEXT,
     lower_bound TEXT,
@@ -276,7 +279,6 @@ CREATE TABLE IF NOT EXISTS plymkt_markets (
     competitive NUMERIC,
     rewards_min_size NUMERIC,
     rewards_max_spread NUMERIC,
-    spread NUMERIC,
     automatically_resolved BOOLEAN,
     one_day_price_change NUMERIC,
     one_hour_price_change NUMERIC,
@@ -305,7 +307,10 @@ CREATE TABLE IF NOT EXISTS plymkt_markets (
     scheduled_deployment_timestamp TIMESTAMPTZ,
     rfq_enabled BOOLEAN,
     event_start_time TIMESTAMPTZ,
-    raw_json JSONB
+    raw_json JSONB,
+    oi DOUBLE PRECISION,
+    spread DOUBLE PRECISION,
+    fee DOUBLE PRECISION
 );
 
 -- 3. Triggers
@@ -360,7 +365,7 @@ CREATE TABLE IF NOT EXISTS orderbooks (
     spread DOUBLE PRECISION,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
-SELECT create_hypertable('orderbooks', 'timestamp', if_not_exists => TRUE);
+SELECT create_hypertable('orderbooks', 'timestamp', if_not_exists => TRUE, migrate_data => TRUE);
 
 CREATE INDEX IF NOT EXISTS idx_orderbooks_token_ts ON orderbooks (token_id, timestamp DESC);
 
@@ -376,7 +381,7 @@ CREATE TABLE IF NOT EXISTS prices_history (
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (token_id, timestamp)
 );
-SELECT create_hypertable('prices_history', 'timestamp', if_not_exists => TRUE);
+SELECT create_hypertable('prices_history', 'timestamp', if_not_exists => TRUE, migrate_data => TRUE);
 -- Index is implicit with Primary Key composite, but we might want just timestamp for general queries?
 -- Access pattern: usually by token_id per time range.
 -- PK covers (token_id, timestamp).
