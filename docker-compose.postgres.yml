@@ -1,23 +1,25 @@
 services:
   postgres:
     image: timescale/timescaledb-ha:pg18-all-arm64
-    container_name: poly-asian-postgres
+    container_name: poly-asian
+    restart: unless-stopped
     environment:
-      - POSTGRES_USER=${POSTGRES_USER:-polyuser}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-polypassword}
-      - POSTGRES_DB=${POSTGRES_DB:-polydata}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - TIMESCALEDB_TELEMETRY_DISABLED=${TIMESCALEDB_TELEMETRY_DISABLED}
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - polyasian_data:/var/lib/postgresql/data
+      - ./scripts:/docker-entrypoint-initdb.d
     networks:
       - poly-asian-network
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U polyuser -d polydata" ]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
+      test: [ "CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}" ]
+      interval: 10s
+      timeout: 10s
+      retries: 10
 
 networks:
   poly-asian-network:
@@ -25,5 +27,4 @@ networks:
     driver: bridge
 
 volumes:
-  postgres_data:
-    name: poly-asian-postgres-data
+  polyasian_data:

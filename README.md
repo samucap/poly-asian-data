@@ -1,5 +1,5 @@
 ## Notes
-    1. f vibe coding... it's a trap. I went fast, but at what cost?
+
     2. need to make code more functional by abstracting generic functionalities better, i.e. need to write abstract db processes into db.go file, and export functions to be used by other cmds; same for workerpool, http client, db client actions... need to refactor how pipeline's created? cuz like the idea i had in mind was that pipelines will have phases and each phase will be comprised of workerpool to concurrently process tasks assigned to that phase,
         or workerpool... i guess I don't have it so wrong... but I mean, need to tidy things up
     3. Need to define workflows/pipelines and schedules
@@ -18,6 +18,8 @@
 
 
     - Fees apply only to 15-minute crypto, 5-minute crypto, NCAAB, and Serie A markets
+
 # TODO
+
     - implement cleaning functions like normalizing dates, timestamps or whatever
     - implement ./cmd/main.go as entrypoint to all other cmds and make it into cli tool with cobra?

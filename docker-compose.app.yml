@@ -1,3 +1,5 @@
+include:
+  - ./docker-compose.postgres.yml
 services:
   app:
     container_name: poly-asian-data-app

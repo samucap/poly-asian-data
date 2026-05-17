@@ -383,7 +383,7 @@ CREATE TABLE prices_history (
     PRIMARY KEY (token_id, timestamp)
 );
 
-SELECT create_hypertable('prices_history', 'timestamp', if_not_exists => TRUE, migrate_data => TRUE);
+SELECT create_hypertable('prices_history', 'timestamp', chunk_time_interval => 86400000, if_not_exists => TRUE, migrate_data => TRUE);
 -- Index is implicit with Primary Key composite, but we might want just timestamp for general queries?
 -- Access pattern: usually by token_id per time range.
 -- PK covers (token_id, timestamp).
@@ -454,7 +454,8 @@ ORDER BY scaled_collateral_volume::NUMERIC DESC;
 -- WITH NO DATA;
 
 -- 2. Market Pressure (Buy/Sell Ratio from Fills) - Hourly
-CREATE MATERIALIZED VIEW IF NOT EXISTS market_pressure_1h AS
+DROP MATERIALIZED VIEW IF EXISTS market_pressure_1h;
+CREATE MATERIALIZED VIEW market_pressure_1h AS
 SELECT
     date_trunc('hour', timestamp::timestamp) AS bucket,
     market_id,
@@ -471,7 +472,8 @@ GROUP BY bucket, market_id;
 CREATE INDEX IF NOT EXISTS idx_market_pressure_lookup ON market_pressure_1h (market_id, bucket DESC);
 
 -- 3. Whale Rankings (Top accounts by 7-day volume)
-CREATE MATERIALIZED VIEW IF NOT EXISTS whale_rankings AS
+DROP MATERIALIZED VIEW IF EXISTS whale_rankings;
+CREATE MATERIALIZED VIEW whale_rankings AS
 SELECT
     id AS account_id,
     collateral_volume::NUMERIC AS volume,
@@ -558,8 +560,8 @@ SELECT create_hypertable('orderbook_snapshots', 'time',
 );
 
 -- Unique constraint for upserts
-ALTER TABLE orderbook_snapshots
-ADD CONSTRAINT orderbook_snapshots_pk_unique UNIQUE (time, market_id, token_id);
+ALTER TABLE orderbook_snapshots DROP CONSTRAINT IF EXISTS orderbook_snapshots_pk_unique;
+ALTER TABLE orderbook_snapshots ADD CONSTRAINT orderbook_snapshots_pk_unique UNIQUE (time, market_id, token_id);
 
 -- Indices
 CREATE INDEX IF NOT EXISTS idx_ob_snap_market_time ON orderbook_snapshots (market_id, time DESC);
@@ -580,10 +582,14 @@ CREATE TABLE IF NOT EXISTS hot_markets_vol (
     spread          DOUBLE PRECISION,
     price_change_1d DOUBLE PRECISION,
     score           DOUBLE PRECISION,
+    clob_token_ids  TEXT,
     active          BOOLEAN,
     closed          BOOLEAN,
-    rank            INTEGER,
-    category        TEXT NOT NULL DEFAULT 'global',
+    last_fetched    TIMESTAMPTZ     DEFAULT NOW(),
+    rank_in_batch   INTEGER,        -- Deprecated in favor of rank? Or keep as alias?
+    rank            INTEGER,        -- Rank within the specific category list
+    category        TEXT            NOT NULL DEFAULT 'global',
+    raw_data        JSONB,
     end_date        TIMESTAMPTZ,
     start_date      TIMESTAMPTZ,
     outcome_prices  TEXT[]
@@ -599,46 +605,11 @@ SELECT create_hypertable('hot_markets_vol', 'time',
 -- 3. Create Constraints & Indices
 -- Unique constraint required for UPSERT (ON CONFLICT) operations
 -- Must include the time column because it's a hypertable
-ALTER TABLE hot_markets_vol 
-ADD CONSTRAINT hot_markets_vol_pk_unique UNIQUE (time, market_id, category);
+ALTER TABLE hot_markets_vol DROP CONSTRAINT IF EXISTS hot_markets_vol_pk_unique;
+ALTER TABLE hot_markets_vol ADD CONSTRAINT hot_markets_vol_pk_unique UNIQUE (time, market_id, category);
 
 -- Optimized lookup indices
 CREATE INDEX IF NOT EXISTS idx_hot_market_time ON hot_markets_vol (market_id, time DESC);
 CREATE INDEX IF NOT EXISTS idx_hot_vol_24hr ON hot_markets_vol (volume_24hr DESC, time DESC);
 CREATE INDEX IF NOT EXISTS idx_hot_score ON hot_markets_vol (score DESC, time DESC);
 CREATE INDEX IF NOT EXISTS idx_hot_category ON hot_markets_vol (category, time DESC);
-
--- Orderbook Snapshots Hypertable
--- Stores computed orderbook depth metrics per token per snapshot time
-
-CREATE TABLE IF NOT EXISTS orderbook_snapshots (
-    time            TIMESTAMPTZ      NOT NULL,
-    market_id       TEXT             NOT NULL,
-    token_id        TEXT             NOT NULL,          -- YES or NO token address
-    best_bid        DOUBLE PRECISION,
-    best_ask        DOUBLE PRECISION,
-    mid_price       DOUBLE PRECISION GENERATED ALWAYS AS ((best_bid + best_ask) / 2) STORED,
-    spread          DOUBLE PRECISION GENERATED ALWAYS AS (best_ask - best_bid) STORED,
-    imbalance       DOUBLE PRECISION,
-    total_bid_depth DOUBLE PRECISION,
-    total_ask_depth DOUBLE PRECISION,
-    depth_json      JSONB,                              -- full bids + asks array
-    raw_response_json JSONB                             -- entire response for debug
-);
-
--- Convert to Hypertable (1 hour chunks)
-SELECT create_hypertable('orderbook_snapshots', 'time',
-    chunk_time_interval => INTERVAL '1 hour',
-    if_not_exists => TRUE
-);
-
--- Unique constraint for upserts
-ALTER TABLE orderbook_snapshots
-ADD CONSTRAINT orderbook_snapshots_pk_unique UNIQUE (time, market_id, token_id);
-
--- Indices
-CREATE INDEX IF NOT EXISTS idx_ob_snap_market_time ON orderbook_snapshots (market_id, time DESC);
-CREATE INDEX IF NOT EXISTS idx_ob_snap_token_time ON orderbook_snapshots (token_id, time DESC);
-
--- Retention policy: 30 days
-SELECT add_retention_policy('orderbook_snapshots', INTERVAL '30 days', if_not_exists => TRUE);

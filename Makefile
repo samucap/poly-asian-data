@@ -115,13 +115,7 @@ app-logs:
 # Development mode with hot-reload (requires Air) or falls back to app container
 dev:
 	@echo "Starting development mode..."
-	@if command -v air >/dev/null 2>&1; then \
-		air; \
-	else \
-		echo "Air not installed. Install: go install github.com/air-verse/air@latest"; \
-		echo "Falling back to docker app container..."; \
-		docker-compose -f $(DOCKER_COMPOSE_APP) up --build; \
-	fi
+	docker-compose -f $(DOCKER_COMPOSE_APP) up --build; \
 
 # =============================================================================
 # Full Stack Commands
@@ -162,16 +156,3 @@ sec:
 	else \
 		echo "gosec not installed. Install: go install github.com/securego/gosec/v2/cmd/gosec@latest"; \
 	fi
-
-# =============================================================================
-# Tools Installation
-# =============================================================================
-
-# Install development tools
-tools:
-	@echo "Installing development tools..."
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
-	go install golang.org/x/vuln/cmd/govulncheck@latest
-	go install github.com/securego/gosec/v2/cmd/gosec@latest
-	go install github.com/air-verse/air@latest
-	go install gotest.tools/gotestsum@latest

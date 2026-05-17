@@ -41,13 +41,13 @@ func InitDB(ctx context.Context, pool *pgxpool.Pool, forceReset bool) error {
 	// Split the schema SQL by semicolon to execute statements individually,
 	// checking against empty strings to avoid errors.
 	// Note: Simple split might be fragile if SQL contains semicolons in strings/functions.
-	// However, for this specific schema.sql, a simple robust split or just executing the whole block 
-    // might work depending on driver support. pgx Exec usually handles multiple statements multiple calls 
-    // or one block? prefer one block if allowed, but sometimes mixed usage fails.
-    // Let's try executing the whole block first.
+	// However, for this specific schema.sql, a simple robust split or just executing the whole block
+	// might work depending on driver support. pgx Exec usually handles multiple statements multiple calls
+	// or one block? prefer one block if allowed, but sometimes mixed usage fails.
+	// Let's try executing the whole block first.
 	if _, err := pool.Exec(ctx, schemaSQL); err != nil {
-        // Fallback or better error handling?
-        return fmt.Errorf("failed to execute schema sql: %w", err)
+		// Fallback or better error handling?
+		return fmt.Errorf("failed to execute schema sql: %w", err)
 	}
 
 	return nil
