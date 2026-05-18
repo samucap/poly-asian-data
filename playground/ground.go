@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -98,7 +99,7 @@ func main() {
 		dbConnString = fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", user, password, host, port, dbName)
 	}
 
-	fetchInterval := 5 * time.Minute
+	fetchInterval := 10 * time.Minute
 	if intervalStr := os.Getenv("REFRESH_INTERVAL"); intervalStr != "" {
 		if d, err := time.ParseDuration(intervalStr); err == nil {
 			fetchInterval = d
@@ -369,8 +370,10 @@ func fetchTopMktsData(ctx context.Context, db *pgxpool.Pool, client *http.Client
 	marketByCondition := map[string]*services.PlyMktMarket{}
 
 	for _, m := range markets {
-		conditionIDs = append(conditionIDs, m.ConditionID)
-		marketByCondition[m.ConditionID] = m
+		if m.ConditionID != "" {
+			conditionIDs = append(conditionIDs, m.ConditionID)
+			marketByCondition[m.ConditionID] = m
+		}
 
 		var tokenIDs []string
 		if err := json.Unmarshal([]byte(m.ClobTokenIds), &tokenIDs); err == nil {
@@ -625,6 +628,14 @@ func ComputeScore(m services.PlyMktMarket, maxVals struct {
 func fetchCategories(ctx context.Context, client *http.Client) ([]*services.PlyMktTag, error) {
 	cats := []*services.PlyMktTag{}
 	catsID := "102982"
+
+	// Add the root tag so it exists in the database
+	cats = append(cats, &services.PlyMktTag{
+		ID:    catsID,
+		Label: "Categories",
+		Slug:  "categories",
+	})
+
 	tagsBase := "https://gamma-api.polymarket.com/tags"
 	relatedPath := "/related-tags/tags?status=active&omit_empty=true"
 	u, err := url.Parse(fmt.Sprintf("%s/%s%s", tagsBase, catsID, relatedPath))
@@ -662,36 +673,12 @@ func fetchCategories(ctx context.Context, client *http.Client) ([]*services.PlyM
 
 // upsertTags inserts/updates tags into the tags table
 func upsertTags(ctx context.Context, db *pgxpool.Pool, categories []*services.PlyMktTag) error {
-	// Ensure table exists
-	createSQL := `
-		CREATE TABLE IF NOT EXISTS tags (
-			id TEXT PRIMARY KEY,
-			label TEXT,
-			slug TEXT,
-			force_show BOOLEAN,
-			force_hide BOOLEAN,
-			sport_id UUID,
-			parent_tag_id TEXT,
-			total_vol DOUBLE PRECISION DEFAULT 0,
-			total_vol_24hr DOUBLE PRECISION DEFAULT 0,
-			total_liq DOUBLE PRECISION DEFAULT 0,
-			total_markets INTEGER DEFAULT 0,
-			created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-			updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-		);
-	`
-	if _, err := db.Exec(ctx, createSQL); err != nil {
-		return fmt.Errorf("failed to create tags table: %w", err)
-	}
-
 	batch := &pgx.Batch{}
 
 	sql := `
 		INSERT INTO tags (
-			id, label, slug, force_show, force_hide, parent_tag_id, total_vol, total_vol_24hr, total_liq, total_markets, created_at, updated_at
-		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
-		)
+			id, label, slug, force_show, force_hide, parent_tag_id, total_vol, total_vol_24hr, total_liq, total_markets
+		) VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7, $8, $9, $10)
 		ON CONFLICT (id) DO UPDATE SET
 			label = EXCLUDED.label,
 			slug = EXCLUDED.slug,
@@ -701,11 +688,9 @@ func upsertTags(ctx context.Context, db *pgxpool.Pool, categories []*services.Pl
 			total_vol = EXCLUDED.total_vol,
 			total_vol_24hr = EXCLUDED.total_vol_24hr,
 			total_liq = EXCLUDED.total_liq,
-			total_markets = EXCLUDED.total_markets,
-			updated_at = EXCLUDED.updated_at;
+			total_markets = EXCLUDED.total_markets
 	`
 
-	now := time.Now()
 	tagCount := 0
 
 	// First, queue all parent category tags
@@ -720,8 +705,10 @@ func upsertTags(ctx context.Context, db *pgxpool.Pool, categories []*services.Pl
 			t.ForceShow,
 			t.ForceHide,
 			t.ParentTagID,
-			now,
-			now,
+			t.TotalVol,
+			t.TotalVol24hr,
+			t.TotalLiq,
+			t.TotalMarkets,
 		)
 		tagCount++
 	}
@@ -745,6 +732,10 @@ func upsertTags(ctx context.Context, db *pgxpool.Pool, categories []*services.Pl
 			}
 			return fmt.Errorf("error executing batch item %d: %w", i, err)
 		}
+	}
+
+	if err := br.Close(); err != nil {
+		return fmt.Errorf("error closing batch (possible constraint violation): %w", err)
 	}
 
 	logging.Info(fmt.Sprintf("Upserted %d tags to database", tagCount))
@@ -976,14 +967,14 @@ func upsertMarkets(ctx context.Context, db *pgxpool.Pool, markets []*services.Pl
 			one_week_price_change, one_month_price_change, one_year_price_change,
 			last_trade_price, best_bid, best_ask, automatically_active, clear_book_on_start,
 			manual_activation, neg_risk_other, game_id, sports_market_type,
-			pending_deployment, deploying, rfq_enabled, event_start_time, computed_score
+			pending_deployment, deploying, rfq_enabled, event_start_time
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, '')::DOUBLE PRECISION, $12, $13, $14, $15, $16, $17,
 			$18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32,
 			$33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47,
 			$48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62,
 			$63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77,
-			$78, $79, $80, $81, $82, $83, $84, $85, $86
+			$78, $79, $80, $81, $82, $83, $84, $85
 		)
 		ON CONFLICT (id) DO UPDATE SET
 			question = EXCLUDED.question,
@@ -1067,8 +1058,7 @@ func upsertMarkets(ctx context.Context, db *pgxpool.Pool, markets []*services.Pl
 			pending_deployment = EXCLUDED.pending_deployment,
 			deploying = EXCLUDED.deploying,
 			rfq_enabled = EXCLUDED.rfq_enabled,
-			event_start_time = EXCLUDED.event_start_time,
-			computed_score = EXCLUDED.computed_score;
+			event_start_time = EXCLUDED.event_start_time
 	`
 
 	for _, m := range markets {
@@ -1090,7 +1080,7 @@ func upsertMarkets(ctx context.Context, db *pgxpool.Pool, markets []*services.Pl
 			m.OneWeekPriceChange, m.OneMonthPriceChange, m.OneYearPriceChange,
 			m.LastTradePrice, m.BestBid, m.BestAsk, m.AutomaticallyActive, m.ClearBookOnStart,
 			m.ManualActivation, m.NegRiskOther, m.GameID, m.SportsMarketType,
-			m.PendingDeployment, m.Deploying, m.RfqEnabled, m.EventStartTime, m.ComputedScore,
+			m.PendingDeployment, m.Deploying, m.RfqEnabled, m.EventStartTime,
 		)
 	}
 
@@ -1436,7 +1426,7 @@ func fetchTrades(client *http.Client, conditionIDs []string) ([]*services.PlyMkt
 		}
 		u.RawQuery = q.Encode()
 
-		batch, err := FetchPaginated[services.PlyMktTrade](client, u, 100, 0)
+		batch, err := FetchPaginated[services.PlyMktTrade](client, u, 100, 3000)
 		if err != nil {
 			logging.Error(fmt.Sprintf("trades fetch error for chunk %d: %v", i/batchSize, err))
 			continue // skip this chunk, try the rest
@@ -1799,8 +1789,9 @@ func FetchPaginated[T any](cl *http.Client, baseURL *url.URL, limit int, limitTh
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			return nil, fmt.Errorf("bad status: %s", resp.Status)
+			return nil, fmt.Errorf("bad status: %s, body: %s, url: %s", resp.Status, string(bodyBytes), reqURL.String())
 		}
 
 		var pageData []*T
