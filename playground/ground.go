@@ -252,7 +252,7 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 
 	events, err = FetchPaginated[services.PlyMktEvent](client, evsUrl, 500, 0)
 	if err != nil {
-		logging.Error(fmt.Sprintf("Failed to fetch sports events: %v", err))
+		logging.Error(fmt.Sprintf("Failed to fetch events: %v", err))
 		return
 	}
 	logging.Info(fmt.Sprintf("Fetched %d events, extracting markets...", len(events)))
@@ -324,6 +324,7 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 	logCategoryStats(catStats)
 
 	// Update tags with aggregated data
+	// TODO: look into combining the initial tags update with this
 	if err := updateTagsWithAggregates(ctx, db, catStats); err != nil {
 		logging.Error(fmt.Sprintf("Failed to update tags with aggregates: %v", err))
 	}
@@ -418,7 +419,12 @@ func fetchTopMktsData(ctx context.Context, db *pgxpool.Pool, client *http.Client
 				logging.Error(fmt.Sprintf("Failed to upsert prices history: %v", err))
 			}
 		}
-		tokenIDs := make([]string, len(clobTokens))
+
+		tokenIDs := make([]string, 0, len(clobTokens))
+		for _, ct := range clobTokens {
+			tokenIDs = append(tokenIDs, ct.TokenID)
+		}
+
 		snapshots, err := fetchOrderbooks(client, tokenIDs)
 		if err != nil {
 			logging.Error(fmt.Sprintf("Failed to fetch orderbooks: %v", err))

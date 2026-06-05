@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS tags (
     slug TEXT,
     force_show BOOLEAN,
     force_hide BOOLEAN,
+    sport_id UUID REFERENCES sports(id),
     parent_tag_id TEXT REFERENCES tags(id) DEFERRABLE INITIALLY DEFERRED,
     total_vol DOUBLE PRECISION DEFAULT 0,
     total_vol_24hr DOUBLE PRECISION DEFAULT 0,
