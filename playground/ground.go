@@ -68,6 +68,10 @@ type MarketFilter struct {
 	MaxN          int     // e.g., 600
 }
 
+// lastPriceFetchTs tracks the timestamp of the last successful price history fetch.
+// 0 on first run → triggers full 30-day backfill. Updated after each cycle.
+var lastPriceFetchTs int64
+
 type EventFilter struct {
 	MinVolume24hr float64 // e.g., 50000.0
 	MinLiquidity  float64 // e.g., 30000.0 (use LiquidityClob if available)
@@ -354,7 +358,8 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 
 	for cat, ranked := range rankedByCat {
 		// Fetch OI, Trades, Prices, Orderbooks
-		fetchTopMktsData(ctx, db, client, ranked)
+		fetchTopMktsData(ctx, db, client, ranked, lastPriceFetchTs)
+		lastPriceFetchTs = time.Now().Unix()
 
 		// Upsert markets to DB
 		if err := upsertMarkets(ctx, db, byCat[cat], fetchTime, cat); err != nil {
@@ -365,7 +370,7 @@ func refreshMarketsOnce(ctx context.Context, db *pgxpool.Pool, client *http.Clie
 	}
 }
 
-func fetchTopMktsData(ctx context.Context, db *pgxpool.Pool, client *http.Client, markets []*services.PlyMktMarket) {
+func fetchTopMktsData(ctx context.Context, db *pgxpool.Pool, client *http.Client, markets []*services.PlyMktMarket, priceFetchFrom int64) {
 	var conditionIDs []string
 	var clobTokens []clobToken
 	marketByCondition := map[string]*services.PlyMktMarket{}
@@ -412,7 +417,7 @@ func fetchTopMktsData(ctx context.Context, db *pgxpool.Pool, client *http.Client
 	// --- Fetch Prices History (concurrent, one per token) and upsert ---
 	// --- Fetch Orderbooks and upsert snapshots ---
 	if len(clobTokens) > 0 {
-		allPrices := fetchPricesHistoryConcurrent(client, clobTokens, 5) // fidelity=5
+		allPrices := fetchPricesHistoryConcurrent(client, clobTokens, 5, priceFetchFrom) // fidelity=5
 		logging.Info(fmt.Sprintf("Fetched %d price history points across %d tokens", len(allPrices), len(clobTokens)))
 		if len(allPrices) > 0 {
 			if err := upsertPricesHistory(ctx, db, allPrices); err != nil {
@@ -1505,12 +1510,20 @@ type clobToken struct {
 
 // fetchPricesHistoryConcurrent fetches prices-history for all tokens concurrently
 // with a semaphore to limit concurrency.
-func fetchPricesHistoryConcurrent(client *http.Client, tokens []clobToken, fidelity int) []services.PlyMktPriceHistory {
+// startTs controls the lookback: 0 = full 30-day backfill, >0 = incremental from that timestamp.
+func fetchPricesHistoryConcurrent(client *http.Client, tokens []clobToken, fidelity int, startTs int64) []services.PlyMktPriceHistory {
 	var mu sync.Mutex
 	var allPrices []services.PlyMktPriceHistory
-	sem := make(chan struct{}, 5) // max 5 concurrent requests
+	sem := make(chan struct{}, 10) // max 10 concurrent requests
 	var wg sync.WaitGroup
 	now := time.Now().Unix()
+
+	// First run (startTs=0): full 30-day backfill
+	// Subsequent runs: from startTs minus 1-hour buffer for overlap safety
+	fetchFrom := now - 30*24*60*60
+	if startTs > 0 {
+		fetchFrom = startTs - 3600 // 1-hour overlap buffer
+	}
 
 	for _, tok := range tokens {
 		wg.Add(1)
@@ -1522,8 +1535,9 @@ func fetchPricesHistoryConcurrent(client *http.Client, tokens []clobToken, fidel
 			u, _ := url.Parse("https://clob.polymarket.com/prices-history")
 			q := u.Query()
 			q.Set("market", t.TokenID)
-			q.Set("interval", "1d")
+			q.Set("interval", "max")
 			q.Set("fidelity", strconv.Itoa(fidelity))
+			q.Set("startTs", strconv.FormatInt(fetchFrom, 10))
 			u.RawQuery = q.Encode()
 
 			resp, err := client.Get(u.String())
