@@ -642,3 +642,33 @@ CREATE INDEX IF NOT EXISTS idx_ob_snap_token_time ON orderbook_snapshots (token_
 
 -- Retention policy: 30 days
 SELECT add_retention_policy('orderbook_snapshots', INTERVAL '30 days', if_not_exists => TRUE);
+
+CREATE TABLE IF NOT EXISTS oi_history (
+    time         TIMESTAMPTZ      NOT NULL,
+    condition_id TEXT             NOT NULL,
+    oi_value     DOUBLE PRECISION NOT NULL
+);
+
+SELECT create_hypertable('oi_history', 'time',
+    chunk_time_interval => INTERVAL '1 day',
+    if_not_exists => TRUE
+);
+
+ALTER TABLE oi_history
+ADD CONSTRAINT oi_history_pk UNIQUE (time, condition_id);
+
+CREATE INDEX IF NOT EXISTS idx_oi_condition_time
+    ON oi_history (condition_id, time DESC);
+
+-- Continuous aggregate for hourly OI deltas
+CREATE MATERIALIZED VIEW IF NOT EXISTS oi_hourly
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('1 hour', time) AS bucket,
+    condition_id,
+    last(oi_value, time) AS oi_close,
+    first(oi_value, time) AS oi_open,
+    max(oi_value) AS oi_high,
+    min(oi_value) AS oi_low
+FROM oi_history
+GROUP BY bucket, condition_id;
