@@ -28,6 +28,29 @@ func testPostgresURL(t *testing.T) string {
 	return connStr
 }
 
+// openTestPool connects using .env_test. Skips the test if Postgres is unreachable.
+func openTestPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	connStr := os.Getenv("POSTGRES_URL")
+	if connStr == "" {
+		t.Skip("POSTGRES_URL not set after loading .env_test")
+	}
+	ctx := context.Background()
+	d, err := db.StartDB(ctx, db.Options{
+		ConnStr:        connStr,
+		ConnectTimeout: 5 * time.Second,
+		MaxConns:       4,
+		MinConns:       1,
+	})
+	require.NoError(t, err)
+	pool, err := d.ConnectDB(ctx)
+	if err != nil {
+		t.Skipf("postgres not reachable: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
 func TestStartDB_Success(t *testing.T) {
 	t.Setenv("ENV", "prod") // ensure SSLMode from opts is preserved
 

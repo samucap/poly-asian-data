@@ -372,8 +372,7 @@ CREATE INDEX IF NOT EXISTS idx_orderbooks_token_ts ON orderbooks (token_id, time
 
 
 -- Prices History (Hypertable)
--- Prices History (Hypertable)
-CREATE TABLE prices_history (
+CREATE TABLE IF NOT EXISTS prices_history (
     token_id     TEXT             NOT NULL,
     timestamp    BIGINT           NOT NULL,
     price        DOUBLE PRECISION NOT NULL,
@@ -608,41 +607,6 @@ CREATE INDEX IF NOT EXISTS idx_hot_vol_24hr ON hot_markets_vol (volume_24hr DESC
 CREATE INDEX IF NOT EXISTS idx_hot_score ON hot_markets_vol (score DESC, time DESC);
 CREATE INDEX IF NOT EXISTS idx_hot_category ON hot_markets_vol (category, time DESC);
 
--- Orderbook Snapshots Hypertable
--- Stores computed orderbook depth metrics per token per snapshot time
-
-CREATE TABLE IF NOT EXISTS orderbook_snapshots (
-    time            TIMESTAMPTZ      NOT NULL,
-    market_id       TEXT             NOT NULL,
-    token_id        TEXT             NOT NULL,          -- YES or NO token address
-    best_bid        DOUBLE PRECISION,
-    best_ask        DOUBLE PRECISION,
-    mid_price       DOUBLE PRECISION GENERATED ALWAYS AS ((best_bid + best_ask) / 2) STORED,
-    spread          DOUBLE PRECISION GENERATED ALWAYS AS (best_ask - best_bid) STORED,
-    imbalance       DOUBLE PRECISION,
-    total_bid_depth DOUBLE PRECISION,
-    total_ask_depth DOUBLE PRECISION,
-    depth_json      JSONB,                              -- full bids + asks array
-    raw_response_json JSONB                             -- entire response for debug
-);
-
--- Convert to Hypertable (1 hour chunks)
-SELECT create_hypertable('orderbook_snapshots', 'time',
-    chunk_time_interval => INTERVAL '1 hour',
-    if_not_exists => TRUE
-);
-
--- Unique constraint for upserts
-ALTER TABLE orderbook_snapshots
-ADD CONSTRAINT orderbook_snapshots_pk_unique UNIQUE (time, market_id, token_id);
-
--- Indices
-CREATE INDEX IF NOT EXISTS idx_ob_snap_market_time ON orderbook_snapshots (market_id, time DESC);
-CREATE INDEX IF NOT EXISTS idx_ob_snap_token_time ON orderbook_snapshots (token_id, time DESC);
-
--- Retention policy: 30 days
-SELECT add_retention_policy('orderbook_snapshots', INTERVAL '30 days', if_not_exists => TRUE);
-
 CREATE TABLE IF NOT EXISTS oi_history (
     time         TIMESTAMPTZ      NOT NULL,
     condition_id TEXT             NOT NULL,
@@ -672,3 +636,85 @@ SELECT
     min(oi_value) AS oi_low
 FROM oi_history
 GROUP BY bucket, condition_id;
+
+-- Hot events (Gamma-ranked events snapshot hypertable)
+CREATE TABLE IF NOT EXISTS hot_events (
+    time TIMESTAMPTZ NOT NULL,
+    id TEXT NOT NULL,
+    ticker TEXT,
+    slug TEXT,
+    title TEXT,
+    subtitle TEXT,
+    description TEXT,
+    resolution_source TEXT,
+    start_date TIMESTAMPTZ,
+    creation_date TIMESTAMPTZ,
+    end_date TIMESTAMPTZ,
+    image TEXT,
+    icon TEXT,
+    active BOOLEAN,
+    closed BOOLEAN,
+    archived BOOLEAN,
+    new BOOLEAN,
+    featured BOOLEAN,
+    restricted BOOLEAN,
+    liquidity NUMERIC,
+    volume NUMERIC,
+    open_interest NUMERIC,
+    sort_by TEXT,
+    category TEXT,
+    subcategory TEXT,
+    is_template BOOLEAN,
+    template_variables TEXT,
+    published_at TEXT,
+    created_by TEXT,
+    updated_by TEXT,
+    created_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ,
+    comments_enabled BOOLEAN,
+    competitive NUMERIC,
+    volume_24hr NUMERIC,
+    volume_1wk NUMERIC,
+    volume_1mo NUMERIC,
+    volume_1yr NUMERIC,
+    featured_image TEXT,
+    disqus_thread TEXT,
+    parent_event TEXT,
+    enable_order_book BOOLEAN,
+    liquidity_amm NUMERIC,
+    liquidity_clob NUMERIC,
+    neg_risk BOOLEAN,
+    neg_risk_market_id TEXT,
+    neg_risk_fee_bips INTEGER,
+    comment_count INTEGER,
+    cyom BOOLEAN,
+    tags JSONB,
+    sub_events TEXT[],
+    PRIMARY KEY (time, id)
+);
+
+SELECT create_hypertable('hot_events', 'time', if_not_exists => TRUE);
+
+CREATE INDEX IF NOT EXISTS idx_hot_events_category ON hot_events (category, time DESC);
+CREATE INDEX IF NOT EXISTS idx_hot_events_volume_24hr ON hot_events (volume_24hr DESC, time DESC);
+
+-- Trades from Polymarket data API
+CREATE TABLE IF NOT EXISTS trades (
+    transaction_hash TEXT PRIMARY KEY,
+    proxy_wallet     TEXT,
+    side             TEXT,
+    asset            TEXT,
+    condition_id     TEXT,
+    size             INTEGER,
+    price            INTEGER,
+    timestamp        INTEGER,
+    title            TEXT,
+    slug             TEXT,
+    icon             TEXT,
+    event_slug       TEXT,
+    outcome          TEXT,
+    outcome_index    INTEGER,
+    name             TEXT,
+    pseudonym        TEXT,
+    created_at       TIMESTAMPTZ DEFAULT NOW()
+);

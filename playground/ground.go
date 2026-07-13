@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -21,8 +22,8 @@ import (
 
 	"github.com/joho/godotenv"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/samucap/poly-asian-data/internal/db"
 	"github.com/samucap/poly-asian-data/internal/logging"
 	"github.com/samucap/poly-asian-data/internal/services"
 )
@@ -114,16 +115,28 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	dbPool, err := pgxpool.New(ctx, dbConnString)
+	dbCfg, err := db.StartDB(ctx, db.Options{
+		ConnStr:        dbConnString,
+		ConnectTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		logging.Error(fmt.Sprintf("Unable to start database config: %v", err))
+		os.Exit(1)
+	}
+	dbPool, err := dbCfg.ConnectDB(ctx)
 	if err != nil {
 		logging.Error(fmt.Sprintf("Unable to connect to database: %v", err))
 		os.Exit(1)
 	}
 	defer dbPool.Close()
 
-	if err := dbPool.Ping(ctx); err != nil {
-		logging.Error(fmt.Sprintf("Failed to ping database: %v", err))
-		os.Exit(1)
+	// Opt-in schema bootstrap (original ground did not Init every start).
+	if v := os.Getenv("INIT_DB"); v == "true" || v == "1" {
+		if err := db.InitDB(ctx, dbPool, false); err != nil {
+			logging.Error(fmt.Sprintf("Failed to initialize database schema: %v", err))
+			os.Exit(1)
+		}
+		logging.Info("Database schema initialized (INIT_DB)")
 	}
 	logging.Info("Connected to database successfully")
 
@@ -683,9 +696,7 @@ func fetchCategories(ctx context.Context, client *http.Client) ([]*services.PlyM
 }
 
 // upsertTags inserts/updates tags into the tags table
-func upsertTags(ctx context.Context, db *pgxpool.Pool, categories []*services.PlyMktTag) error {
-	batch := &pgx.Batch{}
-
+func upsertTags(ctx context.Context, pool *pgxpool.Pool, categories []*services.PlyMktTag) error {
 	sql := `
 		INSERT INTO tags (
 			id, label, slug, force_show, force_hide, parent_tag_id, total_vol, total_vol_24hr, total_liq, total_markets
@@ -702,64 +713,36 @@ func upsertTags(ctx context.Context, db *pgxpool.Pool, categories []*services.Pl
 			total_markets = EXCLUDED.total_markets
 	`
 
-	tagCount := 0
-
-	// First, queue all parent category tags
 	if len(categories) > 0 {
 		logging.Info(fmt.Sprintf("First tag: ID=%s, Label=%s, Slug=%s, ParentCategory=%s", categories[0].ID, categories[0].Label, categories[0].Slug, categories[0].ParentTagID))
 	}
+	rows := make([][]any, 0, len(categories))
 	for _, t := range categories {
-		batch.Queue(sql,
-			t.ID,
-			t.Label,
-			t.Slug,
-			t.ForceShow,
-			t.ForceHide,
-			t.ParentTagID,
-			t.TotalVol,
-			t.TotalVol24hr,
-			t.TotalLiq,
-			t.TotalMarkets,
-		)
-		tagCount++
+		rows = append(rows, []any{
+			t.ID, t.Label, t.Slug, t.ForceShow, t.ForceHide, t.ParentTagID,
+			t.TotalVol, t.TotalVol24hr, t.TotalLiq, t.TotalMarkets,
+		})
 	}
 
-	if tagCount == 0 {
-		return nil
-	}
-
-	logging.Info(fmt.Sprintf("Sending batch with %d tag operations", tagCount))
-	br := db.SendBatch(ctx, batch)
-	defer br.Close()
-
-	for i := 0; i < tagCount; i++ {
-		_, err := br.Exec()
-		if err != nil {
-			logging.Error(fmt.Sprintf("error executing batch item %d: %v", i, err))
-			// Log the problematic tag data
-			if i < len(categories) {
-				tag := categories[i]
-				logging.Error(fmt.Sprintf("Problematic tag: ID=%s, Label=%s, ParentCategory=%s", tag.ID, tag.Label, tag.ParentTagID))
-			}
-			return fmt.Errorf("error executing batch item %d: %w", i, err)
+	logging.Info(fmt.Sprintf("Sending batch with %d tag operations", len(rows)))
+	if err := db.BatchExec(ctx, pool, sql, rows); err != nil {
+		var be *db.BatchItemError
+		if errors.As(err, &be) && be.Index >= 0 && be.Index < len(categories) {
+			tag := categories[be.Index]
+			logging.Error(fmt.Sprintf("Problematic tag: ID=%s, Label=%s, ParentCategory=%s",
+				tag.ID, tag.Label, tag.ParentTagID))
 		}
+		return err
 	}
-
-	if err := br.Close(); err != nil {
-		return fmt.Errorf("error closing batch (possible constraint violation): %w", err)
-	}
-
-	logging.Info(fmt.Sprintf("Upserted %d tags to database", tagCount))
+	logging.Info(fmt.Sprintf("Upserted %d tags to database", len(rows)))
 	return nil
 }
 
 // updateTagsWithAggregates updates tags with aggregated volume/liquidity/market data
-func updateTagsWithAggregates(ctx context.Context, db *pgxpool.Pool, catStats map[string]*CategoryData) error {
+func updateTagsWithAggregates(ctx context.Context, pool *pgxpool.Pool, catStats map[string]*CategoryData) error {
 	if len(catStats) == 0 {
 		return nil
 	}
-
-	batch := &pgx.Batch{}
 
 	sql := `
 		UPDATE tags SET
@@ -771,51 +754,43 @@ func updateTagsWithAggregates(ctx context.Context, db *pgxpool.Pool, catStats ma
 		WHERE id = $1
 	`
 
-	// Update top-level categories
+	var rows [][]any
 	for _, catData := range catStats {
 		if catData.PlyMktTag != nil {
-			batch.Queue(sql,
+			rows = append(rows, []any{
 				catData.PlyMktTag.ID,
 				catData.TotalVol,
 				catData.TotalVol24hr,
 				catData.TotalLiq,
 				catData.TotalMarkets,
-			)
+			})
 		}
-
-		// Update subcategories
 		for _, subData := range catData.RelatedTags {
-			batch.Queue(sql,
+			rows = append(rows, []any{
 				subData.PlyMktTag.ID,
 				subData.TotalVol,
 				subData.TotalVol24hr,
 				subData.TotalLiq,
 				subData.TotalMarkets,
-			)
+			})
 		}
 	}
 
-	br := db.SendBatch(ctx, batch)
-	defer br.Close()
-
-	for i := 0; i < batch.Len(); i++ {
-		if _, err := br.Exec(); err != nil {
-			return fmt.Errorf("failed to update tag aggregate %d: %w", i, err)
-		}
+	if err := db.BatchExec(ctx, pool, sql, rows); err != nil {
+		return err
 	}
-
-	logging.Info(fmt.Sprintf("Updated %d tags with aggregated data", batch.Len()))
+	logging.Info(fmt.Sprintf("Updated %d tags with aggregated data", len(rows)))
 	return nil
 }
 
 // fetchTagsFromDB reads top tags from the database and returns them along with the exact time of the most recently updated record.
-func fetchTagsFromDB(ctx context.Context, db *pgxpool.Pool) ([]*services.PlyMktTag, time.Time) {
+func fetchTagsFromDB(ctx context.Context, pool *pgxpool.Pool) ([]*services.PlyMktTag, time.Time) {
 	var tags []*services.PlyMktTag
 	var maxUpdatedAt time.Time
 
 	// Graceful try: table might not exist
 	query := `SELECT id, label, slug, force_show, force_hide, parent_tag_id, updated_at FROM tags WHERE parent_tag_id = '102982'`
-	rows, err := db.Query(ctx, query)
+	rows, err := pool.Query(ctx, query)
 	if err != nil {
 		return nil, time.Time{}
 	}
@@ -842,12 +817,10 @@ func fetchTagsFromDB(ctx context.Context, db *pgxpool.Pool) ([]*services.PlyMktT
 }
 
 // upsertPlyMktEvents inserts/updates events into the plymkt_events table
-func upsertPlyMktEvents(ctx context.Context, db *pgxpool.Pool, events []*services.PlyMktEvent) error {
+func upsertPlyMktEvents(ctx context.Context, pool *pgxpool.Pool, events []*services.PlyMktEvent) error {
 	if len(events) == 0 {
 		return nil
 	}
-
-	batch := &pgx.Batch{}
 
 	sql := `
 		INSERT INTO plymkt_events (
@@ -900,65 +873,26 @@ func upsertPlyMktEvents(ctx context.Context, db *pgxpool.Pool, events []*service
 			updated_at = EXCLUDED.updated_at;
 	`
 
+	now := time.Now()
+	rows := make([][]any, 0, len(events))
 	for _, e := range events {
-		batch.Queue(sql,
-			e.ID,              // id
-			e.Ticker,          // ticker
-			e.Slug,            // slug
-			e.Title,           // title
-			e.Description,     // description
-			e.StartDate,       // start_date
-			e.EndDate,         // end_date
-			e.Category,        // category
-			e.Image,           // image
-			e.Icon,            // icon
-			e.Active,          // active
-			e.Closed,          // closed
-			e.Archived,        // archived
-			e.New,             // new
-			e.Featured,        // featured
-			e.Restricted,      // restricted
-			e.Liquidity,       // liquidity
-			e.Volume,          // volume
-			e.Volume24hr,      // volume_24hr
-			e.Volume1wk,       // volume_1wk
-			e.Volume1mo,       // volume_1mo
-			e.Volume1yr,       // volume_1yr
-			e.LiquidityClob,   // liquidity_clob
-			e.Competitive,     // competitive
-			e.NegRisk,         // neg_risk
-			e.NegRiskMarketID, // neg_risk_market_id
-			e.CommentCount,    // comment_count
-			e.EnableOrderBook, // enable_order_book
-			e.SeriesSlug,      // series_slug
-			false,             // live (default)
-			false,             // ended (default)
-			e.CreatedBy,       // creator_id
-			e.CreatedAt,       // created_at
-			time.Now(),        // updated_at
-		)
+		rows = append(rows, []any{
+			e.ID, e.Ticker, e.Slug, e.Title, e.Description, e.StartDate, e.EndDate, e.Category,
+			e.Image, e.Icon, e.Active, e.Closed, e.Archived, e.New, e.Featured, e.Restricted,
+			e.Liquidity, e.Volume, e.Volume24hr, e.Volume1wk, e.Volume1mo, e.Volume1yr,
+			e.LiquidityClob, e.Competitive, e.NegRisk, e.NegRiskMarketID, e.CommentCount,
+			e.EnableOrderBook, e.SeriesSlug, false, false, e.CreatedBy,
+			e.CreatedAt, now,
+		})
 	}
-
-	br := db.SendBatch(ctx, batch)
-	defer br.Close()
-
-	for i := 0; i < len(events); i++ {
-		_, err := br.Exec()
-		if err != nil {
-			return fmt.Errorf("error executing batch item %d: %w", i, err)
-		}
-	}
-
-	return nil
+	return db.BatchExec(ctx, pool, sql, rows)
 }
 
 // upsertMarkets upserts ranked markets into the plymkt_markets table
-func upsertMarkets(ctx context.Context, db *pgxpool.Pool, markets []*services.PlyMktMarket, t time.Time, category string) error {
+func upsertMarkets(ctx context.Context, pool *pgxpool.Pool, markets []*services.PlyMktMarket, t time.Time, category string) error {
 	if len(markets) == 0 {
 		return nil
 	}
-
-	batch := &pgx.Batch{}
 
 	sql := `
 		INSERT INTO plymkt_markets (
@@ -1072,9 +1006,10 @@ func upsertMarkets(ctx context.Context, db *pgxpool.Pool, markets []*services.Pl
 			event_start_time = EXCLUDED.event_start_time
 	`
 
+	rows := make([][]any, 0, len(markets))
 	for _, m := range markets {
 		m.Category = category
-		batch.Queue(sql,
+		rows = append(rows, []any{
 			m.ID, m.Question, m.ConditionID, m.Slug, m.ResolutionSource, m.EndDate,
 			m.Category, m.Liquidity, m.SponsorName, m.StartDate, m.Fee, m.Image, m.Icon,
 			m.Description, m.Volume, m.Active, m.MarketType, m.Closed, m.CreatedBy, m.UpdatedBy,
@@ -1092,27 +1027,18 @@ func upsertMarkets(ctx context.Context, db *pgxpool.Pool, markets []*services.Pl
 			m.LastTradePrice, m.BestBid, m.BestAsk, m.AutomaticallyActive, m.ClearBookOnStart,
 			m.ManualActivation, m.NegRiskOther, m.GameID, m.SportsMarketType,
 			m.PendingDeployment, m.Deploying, m.RfqEnabled, m.EventStartTime,
-		)
+		})
 	}
 
-	br := db.SendBatch(ctx, batch)
-	defer br.Close()
-
-	for i := 0; i < len(markets); i++ {
-		_, err := br.Exec()
-		if err != nil {
-			return fmt.Errorf("error executing batch item %d: %w", i, err)
-		}
+	if err := db.BatchExec(ctx, pool, sql, rows); err != nil {
+		return err
 	}
-
 	logging.Info(fmt.Sprintf("Upserted %d markets to plymkt_markets (category=%s)", len(markets), category))
 	return nil
 }
 
 // upsertHotEvents inserts events into the hot_events hypertable
-func upsertHotEvents(ctx context.Context, db *pgxpool.Pool, events []*services.PlyMktEvent, t time.Time) error {
-	batch := &pgx.Batch{}
-
+func upsertHotEvents(ctx context.Context, pool *pgxpool.Pool, events []*services.PlyMktEvent, t time.Time) error {
 	sql := `
 		INSERT INTO hot_events (
 			time, id, ticker, slug, title, subtitle, description, resolution_source,
@@ -1145,75 +1071,23 @@ func upsertHotEvents(ctx context.Context, db *pgxpool.Pool, events []*services.P
 			closed = EXCLUDED.closed;
 	`
 
+	rows := make([][]any, 0, len(events))
 	for _, e := range events {
-		// Convert tags to JSON
 		tagsJSON, _ := json.Marshal(e.Tags)
-
-		batch.Queue(sql,
-			t,                   // time
-			e.ID,                // id
-			e.Ticker,            // ticker
-			e.Slug,              // slug
-			e.Title,             // title
-			e.Subtitle,          // subtitle
-			e.Description,       // description
-			e.ResolutionSource,  // resolution_source
-			e.StartDate,         // start_date
-			e.CreationDate,      // creation_date
-			e.EndDate,           // end_date
-			e.Image,             // image
-			e.Icon,              // icon
-			e.Active,            // active
-			e.Closed,            // closed
-			e.Archived,          // archived
-			e.New,               // new
-			e.Featured,          // featured
-			e.Restricted,        // restricted
-			e.Liquidity,         // liquidity
-			e.Volume,            // volume
-			e.OpenInterest,      // open_interest
-			e.SortBy,            // sort_by
-			e.Category,          // category
-			e.Subcategory,       // subcategory
-			e.IsTemplate,        // is_template
-			e.TemplateVariables, // template_variables
-			e.PublishedAt,       // published_at
-			e.CreatedBy,         // created_by
-			e.UpdatedBy,         // updated_by
-			e.CreatedAt,         // created_at
-			e.UpdatedAt,         // updated_at
-			e.CommentsEnabled,   // comments_enabled
-			e.Competitive,       // competitive
-			e.Volume24hr,        // volume_24hr
-			e.Volume1wk,         // volume_1wk
-			e.Volume1mo,         // volume_1mo
-			e.Volume1yr,         // volume_1yr
-			e.FeaturedImage,     // featured_image
-			e.DisqusThread,      // disqus_thread
-			e.ParentEvent,       // parent_event
-			e.EnableOrderBook,   // enable_order_book
-			e.LiquidityAmm,      // liquidity_amm
-			e.LiquidityClob,     // liquidity_clob
-			e.NegRisk,           // neg_risk
-			e.NegRiskMarketID,   // neg_risk_market_id
-			e.NegRiskFeeBips,    // neg_risk_fee_bips
-			e.CommentCount,      // comment_count
-			e.Cyom,              // cyom
-			tagsJSON,            // tags (JSONB)
-			e.SubEvents,         // sub_events (TEXT[])
-		)
+		rows = append(rows, []any{
+			t, e.ID, e.Ticker, e.Slug, e.Title, e.Subtitle, e.Description, e.ResolutionSource,
+			e.StartDate, e.CreationDate, e.EndDate, e.Image, e.Icon,
+			e.Active, e.Closed, e.Archived, e.New, e.Featured, e.Restricted,
+			e.Liquidity, e.Volume, e.OpenInterest, e.SortBy, e.Category, e.Subcategory,
+			e.IsTemplate, e.TemplateVariables, e.PublishedAt, e.CreatedBy, e.UpdatedBy,
+			e.CreatedAt, e.UpdatedAt, e.CommentsEnabled, e.Competitive,
+			e.Volume24hr, e.Volume1wk, e.Volume1mo, e.Volume1yr,
+			e.FeaturedImage, e.DisqusThread, e.ParentEvent, e.EnableOrderBook,
+			e.LiquidityAmm, e.LiquidityClob, e.NegRisk, e.NegRiskMarketID, e.NegRiskFeeBips,
+			e.CommentCount, e.Cyom, tagsJSON, e.SubEvents,
+		})
 	}
-
-	br := db.SendBatch(ctx, batch)
-	defer br.Close()
-
-	for i := 0; i < len(events); i++ {
-		_, err := br.Exec()
-		if err != nil {
-			return fmt.Errorf("error executing batch item %d: %w", i, err)
-		}
-	}
-	return nil
+	return db.BatchExec(ctx, pool, sql, rows)
 }
 
 // LogMarketStats prints detailed stats on the ranked/filtered markets
@@ -1448,54 +1322,25 @@ func fetchTrades(client *http.Client, conditionIDs []string) ([]*services.PlyMkt
 	return allTrades, nil
 }
 
-func upsertTrades(ctx context.Context, db *pgxpool.Pool, trades []*services.PlyMktTrade) error {
+func upsertTrades(ctx context.Context, pool *pgxpool.Pool, trades []*services.PlyMktTrade) error {
 	if len(trades) == 0 {
 		return nil
 	}
 
-	// Create table if not exists
-	createSQL := `CREATE TABLE IF NOT EXISTS trades (
-		transaction_hash TEXT PRIMARY KEY,
-		proxy_wallet     TEXT,
-		side             TEXT,
-		asset            TEXT,
-		condition_id     TEXT,
-		size             INTEGER,
-		price            INTEGER,
-		timestamp        INTEGER,
-		title            TEXT,
-		slug             TEXT,
-		icon             TEXT,
-		event_slug       TEXT,
-		outcome          TEXT,
-		outcome_index    INTEGER,
-		name             TEXT,
-		pseudonym        TEXT,
-		created_at       TIMESTAMPTZ DEFAULT NOW()
-	)`
-	if _, err := db.Exec(ctx, createSQL); err != nil {
-		return fmt.Errorf("failed to create trades table: %w", err)
-	}
-
-	batch := &pgx.Batch{}
 	sql := `INSERT INTO trades (transaction_hash, proxy_wallet, side, asset, condition_id, size, price, timestamp, title, slug, icon, event_slug, outcome, outcome_index, name, pseudonym)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
 		ON CONFLICT (transaction_hash) DO NOTHING`
 
+	rows := make([][]any, 0, len(trades))
 	for _, t := range trades {
-		batch.Queue(sql,
+		rows = append(rows, []any{
 			t.TransactionHash, t.ProxyWallet, t.Side, t.Asset, t.ConditionId,
 			t.Size, t.Price, t.Timestamp, t.Title, t.Slug, t.Icon, t.EventSlug,
 			t.Outcome, t.OutcomeIndex, t.Name, t.Pseudonym,
-		)
+		})
 	}
-
-	br := db.SendBatch(ctx, batch)
-	defer br.Close()
-	for i := 0; i < batch.Len(); i++ {
-		if _, err := br.Exec(); err != nil {
-			return fmt.Errorf("trades batch item %d error: %w", i, err)
-		}
+	if err := db.BatchExec(ctx, pool, sql, rows); err != nil {
+		return err
 	}
 	logging.Info(fmt.Sprintf("Upserted %d trades", len(trades)))
 	return nil
@@ -1577,23 +1422,9 @@ func fetchPricesHistoryConcurrent(client *http.Client, tokens []clobToken, fidel
 	return allPrices
 }
 
-func upsertPricesHistory(ctx context.Context, db *pgxpool.Pool, prices []services.PlyMktPriceHistory) error {
+func upsertPricesHistory(ctx context.Context, pool *pgxpool.Pool, prices []services.PlyMktPriceHistory) error {
 	if len(prices) == 0 {
 		return nil
-	}
-
-	// Ensure table has the right columns (idempotent migration)
-	createSQL := `CREATE TABLE IF NOT EXISTS prices_history (
-		token_id     TEXT         NOT NULL,
-		timestamp    BIGINT       NOT NULL,
-		price        DOUBLE PRECISION NOT NULL,
-		market_id    TEXT,
-		fidelity_min INTEGER,
-		updated_at   BIGINT,
-		PRIMARY KEY (token_id, timestamp)
-	)`
-	if _, err := db.Exec(ctx, createSQL); err != nil {
-		return fmt.Errorf("failed to ensure prices_history table: %w", err)
 	}
 
 	sql := `INSERT INTO prices_history (token_id, timestamp, price, market_id, fidelity_min, updated_at)
@@ -1607,19 +1438,14 @@ func upsertPricesHistory(ctx context.Context, db *pgxpool.Pool, prices []service
 		if end > len(prices) {
 			end = len(prices)
 		}
-		subBatch := &pgx.Batch{}
+		rows := make([][]any, 0, end-i)
 		for j := i; j < end; j++ {
 			p := prices[j]
-			subBatch.Queue(sql, p.TokenID, p.Timestamp, p.Price, p.MarketID, p.Fidelity, p.UpdatedAt)
+			rows = append(rows, []any{p.TokenID, p.Timestamp, p.Price, p.MarketID, p.Fidelity, p.UpdatedAt})
 		}
-		br := db.SendBatch(ctx, subBatch)
-		for k := 0; k < subBatch.Len(); k++ {
-			if _, err := br.Exec(); err != nil {
-				br.Close()
-				return fmt.Errorf("prices_history batch item %d error: %w", i+k, err)
-			}
+		if err := db.BatchExec(ctx, pool, sql, rows); err != nil {
+			return err
 		}
-		br.Close()
 	}
 
 	logging.Info(fmt.Sprintf("Upserted %d prices_history rows", len(prices)))
@@ -1749,12 +1575,11 @@ func fetchOrderbooks(client *http.Client, tokenIDs []string) ([]orderbookSnapsho
 	return allSnapshots, nil
 }
 
-func upsertOrderbookSnapshots(ctx context.Context, db *pgxpool.Pool, snapshots []orderbookSnapshot) error {
+func upsertOrderbookSnapshots(ctx context.Context, pool *pgxpool.Pool, snapshots []orderbookSnapshot) error {
 	if len(snapshots) == 0 {
 		return nil
 	}
 
-	batch := &pgx.Batch{}
 	sql := `INSERT INTO orderbook_snapshots (time, market_id, token_id, best_bid, best_ask, imbalance, total_bid_depth, total_ask_depth, depth_json, raw_response_json)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		ON CONFLICT (time, market_id, token_id) DO UPDATE SET
@@ -1766,21 +1591,17 @@ func upsertOrderbookSnapshots(ctx context.Context, db *pgxpool.Pool, snapshots [
 			depth_json = EXCLUDED.depth_json,
 			raw_response_json = EXCLUDED.raw_response_json`
 
+	rows := make([][]any, 0, len(snapshots))
 	for _, s := range snapshots {
-		batch.Queue(sql,
+		rows = append(rows, []any{
 			s.Time, s.MarketID, s.TokenID,
 			s.BestBid, s.BestAsk, s.Imbalance,
 			s.TotalBidDepth, s.TotalAskDepth,
 			s.DepthJSON, s.RawJSON,
-		)
+		})
 	}
-
-	br := db.SendBatch(ctx, batch)
-	defer br.Close()
-	for i := 0; i < batch.Len(); i++ {
-		if _, err := br.Exec(); err != nil {
-			return fmt.Errorf("orderbook_snapshots batch item %d error: %w", i, err)
-		}
+	if err := db.BatchExec(ctx, pool, sql, rows); err != nil {
+		return err
 	}
 	logging.Info(fmt.Sprintf("Upserted %d orderbook snapshots", len(snapshots)))
 	return nil
