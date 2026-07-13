@@ -30,6 +30,10 @@ func TestBatchExec_InsertAndUpsert(t *testing.T) {
 
 	id1 := fmt.Sprintf("test-batch-%d-a", time.Now().UnixNano())
 	id2 := fmt.Sprintf("test-batch-%d-b", time.Now().UnixNano())
+	ids := []string{id1, id2}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM tags WHERE id = ANY($1)`, ids)
+	})
 
 	sql := `INSERT INTO tags (id, label, slug)
 		VALUES ($1, $2, $3)
@@ -50,12 +54,9 @@ func TestBatchExec_InsertAndUpsert(t *testing.T) {
 	assert.Equal(t, "A2", label)
 
 	var count int
-	err = pool.QueryRow(ctx, `SELECT count(*) FROM tags WHERE id = ANY($1)`, []string{id1, id2}).Scan(&count)
+	err = pool.QueryRow(ctx, `SELECT count(*) FROM tags WHERE id = ANY($1)`, ids).Scan(&count)
 	require.NoError(t, err)
 	assert.Equal(t, 2, count)
-
-	// cleanup test rows
-	_, _ = pool.Exec(ctx, `DELETE FROM tags WHERE id = ANY($1)`, []string{id1, id2})
 }
 
 func TestBatchExec_MultipleStatementsSameSQL(t *testing.T) {
@@ -75,14 +76,16 @@ func TestBatchExec_MultipleStatementsSameSQL(t *testing.T) {
 		ids = append(ids, id)
 		rows = append(rows, []any{id, fmt.Sprintf("L%d", i), fmt.Sprintf("s%d", i)})
 	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM tags WHERE id = ANY($1)`, ids)
+	})
+
 	require.NoError(t, db.BatchExec(ctx, pool, sql, rows))
 
 	var count int
 	err := pool.QueryRow(ctx, `SELECT count(*) FROM tags WHERE id = ANY($1)`, ids).Scan(&count)
 	require.NoError(t, err)
 	assert.Equal(t, n, count)
-
-	_, _ = pool.Exec(ctx, `DELETE FROM tags WHERE id = ANY($1)`, ids)
 }
 
 func TestBatchExec_ItemError(t *testing.T) {
