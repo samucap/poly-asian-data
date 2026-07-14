@@ -18,7 +18,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/samucap/poly-asian-data/internal/config"
-	internaldb "github.com/samucap/poly-asian-data/internal/db"
 	"github.com/samucap/poly-asian-data/internal/services"
 	"github.com/samucap/poly-asian-data/internal/workerpool"
 )
@@ -117,40 +116,30 @@ type StatsSnapshot struct {
 // Constructor
 // =============================================================================
 
-// New creates and initializes a saver pool with a PostgreSQL connection.
-func New(ctx context.Context, logger *slog.Logger, cfg *config.Config, numWorkers, qSize int) (*Saver, error) {
-	// Initialize pgx connection pool
-	poolConfig, err := pgxpool.ParseConfig(cfg.PostgresURL)
-	if err != nil {
-		return nil, fmt.Errorf("parsing postgres config: %w", err)
+// New creates and initializes a saver pool.
+// db must be a live connection pool owned by the caller (typically pipeline.Factory).
+// The saver does not close db; call Factory.Close / caller's responsibility.
+func New(ctx context.Context, logger *slog.Logger, cfg *config.Config, db *pgxpool.Pool, numWorkers, qSize int) (*Saver, error) {
+	if db == nil {
+		return nil, fmt.Errorf("%w: db pool is required", ErrInvalidConfig)
 	}
-
-	db, err := pgxpool.NewWithConfig(ctx, poolConfig)
-	if err != nil {
-		return nil, fmt.Errorf("creating postgres pool: %w", err)
-	}
-
-	// Ensure database schema is initialized
-	if err := internaldb.InitDB(ctx, db, false); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("initializing db schema: %w", err)
+	if logger == nil {
+		return nil, fmt.Errorf("%w: logger is required", ErrInvalidConfig)
 	}
 
 	s := &Saver{
-		db:           db,
-		logger:       logger,
+		db:         db,
+		logger:     logger,
 		sportCache: make(map[string]*CachedSport),
 	}
 
 	// Pre-load cache
 	if err := s.loadSportIDs(ctx); err != nil {
-		// Log warning but continue, cache will populate as we go (or fail if strict)
 		logger.Warn("failed to pre-load sport IDs", slog.String("error", err.Error()))
 	}
 
 	pool, err := workerpool.NewPool[*Record, *Result](ctx, "saver", numWorkers, qSize, logger, s.workerTask)
 	if err != nil {
-		db.Close()
 		return nil, err
 	}
 
@@ -164,9 +153,9 @@ func New(ctx context.Context, logger *slog.Logger, cfg *config.Config, numWorker
 	return s, nil
 }
 
-// Close closes the database connection pool.
-func (s *Saver) Close() {
-	s.db.Close()
+// DB returns the underlying database pool (shared; do not close from here).
+func (s *Saver) DB() *pgxpool.Pool {
+	return s.db
 }
 
 // SaverStats returns statistics.

@@ -1,19 +1,12 @@
-// Package workerpool provides a generic, reusable worker pool implementation
-// and concurrency utilities for building data processing pipelines.
+// Package workerpool provides a generic, bounded worker pool for pipeline stages.
 //
-// The Pool[T, R] type is the core abstraction - it manages a pool of workers
-// that read from an input channel, process items using a provided function,
-// and write results to an output channel.
+// Pool[T,R] manages N workers that:
+//  1. pull jobs from a bounded input channel (fan-out)
+//  2. run processFunc
+//  3. push results to a bounded output channel (fan-in)
 //
-// Key patterns implemented:
-// - Fan-Out: Multiple workers reading from a single input channel
-// - Fan-In: All workers writing to a single output channel
-// - Bounded Parallelism: Configurable number of concurrent workers
-//
-// Security features:
-// - Race condition prevention via atomic operations
-// - Resource leak prevention with context cancellation
-// - No shared mutable state without proper locking
+// Backpressure is provided by blocking SubmitWait when the input queue is full.
+// Bridge connects an upstream Outputs() channel to a downstream SubmitWait.
 package workerpool
 
 import (
@@ -23,76 +16,47 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"github.com/google/uuid"
 )
 
 // =============================================================================
-// Error Definitions
+// Errors
 // =============================================================================
 
 var (
-	// ErrPoolStopped indicates the worker pool has been stopped.
-	ErrPoolStopped = errors.New("worker pool has been stopped")
-
-	// ErrInvalidConfig indicates invalid pool configuration.
+	ErrPoolStopped   = errors.New("worker pool has been stopped")
 	ErrInvalidConfig = errors.New("invalid worker pool configuration")
-
-	// ErrNilInput indicates a nil input was submitted.
-	ErrNilInput = errors.New("input cannot be nil")
-
-	// ErrQueueFull indicates the input queue is at capacity.
-	ErrQueueFull = errors.New("input queue is full")
+	ErrQueueFull     = errors.New("input queue is full")
 )
 
 // =============================================================================
-// Generic Worker Pool
+// Types
 // =============================================================================
+
+// Input wraps a job payload with tracking metadata.
 type Input[T any] struct {
-    // ID is a unique identifier for tracking this input
-    ID string
-    
-    // WorkerID indicates which worker is processing this input
-    WorkerID int
-    
-    // Data is the actual payload to be processed
-    Data T
-    
-    // SubmittedAt is when this input was submitted
-    SubmittedAt time.Time
+	ID          string
+	WorkerID    int
+	Data        T
+	SubmittedAt time.Time
 }
 
-// Result represents the outcome of processing an item.
+// Result is the outcome of processing one item.
 type Result[R any] struct {
-	// Value is the processed result (valid only if Err is nil).
-	Value R
-
-	// Err contains any error that occurred during processing.
-	Err error
-
-	// Duration is the time taken to process.
+	Value    R
+	Err      error
 	Duration time.Duration
 }
 
-// Stats contains atomic counters for pool statistics.
-// All fields are safe for concurrent access.
+// Stats holds atomic counters (safe for concurrent access).
 type Stats struct {
-	// Submitted is the total number of items submitted.
-	Submitted atomic.Int64
-
-	// Completed is the total number of successfully completed items.
-	Completed atomic.Int64
-
-	// Failed is the total number of failed items.
-	Failed atomic.Int64
-
-	// InProgress is the current number of items being processed.
-	InProgress atomic.Int64
-
-	// TotalDuration tracks cumulative processing time (in nanoseconds).
-	TotalDuration atomic.Int64
+	Submitted     atomic.Int64
+	Completed     atomic.Int64
+	Failed        atomic.Int64
+	InProgress    atomic.Int64
+	TotalDuration atomic.Int64 // nanoseconds
 }
 
-// Snapshot returns a point-in-time copy of the statistics.
+// Snapshot returns a point-in-time copy.
 func (s *Stats) Snapshot() StatsSnapshot {
 	return StatsSnapshot{
 		Submitted:     s.Submitted.Load(),
@@ -103,7 +67,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	}
 }
 
-// StatsSnapshot is an immutable snapshot of pool statistics.
+// StatsSnapshot is an immutable stats view.
 type StatsSnapshot struct {
 	Submitted     int64
 	Completed     int64
@@ -112,7 +76,7 @@ type StatsSnapshot struct {
 	TotalDuration time.Duration
 }
 
-// AverageDuration returns the average processing duration.
+// AverageDuration returns mean processing time for finished items.
 func (s StatsSnapshot) AverageDuration() time.Duration {
 	total := s.Completed + s.Failed
 	if total == 0 {
@@ -121,83 +85,100 @@ func (s StatsSnapshot) AverageDuration() time.Duration {
 	return s.TotalDuration / time.Duration(total)
 }
 
-// Pool is a generic worker pool for concurrent processing.
-// T is the input type, R is the result type.
-//
-// Workers read from a shared input channel (fan-out) and write results
-// to a shared output channel (fan-in).
+// Pending returns Submitted - Completed - Failed (items queued or in progress).
+func (s StatsSnapshot) Pending() int64 {
+	p := s.Submitted - s.Completed - s.Failed
+	if p < 0 {
+		return 0
+	}
+	return p
+}
+
+// Pool is a generic worker pool: T input, R result.
 type Pool[T, R any] struct {
-	PoolType    string // "fetcher", "processor", "writer"
+	Name        string
 	stats       Stats
 	logger      *slog.Logger
 	numWorkers  int
-	queueSize   int // input queue capacity
+	queueSize   int
 	InputQ      chan Input[T]
 	OutputQ     chan Result[R]
 	processFunc func(context.Context, T) (R, error)
-	// Internal synchronization
+	ownsOutput  bool
+
 	wg       sync.WaitGroup
 	ctx      context.Context
 	cancel   context.CancelFunc
 	stopped  atomic.Bool
 	stopOnce sync.Once
+	idSeq    atomic.Uint64
 }
 
-type PoolIF[T, R any] interface {
-	Outputs() chan Result[R]
-	Inputs() chan Input[T]
-	Stats() Stats
-	Stop()
-	StopNow()
-	IsRunning() bool
+// Submitter is anything that accepts jobs with backpressure.
+type Submitter[T any] interface {
 	SubmitWait(ctx context.Context, data T) error
-	Submit(ctx context.Context, data T) error
-	SubmitAndThenWait(ctx context.Context, data T) error
 }
 
-// NewPool creates a new worker pool with the given configuration.
-// The processFunc is called for each input item to produce a result.
-func NewPool[T, R any](ctx context.Context, pooltype string, numWorkers, qSize int, logger *slog.Logger, processFunc func(context.Context, T) (R, error)) (*Pool[T, R], error) {
-	return NewPoolWithOutput[T, R](ctx, pooltype, numWorkers, qSize, logger, processFunc)
-}
+// NewPool creates and starts a worker pool.
+func NewPool[T, R any](
+	ctx context.Context,
+	name string,
+	numWorkers, queueSize int,
+	logger *slog.Logger,
+	processFunc func(context.Context, T) (R, error),
+) (*Pool[T, R], error) {
+	if numWorkers <= 0 {
+		return nil, errors.Join(ErrInvalidConfig, errors.New("numWorkers must be > 0"))
+	}
+	if queueSize <= 0 {
+		return nil, errors.Join(ErrInvalidConfig, errors.New("queueSize must be > 0"))
+	}
+	if processFunc == nil {
+		return nil, errors.Join(ErrInvalidConfig, errors.New("processFunc is required"))
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if name == "" {
+		name = "pool"
+	}
 
-// NewPoolWithOutput creates a new worker pool that writes results to an external channel.
-// If output is nil, an internal output channel is created (accessible via Outputs()).
-func NewPoolWithOutput[T, R any](ctx context.Context, pooltype string, numWorkers, qSize int, logger *slog.Logger, processFunc func(context.Context, T) (R, error)) (*Pool[T, R], error) {
-	logger.Info("Initializing pool",
-		slog.String("type", pooltype),
-		slog.Int("workers", numWorkers),
-		slog.Int("queue_size", qSize),
-	)
+	logger = logger.With(slog.String("pool", name))
 	poolCtx, cancel := context.WithCancel(ctx)
+
+	// Output capacity is larger than input so workers can finish in-flight work and
+	// free input slots even when the downstream consumer is briefly slower.
+	// (Critical for cyclic pipelines: feedback re-enters an upstream stage.)
+	outSize := queueSize*2 + numWorkers
+	if outSize < queueSize {
+		outSize = queueSize
+	}
+
 	p := &Pool[T, R]{
-		PoolType:    pooltype,
+		Name:        name,
 		numWorkers:  numWorkers,
-		InputQ:      make(chan Input[T], qSize),
-		OutputQ:     make(chan Result[R], qSize),
+		queueSize:   queueSize,
+		InputQ:      make(chan Input[T], queueSize),
+		OutputQ:     make(chan Result[R], outSize),
 		processFunc: processFunc,
 		logger:      logger,
 		ctx:         poolCtx,
 		cancel:      cancel,
+		ownsOutput:  true,
 	}
 
-	// Start workers (fan-out pattern)
 	for i := 0; i < numWorkers; i++ {
 		p.wg.Add(1)
 		go p.worker(i)
 	}
 
-	logger.Info("pool started",
+	logger.Debug("pool started",
 		slog.Int("workers", numWorkers),
-		slog.Int("queue_size", qSize),
+		slog.Int("queue_size", queueSize),
 	)
-
 	return p, nil
 }
 
-// worker is a goroutine that processes input items.
-// Multiple workers read from the same input channel (fan-out).
-// All workers write to the same output channel (fan-in).
 func (p *Pool[T, R]) worker(id int) {
 	defer p.wg.Done()
 
@@ -209,7 +190,6 @@ func (p *Pool[T, R]) worker(id int) {
 			if !ok {
 				return
 			}
-			
 			input.WorkerID = id
 			p.sendResult(p.processItem(input))
 		}
@@ -217,61 +197,66 @@ func (p *Pool[T, R]) worker(id int) {
 }
 
 func (p *Pool[T, R]) sendResult(result Result[R]) {
-	p.logger.Info("sending result",
-		slog.Int64("in_progress", p.stats.InProgress.Load()),
-		slog.Int64("submitted", p.stats.Submitted.Load()),
-		slog.Int64("completed", p.stats.Completed.Load()),
-		slog.Int64("failed", p.stats.Failed.Load()),
-	)
 	select {
 	case p.OutputQ <- result:
-		return
 	case <-p.ctx.Done():
 	}
 }
 
-// processItem runs the process function on an input item.
 func (p *Pool[T, R]) processItem(input Input[T]) Result[R] {
 	p.stats.InProgress.Add(1)
 	defer p.stats.InProgress.Add(-1)
 
 	start := time.Now()
-
 	value, err := p.processFunc(p.ctx, input.Data)
-
 	duration := time.Since(start)
 	p.stats.TotalDuration.Add(int64(duration))
 
 	if err != nil {
 		p.stats.Failed.Add(1)
-		// Include value even on error - caller may have set useful data
-		return Result[R]{
-			Value:    value,
-			Err:      err,
-			Duration: duration,
-		}
+		return Result[R]{Value: value, Err: err, Duration: duration}
 	}
-
 	p.stats.Completed.Add(1)
-	return Result[R]{
-		Value:    value,
-		Duration: duration,
+	return Result[R]{Value: value, Duration: duration}
+}
+
+func (p *Pool[T, R]) makeInput(data T) Input[T] {
+	return Input[T]{
+		ID:          formatID(p.idSeq.Add(1)),
+		Data:        data,
+		SubmittedAt: time.Now(),
 	}
 }
 
-// Submit adds an input item to the pool's queue for processing.
-// Returns an error if the pool is stopped or the queue is full.
-func (p *Pool[T, R]) Submit(data T) error {
+func formatID(n uint64) string {
+	const digits = "0123456789"
+	if n == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = digits[n%10]
+		n /= 10
+	}
+	return string(buf[i:])
+}
+
+// Submit tries to enqueue without blocking. Returns ErrQueueFull if the queue is full.
+func (p *Pool[T, R]) Submit(ctx context.Context, data T) error {
 	if p.stopped.Load() {
 		return ErrPoolStopped
 	}
-
-	input := p.MakeInputObj(data)
+	input := p.makeInput(data)
 	p.stats.Submitted.Add(1)
 
 	select {
 	case p.InputQ <- input:
 		return nil
+	case <-ctx.Done():
+		p.stats.Submitted.Add(-1)
+		return ctx.Err()
 	case <-p.ctx.Done():
 		p.stats.Submitted.Add(-1)
 		return ErrPoolStopped
@@ -281,533 +266,148 @@ func (p *Pool[T, R]) Submit(data T) error {
 	}
 }
 
-// SubmitWait adds an input item, blocking until space is available.
-// Returns an error only if the pool is stopped.
-func (p *Pool[T, R]) SubmitWait(data T) error {
+// SubmitWait blocks until the job is queued or ctx/pool is cancelled.
+func (p *Pool[T, R]) SubmitWait(ctx context.Context, data T) error {
 	if p.stopped.Load() {
 		return ErrPoolStopped
 	}
-
-	input := p.MakeInputObj(data)
+	input := p.makeInput(data)
 	p.stats.Submitted.Add(1)
 
 	select {
 	case p.InputQ <- input:
 		return nil
+	case <-ctx.Done():
+		p.stats.Submitted.Add(-1)
+		return ctx.Err()
 	case <-p.ctx.Done():
 		p.stats.Submitted.Add(-1)
 		return ErrPoolStopped
 	}
 }
 
-func (p *Pool[T, R]) SubmitAndThenWait(data T) error {
-	if err := p.Submit(data); err != nil {
-		if err == ErrQueueFull {
-			return p.SubmitWait(data)
-		}
-		return err
-	}
-	return nil
-}
-
-func (p *Pool[T, R]) MakeInputObj(data T) Input[T] {
-	return Input[T]{
-		ID: uuid.New().String(),
-		Data: data,
-	}
-}
-
-// Inputs returns the input channel for direct writing.
-// Use with caution - prefer Submit/SubmitWait for proper stats tracking.
-func (p *Pool[T, R]) Inputs() chan<- Input[T] {
-	return p.InputQ
-}
-
-// Outputs returns the channel where results are published.
-// Panics if an external output channel was provided to NewPoolWithOutput.
+// Outputs returns the result channel (receive-only).
 func (p *Pool[T, R]) Outputs() <-chan Result[R] {
 	return p.OutputQ
 }
 
-// Stats returns the current statistics.
+// Stats returns a pointer to live atomic stats.
 func (p *Pool[T, R]) Stats() *Stats {
 	return &p.stats
 }
 
-// IsStopped returns true if the pool has been stopped.
+// Pending returns items submitted but not yet completed or failed.
+func (p *Pool[T, R]) Pending() int64 {
+	return p.stats.Snapshot().Pending()
+}
+
+// IsStopped reports whether the pool has been stopped.
 func (p *Pool[T, R]) IsStopped() bool {
 	return p.stopped.Load()
 }
 
-// Stop gracefully shuts down the pool.
-// It stops accepting new work, waits for in-progress work to complete,
-// then closes the output channel (if owned by this pool).
+// IsRunning is the inverse of IsStopped.
+func (p *Pool[T, R]) IsRunning() bool {
+	return !p.stopped.Load()
+}
+
+// Stop gracefully shuts down: stop accepting, close input so workers drain, wait, close output.
 func (p *Pool[T, R]) Stop() {
 	p.stopOnce.Do(func() {
 		p.stopped.Store(true)
 		close(p.InputQ)
 		p.wg.Wait()
 		p.cancel()
-
-		// Only close output channel if we created it
-		if p.OutputQ != nil {
+		if p.ownsOutput {
 			close(p.OutputQ)
 		}
-
-		stats := p.stats.Snapshot()
+		snap := p.stats.Snapshot()
 		p.logger.Info("pool stopped",
-			slog.Int64("completed", stats.Completed),
-			slog.Int64("failed", stats.Failed),
+			slog.Int64("completed", snap.Completed),
+			slog.Int64("failed", snap.Failed),
 		)
 	})
 }
 
-// StopNow immediately stops the pool, cancelling in-progress work.
+// StopNow cancels in-flight work and stops the pool.
 func (p *Pool[T, R]) StopNow() {
 	p.stopOnce.Do(func() {
 		p.stopped.Store(true)
 		p.cancel()
 		close(p.InputQ)
 		p.wg.Wait()
-
-		// Only close output channel if we created it
-		if p.OutputQ != nil {
+		if p.ownsOutput {
 			close(p.OutputQ)
 		}
 	})
 }
 
-// IsRunning returns true if the pool is currently running.
-func (p *Pool[T, R]) IsRunning() bool {
-	return p.IsStopped() == false
-}
-
 // =============================================================================
-// Fan-In / Fan-Out Utilities
+// Bridge
 // =============================================================================
 
-// FanIn merges multiple input channels into a single output channel.
-// The output channel is closed when all input channels are closed.
-func FanIn[T any](ctx context.Context, channels ...<-chan T) <-chan T {
-	out := make(chan T)
-	var wg sync.WaitGroup
-
-	multiplex := func(ch <-chan T) {
-		defer wg.Done()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case val, ok := <-ch:
-				if !ok {
-					return
-				}
-				select {
-				case out <- val:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}
-	}
-
-	wg.Add(len(channels))
-	for _, ch := range channels {
-		go multiplex(ch)
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
-}
-
-// FanOut distributes items from a single input channel to multiple output channels.
-// Items are distributed round-robin. All output channels are closed when input is closed.
-func FanOut[T any](ctx context.Context, input <-chan T, numOutputs int) []<-chan T {
-	if numOutputs <= 0 {
-		numOutputs = 1
-	}
-
-	outputs := make([]chan T, numOutputs)
-	for i := range outputs {
-		outputs[i] = make(chan T)
-	}
-
-	go func() {
-		defer func() {
-			for _, ch := range outputs {
-				close(ch)
-			}
-		}()
-
-		i := 0
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case item, ok := <-input:
-				if !ok {
-					return
-				}
-				select {
-				case outputs[i%numOutputs] <- item:
-					i++
-				case <-ctx.Done():
-					return
-				}
-			}
-		}
-	}()
-
-	result := make([]<-chan T, numOutputs)
-	for i, ch := range outputs {
-		result[i] = ch
-	}
-	return result
-}
-
-// =============================================================================
-// Pipeline Utilities
-// =============================================================================
-
-// Generator creates a channel that emits items from a slice.
-func Generator[T any](ctx context.Context, items ...T) <-chan T {
-	out := make(chan T)
-	go func() {
-		defer close(out)
-		for _, item := range items {
-			select {
-			case <-ctx.Done():
-				return
-			case out <- item:
-			}
-		}
-	}()
-	return out
-}
-
-// Map applies a transformation function to each item in the input channel.
-func Map[T, R any](ctx context.Context, input <-chan T, fn func(T) R) <-chan R {
-	out := make(chan R)
-	go func() {
-		defer close(out)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case item, ok := <-input:
-				if !ok {
-					return
-				}
-				select {
-				case out <- fn(item):
-				case <-ctx.Done():
-					return
-				}
-			}
-		}
-	}()
-	return out
-}
-
-// Filter returns a channel containing only items that pass the predicate.
-func Filter[T any](ctx context.Context, input <-chan T, predicate func(T) bool) <-chan T {
-	out := make(chan T)
-	go func() {
-		defer close(out)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case item, ok := <-input:
-				if !ok {
-					return
-				}
-				if predicate(item) {
-					select {
-					case out <- item:
-					case <-ctx.Done():
-						return
-					}
-				}
-			}
-		}
-	}()
-	return out
-}
-
-// Batch collects items into slices of the specified size.
-func Batch[T any](ctx context.Context, input <-chan T, size int) <-chan []T {
-	if size <= 0 {
-		size = 1
-	}
-
-	out := make(chan []T)
-	go func() {
-		defer close(out)
-		batch := make([]T, 0, size)
-
-		for {
-			select {
-			case <-ctx.Done():
-				if len(batch) > 0 {
-					select {
-					case out <- batch:
-					case <-ctx.Done():
-					}
-				}
-				return
-			case item, ok := <-input:
-				if !ok {
-					if len(batch) > 0 {
-						select {
-						case out <- batch:
-						case <-ctx.Done():
-						}
-					}
-					return
-				}
-				batch = append(batch, item)
-				if len(batch) >= size {
-					select {
-					case out <- batch:
-						batch = make([]T, 0, size)
-					case <-ctx.Done():
-						return
-					}
-				}
-			}
-		}
-	}()
-	return out
-}
-
-// Collect drains a channel into a slice.
-func Collect[T any](ctx context.Context, input <-chan T) []T {
-	var result []T
+// Bridge drains upstream results into dest.SubmitWait.
+// Failed results (Err != nil) are skipped (optional onErr called).
+// Blocks on SubmitWait — this is intentional backpressure.
+// Returns when upstream is closed or ctx is done.
+func Bridge[T any](
+	ctx context.Context,
+	upstream <-chan Result[T],
+	dest Submitter[T],
+	onErr func(error),
+) {
 	for {
 		select {
 		case <-ctx.Done():
-			return result
-		case item, ok := <-input:
+			return
+		case res, ok := <-upstream:
 			if !ok {
-				return result
+				return
 			}
-			result = append(result, item)
+			if res.Err != nil {
+				if onErr != nil {
+					onErr(res.Err)
+				}
+				continue
+			}
+			if err := dest.SubmitWait(ctx, res.Value); err != nil {
+				if onErr != nil {
+					onErr(err)
+				}
+				if errors.Is(err, ErrPoolStopped) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return
+				}
+			}
 		}
 	}
 }
 
-// Parallel processes items with bounded concurrency.
-func Parallel[T, R any](
+// StartBridge runs Bridge in a new goroutine.
+func StartBridge[T any](
 	ctx context.Context,
-	input <-chan T,
-	maxConcurrency int,
-	processor func(context.Context, T) (R, error),
-) <-chan Result[R] {
-	if maxConcurrency <= 0 {
-		maxConcurrency = 1
-	}
+	upstream <-chan Result[T],
+	dest Submitter[T],
+	onErr func(error),
+) {
+	go Bridge(ctx, upstream, dest, onErr)
+}
 
-	out := make(chan Result[R])
-	semaphore := make(chan struct{}, maxConcurrency)
-	var wg sync.WaitGroup
-
-	go func() {
-		defer close(out)
-
-		for {
-			select {
-			case <-ctx.Done():
-				wg.Wait()
+// Drain discards all values from ch until closed or ctx done.
+// Required so workers never block forever on a full output queue.
+func Drain[R any](ctx context.Context, ch <-chan Result[R]) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-ch:
+			if !ok {
 				return
-			case item, ok := <-input:
-				if !ok {
-					wg.Wait()
-					return
-				}
-
-				select {
-				case semaphore <- struct{}{}:
-				case <-ctx.Done():
-					wg.Wait()
-					return
-				}
-
-				wg.Add(1)
-				go func(item T) {
-					defer wg.Done()
-					defer func() { <-semaphore }()
-
-					start := time.Now()
-					value, err := processor(ctx, item)
-
-					select {
-					case out <- Result[R]{Value: value, Err: err, Duration: time.Since(start)}:
-					case <-ctx.Done():
-					}
-				}(item)
 			}
 		}
-	}()
-
-	return out
-}
-
-// =============================================================================
-// Error Aggregation
-// =============================================================================
-
-// ErrorGroup collects errors from multiple goroutines safely.
-type ErrorGroup struct {
-	mu     sync.Mutex
-	errors []error
-}
-
-// Add appends an error to the group. Nil errors are ignored.
-func (eg *ErrorGroup) Add(err error) {
-	if err == nil {
-		return
-	}
-	eg.mu.Lock()
-	eg.errors = append(eg.errors, err)
-	eg.mu.Unlock()
-}
-
-// Errors returns all collected errors.
-func (eg *ErrorGroup) Errors() []error {
-	eg.mu.Lock()
-	defer eg.mu.Unlock()
-	result := make([]error, len(eg.errors))
-	copy(result, eg.errors)
-	return result
-}
-
-// HasErrors returns true if any errors were collected.
-func (eg *ErrorGroup) HasErrors() bool {
-	eg.mu.Lock()
-	defer eg.mu.Unlock()
-	return len(eg.errors) > 0
-}
-
-// Combined returns all errors as a single error.
-func (eg *ErrorGroup) Combined() error {
-	eg.mu.Lock()
-	defer eg.mu.Unlock()
-	if len(eg.errors) == 0 {
-		return nil
-	}
-	return errors.Join(eg.errors...)
-}
-
-// Count returns the number of errors collected.
-func (eg *ErrorGroup) Count() int {
-	eg.mu.Lock()
-	defer eg.mu.Unlock()
-	return len(eg.errors)
-}
-
-// =============================================================================
-// Counter Utility
-// =============================================================================
-
-// Counter is a thread-safe counter.
-type Counter struct {
-	value atomic.Int64
-}
-
-func (c *Counter) Add(delta int64) int64 { return c.value.Add(delta) }
-func (c *Counter) Inc() int64            { return c.value.Add(1) }
-func (c *Counter) Dec() int64            { return c.value.Add(-1) }
-func (c *Counter) Load() int64           { return c.value.Load() }
-func (c *Counter) Store(val int64)       { c.value.Store(val) }
-func (c *Counter) Reset() int64          { return c.value.Swap(0) }
-
-// =============================================================================
-// Rate Limiter
-// =============================================================================
-
-// RateLimiter implements a token bucket rate limiter.
-type RateLimiter struct {
-	tokens   chan struct{}
-	interval time.Duration
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
-	stopped  atomic.Bool
-}
-
-// NewRateLimiter creates a rate limiter allowing ratePerSecond operations per second.
-func NewRateLimiter(ratePerSecond int) *RateLimiter {
-	if ratePerSecond <= 0 {
-		return nil
-	}
-
-	rl := &RateLimiter{
-		tokens:   make(chan struct{}, ratePerSecond),
-		interval: time.Second / time.Duration(ratePerSecond),
-		stopCh:   make(chan struct{}),
-	}
-
-	for i := 0; i < ratePerSecond; i++ {
-		rl.tokens <- struct{}{}
-	}
-
-	rl.wg.Add(1)
-	go func() {
-		defer rl.wg.Done()
-		ticker := time.NewTicker(rl.interval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-rl.stopCh:
-				return
-			case <-ticker.C:
-				select {
-				case rl.tokens <- struct{}{}:
-				default:
-				}
-			}
-		}
-	}()
-
-	return rl
-}
-
-// Wait blocks until a token is available or context is cancelled.
-func (rl *RateLimiter) Wait(ctx context.Context) error {
-	if rl == nil {
-		return nil
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-rl.tokens:
-		return nil
 	}
 }
 
-// TryAcquire attempts to acquire a token without blocking.
-func (rl *RateLimiter) TryAcquire() bool {
-	if rl == nil {
-		return true
-	}
-	select {
-	case <-rl.tokens:
-		return true
-	default:
-		return false
-	}
-}
-
-// Stop stops the rate limiter.
-func (rl *RateLimiter) Stop() {
-	if rl == nil || rl.stopped.Swap(true) {
-		return
-	}
-	close(rl.stopCh)
-	rl.wg.Wait()
+// StartDrain runs Drain in a new goroutine.
+func StartDrain[R any](ctx context.Context, ch <-chan Result[R]) {
+	go Drain(ctx, ch)
 }

@@ -158,13 +158,17 @@ func isSubgraphURL(url string) bool {
 // Pipeline Tests
 // =============================================================================
 
-func TestNew(t *testing.T) {
+func TestFactory_Create(t *testing.T) {
 	t.Run("creates pipeline with valid config", func(t *testing.T) {
 		cfg, cleanup := createTestConfig(t)
 		defer cleanup()
 
 		ctx := context.Background()
-		p, err := New(ctx, logging.Logger, cfg)
+		f, err := NewFactory(ctx, cfg, logging.Logger)
+		require.NoError(t, err)
+		defer f.Close()
+
+		p, err := f.Create(ctx, Options{Name: "test"})
 		require.NoError(t, err)
 		require.NotNil(t, p)
 		assert.False(t, p.IsStopped())
@@ -182,7 +186,10 @@ func TestPipeline_Stop(t *testing.T) {
 		defer cleanup()
 
 		ctx := context.Background()
-		p, err := New(ctx, logging.Logger, cfg)
+		f, err := NewFactory(ctx, cfg, logging.Logger)
+		require.NoError(t, err)
+		defer f.Close()
+		p, err := f.Create(ctx, Options{Name: "stop"})
 		require.NoError(t, err)
 
 		p.Stop()
@@ -195,7 +202,10 @@ func TestPipeline_Stop(t *testing.T) {
 		defer cleanup()
 
 		ctx := context.Background()
-		p, err := New(ctx, logging.Logger, cfg)
+		f, err := NewFactory(ctx, cfg, logging.Logger)
+		require.NoError(t, err)
+		defer f.Close()
+		p, err := f.Create(ctx, Options{Name: "stop2"})
 		require.NoError(t, err)
 
 		p.Stop()
@@ -215,7 +225,10 @@ func TestPipeline_Stats(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	p, err := New(ctx, logging.Logger, cfg)
+	f, err := NewFactory(ctx, cfg, logging.Logger)
+	require.NoError(t, err)
+	defer f.Close()
+	p, err := f.Create(ctx, Options{Name: "stats"})
 	require.NoError(t, err)
 	defer p.Stop()
 
@@ -230,12 +243,24 @@ func TestPipeline_WaitUntilIdle(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	p, err := New(ctx, logging.Logger, cfg)
+	f, err := NewFactory(ctx, cfg, logging.Logger)
+	require.NoError(t, err)
+	defer f.Close()
+	p, err := f.Create(ctx, Options{Name: "idle"})
 	require.NoError(t, err)
 	defer p.Stop()
 
-	// This test is flaky in integration environments where pool startup/shutdown timings vary.
-	t.Skip("Skipping flaky test: WaitUntilIdle times out consistently in integration environment")
+	// Empty pipeline should become idle quickly.
+	done := make(chan struct{})
+	go func() {
+		p.WaitUntilIdle(ctx, 100*time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("WaitUntilIdle did not return for empty pipeline")
+	}
 }
 
 // =============================================================================
@@ -251,13 +276,13 @@ func TestWhaleSyncNoSubgraphRequests(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	p, err := New(ctx, logging.Logger, cfg)
+	f, err := NewFactory(ctx, cfg, logging.Logger)
+	require.NoError(t, err)
+	defer f.Close()
+	p, err := f.Create(ctx, Options{Name: "whale-reqs"})
 	require.NoError(t, err)
 	defer p.StopNow()
 
-	// Validate that RunWhaleSync's ticker-based loop structure only uses
-	// discoveryTicker and liveDataTicker, not accountsTicker.
-	
 	// Test that the initial discovery requests don't include subgraph URLs
 	reqs, err := p.plyMktSvc.GetDiscoveryReqs(ctx)
 	if err != nil {
@@ -299,7 +324,10 @@ func TestWhaleSyncRunsWithoutSubgraphPhase(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	p, err := New(ctx, logging.Logger, cfg)
+	f, err := NewFactory(ctx, cfg, logging.Logger)
+	require.NoError(t, err)
+	defer f.Close()
+	p, err := f.Create(ctx, Options{Name: "whale-run"})
 	require.NoError(t, err)
 
 	// Run whale sync briefly - it should not panic or call removed methods
@@ -330,7 +358,10 @@ func TestWhaleSyncDiscoveryRequestsAreGammaAPI(t *testing.T) {
 
 	ctx := context.Background()
 
-	p, err := New(ctx, logging.Logger, cfg)
+	f, err := NewFactory(ctx, cfg, logging.Logger)
+	require.NoError(t, err)
+	defer f.Close()
+	p, err := f.Create(ctx, Options{Name: "whale-gamma"})
 	require.NoError(t, err)
 	defer p.StopNow()
 

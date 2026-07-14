@@ -16,43 +16,41 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Initialize logger
 	env := os.Getenv("ENV")
 	if env == "" {
 		env = "dev"
 	}
 	logging.Init(env)
 
-	logging.Info("Starting Poly Asian Whale Sync Pipeline...")
-
-	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {
 		logging.Error("Failed to load configuration", slog.Any("error", err))
 		os.Exit(1)
 	}
-
-	// Re-init logger with config
 	logging.Init(cfg.ENV)
+	logging.Info("Starting Poly Asian Whale Sync Pipeline...")
 
-	logging.Info("Configuration loaded", slog.String("env", cfg.ENV))
+	factory, err := pipeline.NewFactory(ctx, cfg, logging.Logger)
+	if err != nil {
+		logging.Error("Failed to create pipeline factory", slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer factory.Close()
 
-	// Graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go runWhaleSync(ctx, cfg)
-
-	<-sigChan
-	logging.Info("Shutdown signal received. Exiting...")
-	// Can call pipeline.Stop() here if we exposed the instance
-}
-
-func runWhaleSync(ctx context.Context, cfg *config.Config) {
-	pipe, err := pipeline.New(ctx, logging.Logger, cfg)
+	pipe, err := factory.Create(ctx, pipeline.Options{Name: "whale-sync"})
 	if err != nil {
 		logging.Error("Failed to create pipeline", slog.Any("error", err))
 		os.Exit(1)
 	}
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		logging.Info("Shutdown signal received")
+		cancel()
+		pipe.Stop()
+	}()
+
 	pipe.RunWhaleSync(ctx)
 }

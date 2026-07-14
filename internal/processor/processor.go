@@ -141,26 +141,6 @@ func New(ctx context.Context, cfg *config.Config, numWorkers, qSize int) (*Proce
 	return p, nil
 }
 
-// SubscribeToFetcher connects to the fetcher's output channel.
-func (p *Processor) SubscribeToFetcher(ctx context.Context, upstream <-chan workerpool.Result[*fetcher.Response]) {
-	for {
-		select {
-		case result, ok := <-upstream:
-			if !ok {
-				return
-			}
-			if result.Err != nil {
-				p.logger.Warn("skipping failed fetch result",
-					slog.String("error", result.Err.Error()))
-				continue
-			}
-			_ = p.SubmitWait(result.Value)
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
 // =============================================================================
 // Worker Task - Type Dispatch
 // =============================================================================
