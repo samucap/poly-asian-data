@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -13,11 +14,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/samucap/poly-asian-data/internal/config"
+	"github.com/samucap/poly-asian-data/internal/db"
 	"github.com/samucap/poly-asian-data/internal/services"
 	"github.com/samucap/poly-asian-data/internal/workerpool"
 )
@@ -56,7 +57,7 @@ var (
 		"soccer", "cricket", "rugby", "golf", "ufc", "formula1", "chess",
 		"boxing", "pickleball",
 	}
-	
+
 	leagueDefaults = map[string]string{
 		"acn": "soccer", "bl2": "soccer", "scop": "soccer", "fr2": "soccer", "itsb": "soccer",
 		"nba": "basketball", "wnba": "basketball", "ncaab": "basketball", "cbb": "basketball",
@@ -138,14 +139,15 @@ func New(ctx context.Context, logger *slog.Logger, cfg *config.Config, db *pgxpo
 		logger.Warn("failed to pre-load sport IDs", slog.String("error", err.Error()))
 	}
 
-	pool, err := workerpool.NewPool[*Record, *Result](ctx, "saver", numWorkers, qSize, logger, s.workerTask)
+	// Terminal stage: process still updates pool + saver stats; no OutputQ consumer/Drain.
+	pool, err := workerpool.NewPool(ctx, "saver", numWorkers, qSize, logger, s.workerTask, workerpool.WithDiscardOutput())
 	if err != nil {
 		return nil, err
 	}
 
 	s.Pool = pool
 
-	logger.Info("saver initialized",
+	logger.Debug("saver initialized",
 		slog.Int("workers", numWorkers),
 		slog.Int("queue_size", qSize),
 	)
@@ -173,9 +175,9 @@ func (s *Saver) loadSportIDs(ctx context.Context) error {
 
 	s.cacheMu.Lock()
 	defer s.cacheMu.Unlock()
-    
-    // Reset cache
-    s.sportCache = make(map[string]*CachedSport)
+
+	// Reset cache
+	s.sportCache = make(map[string]*CachedSport)
 	for rows.Next() {
 		var slug, id string
 		var primaryTagID *string
@@ -184,12 +186,12 @@ func (s *Saver) loadSportIDs(ctx context.Context) error {
 			// Assuming schema matches.
 			return err
 		}
-		
+
 		if _, ok := s.sportCache[slug]; ok {
 			s.logger.Warn("duplicate sport slug", slog.String("slug", slug))
 		}
 		s.sportCache[slug] = &CachedSport{
-			UUID: id,
+			UUID:         id,
 			PrimaryTagID: primaryTagID,
 		}
 	}
@@ -223,58 +225,58 @@ func (s *Saver) setSportID(slug, id string, primaryTagID *string) {
 
 // findSportForLeague attempts to resolve the Sport Slug for a league
 func (s *Saver) findSportForLeague(l *services.PlyMktSport) string {
-    s.cacheMu.RLock()
-    defer s.cacheMu.RUnlock()
+	s.cacheMu.RLock()
+	defer s.cacheMu.RUnlock()
 
-    // 1. Check direct defaults
-    key := strings.ToLower(l.Sport) // l.Sport is effectively the league 'slug' or 'key' often
-    if val, ok := leagueDefaults[key]; ok {
-        return val
-    }
-    
-    // 2. Check Tags (matches Sport Primary Tag ID)
-    tagIDs := strings.Split(l.Tags, ",")
-    for _, tagID := range tagIDs {
-        tagID = strings.TrimSpace(tagID)
-        for slug, sport := range s.sportCache {
-            if sport.PrimaryTagID != nil && *sport.PrimaryTagID == tagID {
-                return slug
-            }
-        }
-    }
-    
-    // 3. Check Resolution string for Slug
-    for slug := range s.sportCache {
-        // Simple case insensitive check? Original logic was `strings.Contains(l.Resolution, cat.Tag.Slug)`
-        // cat.Tag.Slug == slug (mostly)
-        if strings.Contains(l.Resolution, slug) {
-            return slug
-        }
-    }
-    
-    // 4. Default Slug match
-    if val, ok := leagueDefaults[l.Sport]; ok { // l.Sport again
-         return val
-    }
+	// 1. Check direct defaults
+	key := strings.ToLower(l.Sport) // l.Sport is effectively the league 'slug' or 'key' often
+	if val, ok := leagueDefaults[key]; ok {
+		return val
+	}
 
-    return ""
+	// 2. Check Tags (matches Sport Primary Tag ID)
+	tagIDs := strings.Split(l.Tags, ",")
+	for _, tagID := range tagIDs {
+		tagID = strings.TrimSpace(tagID)
+		for slug, sport := range s.sportCache {
+			if sport.PrimaryTagID != nil && *sport.PrimaryTagID == tagID {
+				return slug
+			}
+		}
+	}
+
+	// 3. Check Resolution string for Slug
+	for slug := range s.sportCache {
+		// Simple case insensitive check? Original logic was `strings.Contains(l.Resolution, cat.Tag.Slug)`
+		// cat.Tag.Slug == slug (mostly)
+		if strings.Contains(l.Resolution, slug) {
+			return slug
+		}
+	}
+
+	// 4. Default Slug match
+	if val, ok := leagueDefaults[l.Sport]; ok { // l.Sport again
+		return val
+	}
+
+	return ""
 }
 
 // findSportForTeam attempts to resolve Sport Slug for a team
 func (s *Saver) findSportForTeam(t *services.PlyMktTeam) string {
-    s.cacheMu.RLock()
-    defer s.cacheMu.RUnlock()
-    
-    // 1. Check League in defaults
-    if val, ok := leagueDefaults[t.League]; ok {
-        return val
-    }
-    
-    // 2. Check if League is in any Sport's list of Leagues (Saver doesn't track this easily without huge state)
-    // But we can check if t.League matches any known Sport-linked logic?
-    // Simplified: relying on defaults mainly. 
-    
-    return ""
+	s.cacheMu.RLock()
+	defer s.cacheMu.RUnlock()
+
+	// 1. Check League in defaults
+	if val, ok := leagueDefaults[t.League]; ok {
+		return val
+	}
+
+	// 2. Check if League is in any Sport's list of Leagues (Saver doesn't track this easily without huge state)
+	// But we can check if t.League matches any known Sport-linked logic?
+	// Simplified: relying on defaults mainly.
+
+	return ""
 }
 
 // =============================================================================
@@ -283,8 +285,10 @@ func (s *Saver) findSportForTeam(t *services.PlyMktTeam) string {
 
 func (s *Saver) workerTask(ctx context.Context, record *Record) (*Result, error) {
 	start := time.Now()
+	// Job-level counters (one SubmitSave → one submitted; success/fail for rate).
+	s.stats.RecordsSubmitted.Add(1)
 
-	s.logger.Info("saving record",
+	s.logger.Debug("saving record",
 		slog.String("table", record.TableName),
 		slog.Int("itemCount", record.ItemCount),
 	)
@@ -315,6 +319,12 @@ func (s *Saver) workerTask(ctx context.Context, record *Record) (*Result, error)
 		rowsAffected, err = s.batchInsertAccounts(ctx, record.Data)
 	case "prices_history":
 		rowsAffected, err = s.batchInsertPricesHistory(ctx, record.Data)
+	case "trades":
+		rowsAffected, err = s.batchInsertTrades(ctx, record.Data)
+	case "orderbook_snapshots":
+		rowsAffected, err = s.batchInsertOrderbookSnapshots(ctx, record.Data)
+	case "plymkt_markets_oi":
+		rowsAffected, err = s.batchUpdateMarketsOI(ctx, record.Data)
 	case "accounts_increment":
 		rowsAffected, err = s.batchIncrementAccounts(ctx, record.Data)
 	case "position_snapshots":
@@ -345,11 +355,13 @@ func (s *Saver) workerTask(ctx context.Context, record *Record) (*Result, error)
 	}
 
 	duration := time.Since(start)
-	s.stats.RecordsSaved.Add(int64(record.ItemCount))
+	// Count successful jobs (not ItemCount) so success rates match submitted/failed.
+	// Row volume lives in RowsAffected.
+	s.stats.RecordsSaved.Add(1)
 	s.stats.RowsAffected.Add(rowsAffected)
 	s.stats.TotalDuration.Add(int64(duration))
 
-	s.logger.Info("saved record",
+	s.logger.Debug("saved record",
 		slog.String("table", record.TableName),
 		slog.Int64("rowsAffected", rowsAffected),
 		slog.Duration("duration", duration),
@@ -370,20 +382,110 @@ func (s *Saver) batchInsertPricesHistory(ctx context.Context, data any) (int64, 
 		return 0, fmt.Errorf("invalid data type for prices_history: got %T", data)
 	}
 
-	batch := &pgx.Batch{}
+	sql := `INSERT INTO prices_history (token_id, timestamp, price, market_id, fidelity_min, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (token_id, timestamp) DO UPDATE SET 
+			price = EXCLUDED.price, 
+			updated_at = EXCLUDED.updated_at`
+
+	rows := make([][]any, 0, len(items))
 	for _, item := range items {
-		// Convert timestamp from int64 (unix seconds) to time.Time
-		ts := time.Unix(item.Timestamp, 0)
-		
-		batch.Queue(`
-			INSERT INTO prices_history (timestamp, token_id, price)
-			VALUES ($1, $2, $3)
-			ON CONFLICT (token_id, timestamp) DO NOTHING
-		`, ts, item.TokenID, item.Price)
+		rows = append(rows, []any{
+			item.TokenID,
+			item.Timestamp,
+			item.Price,
+			item.MarketID,
+			item.Fidelity,
+			item.UpdatedAt,
+		})
 	}
 
-	rows, _, err := s.execBatch(ctx, batch, len(items))
-	return rows, err
+	if err := db.BatchExec(ctx, s.db, sql, rows); err != nil {
+		return 0, err
+	}
+	return int64(len(items)), nil
+}
+
+func (s *Saver) batchInsertTrades(ctx context.Context, data any) (int64, error) {
+	items, ok := data.([]services.PlyMktTrade)
+	if !ok {
+		return 0, fmt.Errorf("invalid data type for trades: got %T", data)
+	}
+
+	sql := `INSERT INTO trades (
+			transaction_hash, proxy_wallet, side, asset, condition_id, 
+			size, price, timestamp, title, slug, icon, event_slug, 
+			outcome, outcome_index, name, pseudonym
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		ON CONFLICT (transaction_hash) DO NOTHING`
+
+	rows := make([][]any, 0, len(items))
+	for _, t := range items {
+		rows = append(rows, []any{
+			t.TransactionHash, t.ProxyWallet, t.Side, t.Asset, t.ConditionId,
+			t.Size, t.Price, t.Timestamp, t.Title, t.Slug, t.Icon, t.EventSlug,
+			t.Outcome, t.OutcomeIndex, t.Name, t.Pseudonym,
+		})
+	}
+
+	if err := db.BatchExec(ctx, s.db, sql, rows); err != nil {
+		return 0, err
+	}
+	return int64(len(items)), nil
+}
+
+func (s *Saver) batchInsertOrderbookSnapshots(ctx context.Context, data any) (int64, error) {
+	items, ok := data.([]services.PlyMktOrderbookSnapshot)
+	if !ok {
+		return 0, fmt.Errorf("invalid data type for orderbook_snapshots: got %T", data)
+	}
+
+	sql := `INSERT INTO orderbook_snapshots (
+			time, market_id, token_id, best_bid, best_ask, imbalance, 
+			total_bid_depth, total_ask_depth, depth_json, raw_response_json
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		ON CONFLICT (time, market_id, token_id) DO UPDATE SET
+			best_bid = EXCLUDED.best_bid,
+			best_ask = EXCLUDED.best_ask,
+			imbalance = EXCLUDED.imbalance,
+			total_bid_depth = EXCLUDED.total_bid_depth,
+			total_ask_depth = EXCLUDED.total_ask_depth,
+			depth_json = EXCLUDED.depth_json,
+			raw_response_json = EXCLUDED.raw_response_json`
+
+	rows := make([][]any, 0, len(items))
+	for _, item := range items {
+		rows = append(rows, []any{
+			item.Time, item.MarketID, item.TokenID,
+			item.BestBid, item.BestAsk, item.Imbalance,
+			item.TotalBidDepth, item.TotalAskDepth,
+			item.DepthJSON, item.RawJSON,
+		})
+	}
+
+	if err := db.BatchExec(ctx, s.db, sql, rows); err != nil {
+		return 0, err
+	}
+	return int64(len(items)), nil
+}
+
+func (s *Saver) batchUpdateMarketsOI(ctx context.Context, data any) (int64, error) {
+	items, ok := data.([]services.PlyMktMarketOI)
+	if !ok {
+		return 0, fmt.Errorf("invalid data type for plymkt_markets_oi: got %T", data)
+	}
+
+	sql := `UPDATE plymkt_markets SET oi = $2 WHERE condition_id = $1`
+
+	rows := make([][]any, 0, len(items))
+	for _, item := range items {
+		rows = append(rows, []any{item.Market, item.Value})
+	}
+
+	if err := db.BatchExec(ctx, s.db, sql, rows); err != nil {
+		return 0, err
+	}
+	return int64(len(items)), nil
 }
 
 // GetActiveTokenIDs fetches token IDs for active markets/whales to prioritize for price history.
@@ -414,9 +516,9 @@ func (s *Saver) GetActiveTokenIDs(ctx context.Context) ([]string, error) {
 		if err := json.Unmarshal([]byte(idsVal), &ids); err == nil {
 			tokenIDs = append(tokenIDs, ids...)
 		} else {
-             // Fallback if not JSON
-             tokenIDs = append(tokenIDs, idsVal)
-        }
+			// Fallback if not JSON
+			tokenIDs = append(tokenIDs, idsVal)
+		}
 	}
 	return tokenIDs, nil
 }
@@ -426,7 +528,7 @@ func (s *Saver) GetActiveMarketIDs(ctx context.Context, limit int) ([]string, er
 	if limit <= 0 {
 		limit = 100
 	}
-	
+
 	// Select condition_id (Hex) instead of id (Numeric Asset ID)
 	rows, err := s.db.Query(ctx, `
 		SELECT condition_id FROM plymkt_markets 
@@ -456,7 +558,7 @@ func (s *Saver) GetWhaleIDs(ctx context.Context, limit int) ([]string, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	
+
 	rows, err := s.db.Query(ctx, `
 		SELECT id FROM accounts 
 		WHERE collateral_volume IS NOT NULL AND collateral_volume != '' AND collateral_volume != '0'
@@ -483,17 +585,17 @@ func (s *Saver) GetWhaleIDs(ctx context.Context, limit int) ([]string, error) {
 // GetLastAccountID fetches the lexically last account ID currently in the DB.
 // Used for resumable syncing.
 func (s *Saver) GetLastAccountID(ctx context.Context) (string, error) {
-    var id string
-    // accounts are sorted by ID in the subgraph query.
-    // So we just need the max ID we have.
-    err := s.db.QueryRow(ctx, "SELECT id FROM accounts ORDER BY id DESC LIMIT 1").Scan(&id)
-    if err != nil {
-        if errors.Is(err, pgx.ErrNoRows) {
-            return "", nil
-        }
-        return "", err
-    }
-    return id, nil
+	var id string
+	// accounts are sorted by ID in the subgraph query.
+	// So we just need the max ID we have.
+	err := s.db.QueryRow(ctx, "SELECT id FROM accounts ORDER BY id DESC LIMIT 1").Scan(&id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return id, nil
 }
 
 // =============================================================================
@@ -504,8 +606,8 @@ func (s *Saver) GetLastAccountID(ctx context.Context) (string, error) {
 // Returns empty string if no cursor exists (first sync).
 func (s *Saver) GetSyncCursor(ctx context.Context, syncType string) (string, error) {
 	var cursor *string
-	err := s.db.QueryRow(ctx, 
-		"SELECT last_cursor FROM sync_state WHERE sync_type = $1", 
+	err := s.db.QueryRow(ctx,
+		"SELECT last_cursor FROM sync_state WHERE sync_type = $1",
 		syncType,
 	).Scan(&cursor)
 	if err != nil {
@@ -679,7 +781,14 @@ func (s *Saver) batchInsertMarkets(ctx context.Context, data any) (int64, error)
 
 	batch := &pgx.Batch{}
 	for _, m := range markets {
-		// Only upsert fields present in schema.sql. 
+		// fee is DOUBLE PRECISION in schema; API often sends "" — use NULL instead of empty string.
+		var feeVal any
+		if m.Fee != "" {
+			if f, err := strconv.ParseFloat(m.Fee, 64); err == nil {
+				feeVal = f
+			}
+		}
+		// Only upsert fields present in schema.sql.
 		// Note: schema has NUMERIC for float64 fields. PGX handles float64 -> numeric mapping well usually.
 		batch.Queue(`
 			INSERT INTO plymkt_markets (
@@ -699,14 +808,14 @@ func (s *Saver) batchInsertMarkets(ctx context.Context, data any) (int64, error)
 				one_week_price_change, one_month_price_change, one_year_price_change, 
 				last_trade_price, best_bid, best_ask, automatically_active, clear_book_on_start, 
 				manual_activation, neg_risk_other, game_id, sports_market_type, 
-				pending_deployment, deploying, rfq_enabled, event_start_time
+				pending_deployment, deploying, rfq_enabled, event_start_time, oi
 			) VALUES (
 				$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 
 				$18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, 
 				$33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, 
 				$48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, 
 				$63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, 
-				$78, $79, $80, $81, $82, $83, $84, $85
+				$78, $79, $80, $81, $82, $83, $84, $85, $86
 			)
 			ON CONFLICT (id) DO UPDATE SET
 				question = EXCLUDED.question,
@@ -790,10 +899,11 @@ func (s *Saver) batchInsertMarkets(ctx context.Context, data any) (int64, error)
 				pending_deployment = EXCLUDED.pending_deployment,
 				deploying = EXCLUDED.deploying,
 				rfq_enabled = EXCLUDED.rfq_enabled,
-				event_start_time = EXCLUDED.event_start_time
+				event_start_time = EXCLUDED.event_start_time,
+				oi = COALESCE(EXCLUDED.oi, plymkt_markets.oi)
 		`,
 			m.ID, m.Question, m.ConditionID, m.Slug, m.ResolutionSource, m.EndDate,
-			m.Category, m.Liquidity, m.SponsorName, m.StartDate, m.Fee, m.Image, m.Icon,
+			m.Category, m.Liquidity, m.SponsorName, m.StartDate, feeVal, m.Image, m.Icon,
 			m.Description, m.Volume, m.Active, m.MarketType, m.Closed, m.CreatedBy, m.UpdatedBy,
 			m.CreatedAt, m.UpdatedAt, m.WideFormat, m.New, m.Featured, m.Archived, m.Restricted,
 			m.QuestionID, m.EnableOrderBook, m.OrderPriceMinTickSize, m.OrderMinSize,
@@ -809,10 +919,11 @@ func (s *Saver) batchInsertMarkets(ctx context.Context, data any) (int64, error)
 			m.LastTradePrice, m.BestBid, m.BestAsk, m.AutomaticallyActive, m.ClearBookOnStart,
 			m.ManualActivation, m.NegRiskOther, m.GameID, m.SportsMarketType,
 			m.PendingDeployment, m.Deploying, m.RfqEnabled, m.EventStartTime,
+			m.OpenInterest,
 		)
 	}
 
-// ... (inside batchInsertMarkets)
+	// ... (inside batchInsertMarkets)
 	rowsAffected, failIdx, err := s.execBatch(ctx, batch, len(markets))
 	if err != nil {
 		if failIdx != -1 && failIdx < len(markets) {
@@ -837,7 +948,7 @@ func (s *Saver) batchInsertSports(ctx context.Context, data any) (int64, error) 
 	// The Processor needs to send this. Let's assume it sends `[]*services.PlyMktSportCategory` (we need to define this if not exists)
 	// Or we reuse `PlyMktSport` but that's for 'leagues'.
 	// Let's use `services.PlyMktSportCategory`.
-	
+
 	sports, ok := data.([]services.PlyMktSportCategory)
 	if !ok {
 		return 0, fmt.Errorf("invalid data type for sports: got %T", data)
@@ -871,7 +982,7 @@ func (s *Saver) batchInsertSports(ctx context.Context, data any) (int64, error) 
 
 	// EXECUTE and Capture IDs
 	results := s.db.SendBatch(ctx, batch)
-	
+
 	// We must defer cache updates until AFTER the batch is fully processed (and implicitly committed).
 	// Otherwise, concurrent workers might try to use the ID before it's visible in DB.
 	type update struct {
@@ -897,12 +1008,12 @@ func (s *Saver) batchInsertSports(ctx context.Context, data any) (int64, error) 
 			results.Close() // Close before return ensuring tx rollback/cleanup
 			return totalAffected, fmt.Errorf("sport upsert at index %d: %w", i, err)
 		}
-        
-        var primaryTagID *string
-        if sports[i].PrimaryTagID != "" {
-            pid := sports[i].PrimaryTagID
-            primaryTagID = &pid
-        }
+
+		var primaryTagID *string
+		if sports[i].PrimaryTagID != "" {
+			pid := sports[i].PrimaryTagID
+			primaryTagID = &pid
+		}
 		updates = append(updates, update{slug, id, primaryTagID})
 		totalAffected++
 	}
@@ -975,7 +1086,7 @@ func (s *Saver) batchInsertTagsSportLink(ctx context.Context, data any) (int64, 
 			// Ideally we want to link it. If missing, maybe retry or skip.
 			// For now, allow null to ensure ID exists, but update won't do much.
 			// Actually, if we can't resolve sport, it's useless for "SportLink".
-			s.logger.Debug("skipping tag sport link - sport unresolved", 
+			s.logger.Debug("skipping tag sport link - sport unresolved",
 				slog.String("tag_id", t.ID),
 				slog.String("sport_slug", t.SportSlug))
 			continue
@@ -1056,11 +1167,11 @@ func (s *Saver) batchInsertLeagues(ctx context.Context, data any) (int64, error)
 
 	batch := &pgx.Batch{}
 	for _, l := range leagues {
-        // Try resolving sport slug if missing
-        if l.SportSlug == "" {
-            l.SportSlug = s.findSportForLeague(&l)
-        }
-    
+		// Try resolving sport slug if missing
+		if l.SportSlug == "" {
+			l.SportSlug = s.findSportForLeague(&l)
+		}
+
 		// Resolve SportID
 		var sportID *string
 		if l.SportSlug != "" {
@@ -1082,7 +1193,7 @@ func (s *Saver) batchInsertLeagues(ctx context.Context, data any) (int64, error)
 		`, l.Sport, l.Image, l.Resolution, l.Ordering, l.Tags, l.Series, sportID)
 	}
 
-// ... (inside batchInsertLeagues)
+	// ... (inside batchInsertLeagues)
 	rowsAffected, failIdx, err := s.execBatch(ctx, batch, len(leagues))
 	if err != nil {
 		if failIdx != -1 && failIdx < len(leagues) {
@@ -1105,11 +1216,11 @@ func (s *Saver) batchInsertTeams(ctx context.Context, data any) (int64, error) {
 
 	batch := &pgx.Batch{}
 	for _, t := range teams {
-         // Try resolving sport slug if missing
-        if t.SportSlug == "" {
-            t.SportSlug = s.findSportForTeam(&t)
-        }
-        
+		// Try resolving sport slug if missing
+		if t.SportSlug == "" {
+			t.SportSlug = s.findSportForTeam(&t)
+		}
+
 		// Resolve SportID
 		var sportID *string
 		if t.SportSlug != "" {
@@ -1134,7 +1245,7 @@ func (s *Saver) batchInsertTeams(ctx context.Context, data any) (int64, error) {
 		`, t.ID, t.Name, t.League, t.Record, t.Logo, t.Abbreviation, t.Alias, t.ProviderID, t.Color, sportID)
 	}
 
-// ... (inside batchInsertTeams)
+	// ... (inside batchInsertTeams)
 	rowsAffected, failIdx, err := s.execBatch(ctx, batch, len(teams))
 	if err != nil {
 		if failIdx != -1 && failIdx < len(teams) {
@@ -1208,7 +1319,7 @@ func (s *Saver) batchInsertLeagueHierarchy(ctx context.Context, data any) (int64
 		for i := 0; i < len(cleaned); i++ {
 			tagID := cleaned[i]
 			var parentID *string
-			
+
 			// Chain parent to the previous tag in the list
 			if i > 0 {
 				pid := cleaned[i-1]
@@ -1301,11 +1412,11 @@ func (s *Saver) batchInsertAccounts(ctx context.Context, data any) (int64, error
 
 	batch := &pgx.Batch{}
 	for _, item := range items {
-        // Convert Timestamps
-        creationTS := s.parseUnixTimestamp(item.CreationTimestamp)
-        lastSeenTS := s.parseUnixTimestamp(item.LastSeenTimestamp)
-        lastTradedTS := s.parseUnixTimestamp(item.LastTradedTimestamp)
-        
+		// Convert Timestamps
+		creationTS := s.parseUnixTimestamp(item.CreationTimestamp)
+		lastSeenTS := s.parseUnixTimestamp(item.LastSeenTimestamp)
+		lastTradedTS := s.parseUnixTimestamp(item.LastTradedTimestamp)
+
 		batch.Queue(`
 			INSERT INTO accounts (id, creation_timestamp, last_seen_timestamp, last_traded_timestamp, collateral_volume, num_trades, profit, scaled_collateral_volume, scaled_profit, updated_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
@@ -1342,20 +1453,20 @@ func (s *Saver) batchInsertAccounts(ctx context.Context, data any) (int64, error
 // parseUnixTimestamp converts a unix timestamp string (seconds) to *time.Time.
 // Returns nil if string is empty or invalid.
 func (s *Saver) parseUnixTimestamp(tsStr string) *time.Time {
-    if tsStr == "" || tsStr == "0" {
-        return nil
-    }
-    // Subgraph often returns numeric strings "1600..."
-    // Sometimes it might return "0" for null
-    val, err := strconv.ParseInt(tsStr, 10, 64)
-    if err != nil {
-        return nil
-    }
-    if val == 0 {
-        return nil
-    }
-    t := time.Unix(val, 0)
-    return &t
+	if tsStr == "" || tsStr == "0" {
+		return nil
+	}
+	// Subgraph often returns numeric strings "1600..."
+	// Sometimes it might return "0" for null
+	val, err := strconv.ParseInt(tsStr, 10, 64)
+	if err != nil {
+		return nil
+	}
+	if val == 0 {
+		return nil
+	}
+	t := time.Unix(val, 0)
+	return &t
 }
 
 // batchIncrementAccounts increments account statistics (collateral_volume, num_trades).
@@ -1365,17 +1476,17 @@ func (s *Saver) batchIncrementAccounts(ctx context.Context, data any) (int64, er
 		return 0, fmt.Errorf("invalid data type for accounts_increment: got %T", data)
 	}
 
-    // Sort by ID to prevent deadlocks from inconsistent lock ordering
-    sort.Slice(items, func(i, j int) bool {
-        return items[i].ID < items[j].ID
-    })
+	// Sort by ID to prevent deadlocks from inconsistent lock ordering
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].ID < items[j].ID
+	})
 
 	batch := &pgx.Batch{}
 	for _, item := range items {
 		// Parse numeric values from string fields
 		vol, _ := strconv.ParseFloat(item.CollateralVolume, 64)
 		trades, _ := strconv.ParseInt(item.NumTrades, 10, 64)
-		
+
 		// Convert to timestamptz using helper
 		ts := s.parseUnixTimestamp(item.LastTradedTimestamp)
 
@@ -1405,7 +1516,7 @@ func (s *Saver) batchInsertOrderFilledEvents(ctx context.Context, data any) (int
 
 	batch := &pgx.Batch{}
 	for _, item := range items {
-        ts := s.parseUnixTimestamp(item.Timestamp)
+		ts := s.parseUnixTimestamp(item.Timestamp)
 		batch.Queue(`
 			INSERT INTO order_filled_events (id, maker_asset_id, taker_asset_id, maker_amount_filled, taker_amount_filled, maker_id, taker_id, fee, timestamp, transaction_hash, created_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
@@ -1440,7 +1551,7 @@ func (s *Saver) batchInsertEnrichedOrderFilledEvents(ctx context.Context, data a
 
 	batch := &pgx.Batch{}
 	for _, item := range items {
-        ts := s.parseUnixTimestamp(item.Timestamp)
+		ts := s.parseUnixTimestamp(item.Timestamp)
 		batch.Queue(`
 			INSERT INTO enriched_order_filled_events (id, price, side, size, maker_id, taker_id, market_id, timestamp, created_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
@@ -1457,13 +1568,16 @@ func (s *Saver) batchInsertEnrichedOrderFilledEvents(ctx context.Context, data a
 		)
 	}
 
-	fmt.Printf("DEBUG: Saving %d enriched order filled events\n", len(items))
+	s.logger.Debug("saving enriched order filled events", slog.Int("count", len(items)))
 	totalAffected, failIdx, err := s.execBatch(ctx, batch, len(items))
 	if err != nil {
-		fmt.Printf("DEBUG: Failed to save enriched order filled events: %v\n", err)
 		if failIdx != -1 && failIdx < len(items) {
-			fmt.Printf("DEBUG: Failed item ID: %s\n", items[failIdx].ID)
-			s.logger.Error("failed to save enriched_order_filled_event", "id", items[failIdx].ID, "error", err)
+			s.logger.Error("failed to save enriched_order_filled_event",
+				slog.String("id", items[failIdx].ID),
+				slog.Any("error", err),
+			)
+		} else {
+			s.logger.Error("failed to save enriched_order_filled_events", slog.Any("error", err))
 		}
 	}
 	return totalAffected, err
@@ -1492,7 +1606,7 @@ func (s *Saver) batchInsertPositionSnapshots(ctx context.Context, data any) (int
 		Quantity float64
 		Value    float64
 	})
-	
+
 	// Query for latest snapshot per account+market
 	rows, err := s.db.Query(ctx, `
 		SELECT DISTINCT ON (account_id, market_id)
@@ -1505,7 +1619,7 @@ func (s *Saver) batchInsertPositionSnapshots(ctx context.Context, data any) (int
 		return 0, fmt.Errorf("failed to query latest positions: %w", err)
 	}
 	defer rows.Close()
-	
+
 	for rows.Next() {
 		var accID, mktID string
 		var qty, val float64
@@ -1520,25 +1634,25 @@ func (s *Saver) batchInsertPositionSnapshots(ctx context.Context, data any) (int
 	// Step 3: Insert new snapshots with computed deltas
 	batch := &pgx.Batch{}
 	now := time.Now()
-	
+
 	for _, item := range items {
 		key := posKey{AccountID: item.User, MarketID: item.TokenID}
-		
+
 		// Parse current values
 		qty, _ := strconv.ParseFloat(item.Amount, 64)
-        // Value might be 0 if not returned by subgraph, use RealizedPnl? 
-        // Or if simple quantity tracking, value is less important or need price.
-        // For now, let's use 0 if NetValue is missing or try to derive.
-        // Queries return realizedPnl/avgPrice/totalBought. 
-        // Current Value ~= amount * current_price (not available here)
-        // OR avgPrice * amount? That's cost basis.
-        // Let's rely on Amount (qty) mostly.
+		// Value might be 0 if not returned by subgraph, use RealizedPnl?
+		// Or if simple quantity tracking, value is less important or need price.
+		// For now, let's use 0 if NetValue is missing or try to derive.
+		// Queries return realizedPnl/avgPrice/totalBought.
+		// Current Value ~= amount * current_price (not available here)
+		// OR avgPrice * amount? That's cost basis.
+		// Let's rely on Amount (qty) mostly.
 		val := 0.0 // Placeholder as netValue is not in query
-		
-        // OutcomeIndex is not in query anymore, default to 0 or parse from TokenID if possible?
-        // Using 0 for now as it's often not critical for whale flow unless split.
+
+		// OutcomeIndex is not in query anymore, default to 0 or parse from TokenID if possible?
+		// Using 0 for now as it's often not critical for whale flow unless split.
 		outcomeIdx := 0
-		
+
 		// Compute deltas
 		deltaQty := qty
 		deltaVal := val
@@ -1546,7 +1660,7 @@ func (s *Saver) batchInsertPositionSnapshots(ctx context.Context, data any) (int
 			deltaQty = qty - prev.Quantity
 			deltaVal = val - prev.Value
 		}
-		
+
 		// Only insert if there's a meaningful change (or first snapshot)
 		if deltaQty == 0 && deltaVal == 0 {
 			continue
@@ -1597,7 +1711,7 @@ func (s *Saver) extractMarketIDs(keys []posKey) []string {
 // batchInsertOrderbooks inserts orderbook snapshots.
 func (s *Saver) batchInsertOrderbooks(ctx context.Context, data any) (int64, error) {
 	var items []services.PlyMktOrderbook
-	
+
 	switch v := data.(type) {
 	case []services.PlyMktOrderbook:
 		items = v
@@ -1613,12 +1727,12 @@ func (s *Saver) batchInsertOrderbooks(ctx context.Context, data any) (int64, err
 
 	batch := &pgx.Batch{}
 	now := time.Now()
-	
+
 	for _, item := range items {
 		// Marshal bids and asks to JSONB
 		bidsJSON, _ := json.Marshal(item.Bids)
 		asksJSON, _ := json.Marshal(item.Asks)
-		
+
 		batch.Queue(`
 			INSERT INTO orderbooks (timestamp, token_id, bids, asks, spread)
 			VALUES ($1, $2, $3, $4, $5)
@@ -1667,7 +1781,7 @@ func (s *Saver) batchInsertUsers(ctx context.Context, data any) (int64, error) {
 			item.XUsername, item.VerifiedBadge, item.Vol, item.Pnl, item.Rank,
 		)
 	}
-	
+
 	rows, _, err := s.execBatch(ctx, batch, len(items))
 	return rows, err
 }

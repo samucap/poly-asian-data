@@ -7,29 +7,57 @@ import (
 
 	"github.com/samucap/poly-asian-data/internal/fetcher"
 	"github.com/samucap/poly-asian-data/internal/saver"
+	"github.com/samucap/poly-asian-data/internal/workerpool"
 )
 
-// routeProcessorOutput is the feedback/router loop.
+// routeProcessorOutput fans out processor results:
+//   - Saver payloads → saver.SubmitWait (backpressure)
+//   - Derived / next-page requests → bounded requeue into fetcher
 //
-// Saves are submitted synchronously (backpressure into saver).
-// Derived/next-page requests go through a bounded requeue channel with a small
-// set of worker goroutines. That keeps feedback concurrency bounded while
-// allowing the router to keep draining processor output (avoids cyclic deadlock
-// when feedback multiplies work under full queues).
+// Requeue never blocks the processor drain path: full channel tries non-blocking
+// fetcher submit, then a capped overflow list drained by requeue workers.
 func (p *Pipeline) routeProcessorOutput(ctx context.Context) {
 	const requeueWorkers = 4
-	// Buffer absorbs bursts of derived requests (e.g. orderbook chunks).
 	requeueBuf := 256
 	if q := p.cfg.FetcherCfg.Qsize; q > requeueBuf {
 		requeueBuf = q * 2
 	}
 	requeue := make(chan *fetcher.Request, requeueBuf)
 
-	var requeueWG sync.WaitGroup
+	const maxOverflow = 50_000
+	var (
+		overflowMu sync.Mutex
+		overflow   []*fetcher.Request
+	)
+
+	submitToFetcher := func(req *fetcher.Request) {
+		if req == nil {
+			p.routerInflight.Add(-1)
+			return
+		}
+		if err := p.fetcherPool.SubmitWait(ctx, req); err != nil {
+			p.logger.Warn("failed to submit requeued request",
+				slog.String("url", req.URL),
+				slog.String("error", err.Error()),
+			)
+		}
+		p.routerInflight.Add(-1)
+	}
+
+	popOverflow := func() *fetcher.Request {
+		overflowMu.Lock()
+		defer overflowMu.Unlock()
+		if len(overflow) == 0 {
+			return nil
+		}
+		req := overflow[0]
+		overflow[0] = nil
+		overflow = overflow[1:]
+		return req
+	}
+
 	for i := 0; i < requeueWorkers; i++ {
-		requeueWG.Add(1)
 		go func() {
-			defer requeueWG.Done()
 			for {
 				select {
 				case <-ctx.Done():
@@ -38,19 +66,29 @@ func (p *Pipeline) routeProcessorOutput(ctx context.Context) {
 					if !ok {
 						return
 					}
-					if err := p.fetcherPool.SubmitWait(ctx, req); err != nil {
-						p.logger.Warn("failed to submit requeued request",
-							slog.String("url", req.URL),
-							slog.String("error", err.Error()),
-						)
+					submitToFetcher(req)
+					continue
+				default:
+				}
+
+				if req := popOverflow(); req != nil {
+					submitToFetcher(req)
+					continue
+				}
+
+				select {
+				case <-ctx.Done():
+					return
+				case req, ok := <-requeue:
+					if !ok {
+						return
 					}
-					p.routerInflight.Add(-1)
+					submitToFetcher(req)
 				}
 			}
 		}()
 	}
 
-	// Serialize cursor advances per sync type so concurrent pages stay monotonic.
 	var cursorMu sync.Mutex
 	lastCursor := make(map[string]string)
 
@@ -64,14 +102,33 @@ func (p *Pipeline) routeProcessorOutput(ctx context.Context) {
 			p.routerInflight.Add(-1)
 			return
 		case requeue <- req:
+			return
+		default:
+			if err := p.fetcherPool.Submit(ctx, req); err == nil {
+				p.routerInflight.Add(-1)
+				return
+			} else if err != workerpool.ErrQueueFull && ctx.Err() != nil {
+				p.routerInflight.Add(-1)
+				return
+			}
+			overflowMu.Lock()
+			if len(overflow) >= maxOverflow {
+				overflowMu.Unlock()
+				p.logger.Warn("dropping derived request: requeue overflow full",
+					slog.String("url", req.URL),
+					slog.Int("max_overflow", maxOverflow),
+				)
+				p.routerInflight.Add(-1)
+				return
+			}
+			overflow = append(overflow, req)
+			overflowMu.Unlock()
 		}
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			// Leave requeue workers to exit via ctx; do not close requeue while they select on it
-			// with ctx — they return on Done.
 			return
 		case result, ok := <-p.processorPool.Outputs():
 			if !ok {
@@ -88,7 +145,6 @@ func (p *Pipeline) routeProcessorOutput(ctx context.Context) {
 
 			p.routerInflight.Add(1)
 
-			// 1. Saver payloads — sync backpressure into saver
 			for _, payload := range output.SaverPayloads {
 				record := &saver.Record{
 					ID:          output.ID,
@@ -109,7 +165,6 @@ func (p *Pipeline) routeProcessorOutput(ctx context.Context) {
 				}
 			}
 
-			// 2. Cursor update (ordered)
 			if output.SyncType != "" && output.LastCursor != "" {
 				cursorMu.Lock()
 				prev := lastCursor[output.SyncType]
@@ -126,7 +181,6 @@ func (p *Pipeline) routeProcessorOutput(ctx context.Context) {
 				cursorMu.Unlock()
 			}
 
-			// 3. Derived + next page via bounded requeue
 			for _, req := range output.DerivedRequests {
 				enqueueFetch(req)
 			}

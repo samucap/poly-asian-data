@@ -4,6 +4,10 @@ import (
 	"context"
 	"log/slog"
 	"time"
+
+	"github.com/samucap/poly-asian-data/internal/logging"
+	"github.com/samucap/poly-asian-data/internal/saver"
+	"github.com/samucap/poly-asian-data/internal/workerpool"
 )
 
 // WaitUntilIdle blocks until the pipeline has no pending stage work and the
@@ -25,12 +29,12 @@ func (p *Pipeline) WaitUntilIdle(ctx context.Context, stableDuration time.Durati
 			idle := p.isIdle()
 
 			if idle && !isStable {
-				p.logger.Info("pipeline became IDLE; starting stability timer")
+				p.logger.Debug("pipeline became IDLE; starting stability timer")
 				stableSince = time.Now()
 				isStable = true
 				lastLog = time.Now()
 			} else if !idle && isStable {
-				p.logger.Info("pipeline stability RESET; activity detected")
+				p.logger.Debug("pipeline stability RESET; activity detected")
 				isStable = false
 			} else if !idle && time.Since(lastLog) >= logInterval {
 				p.logStatus(idle, isStable, stableSince)
@@ -57,7 +61,7 @@ func (p *Pipeline) logStatus(idle, stable bool, stableSince time.Time) {
 	fs := p.fetcherPool.Stats().Snapshot()
 	ps := p.processorPool.Stats().Snapshot()
 	ss := p.saverPool.Stats().Snapshot()
-	p.logger.Info("Pipeline Status",
+	p.logger.Debug("Pipeline Status",
 		slog.Int64("fetcher_pending", fs.Pending()),
 		slog.Int64("processor_pending", ps.Pending()),
 		slog.Int64("saver_pending", ss.Pending()),
@@ -79,30 +83,89 @@ func (p *Pipeline) Stats() Stats {
 	}
 }
 
-// PrintFinalReport logs a summary of pipeline execution.
+// DiffStats returns after − before for cumulative counters (for cycle deltas).
+func DiffStats(before, after Stats) Stats {
+	return Stats{
+		StartedAt:      after.StartedAt,
+		UptimeDuration: after.UptimeDuration,
+		Fetcher: workerpool.StatsSnapshot{
+			Submitted:     after.Fetcher.Submitted - before.Fetcher.Submitted,
+			Completed:     after.Fetcher.Completed - before.Fetcher.Completed,
+			Failed:        after.Fetcher.Failed - before.Fetcher.Failed,
+			InProgress:    after.Fetcher.InProgress,
+			TotalDuration: after.Fetcher.TotalDuration - before.Fetcher.TotalDuration,
+		},
+		Processor: workerpool.StatsSnapshot{
+			Submitted:     after.Processor.Submitted - before.Processor.Submitted,
+			Completed:     after.Processor.Completed - before.Processor.Completed,
+			Failed:        after.Processor.Failed - before.Processor.Failed,
+			InProgress:    after.Processor.InProgress,
+			TotalDuration: after.Processor.TotalDuration - before.Processor.TotalDuration,
+		},
+		Saver: saver.StatsSnapshot{
+			RecordsSubmitted: after.Saver.RecordsSubmitted - before.Saver.RecordsSubmitted,
+			RecordsSaved:     after.Saver.RecordsSaved - before.Saver.RecordsSaved,
+			RecordsFailed:    after.Saver.RecordsFailed - before.Saver.RecordsFailed,
+			RowsAffected:     after.Saver.RowsAffected - before.Saver.RowsAffected,
+			TotalDuration:    after.Saver.TotalDuration - before.Saver.TotalDuration,
+		},
+	}
+}
+
+// LogStageReport logs compact aggregated counters for each pipeline stage:
+// how many ops were submitted, how many succeeded/failed, success rate, avg latency.
+// Safe for cycle-end use only (formatting is intentional here, not in workers).
+func (p *Pipeline) LogStageReport(label string, s Stats) {
+	log := p.logger
+	if log == nil {
+		log = logging.Logger
+	}
+	if label == "" {
+		label = "pipeline"
+	}
+
+	fetcherAvg := s.Fetcher.AverageDuration()
+	processorAvg := s.Processor.AverageDuration()
+	var saverAvg time.Duration
+	finished := s.Saver.RecordsSaved + s.Saver.RecordsFailed
+	if finished > 0 {
+		saverAvg = s.Saver.TotalDuration / time.Duration(finished)
+	}
+
+	log.Info("stage fetcher",
+		slog.String("report", label),
+		slog.String("ops", logging.FormatCount(s.Fetcher.Submitted)),
+		slog.String("ok", logging.FormatCount(s.Fetcher.Completed)),
+		slog.String("failed", logging.FormatCount(s.Fetcher.Failed)),
+		slog.String("success", logging.FormatRate(s.Fetcher.Completed, s.Fetcher.Failed)),
+		slog.String("avg", logging.FormatDuration(fetcherAvg)),
+	)
+	log.Info("stage processor",
+		slog.String("report", label),
+		slog.String("ops", logging.FormatCount(s.Processor.Submitted)),
+		slog.String("ok", logging.FormatCount(s.Processor.Completed)),
+		slog.String("failed", logging.FormatCount(s.Processor.Failed)),
+		slog.String("success", logging.FormatRate(s.Processor.Completed, s.Processor.Failed)),
+		slog.String("avg", logging.FormatDuration(processorAvg)),
+	)
+	log.Info("stage saver",
+		slog.String("report", label),
+		slog.String("ops", logging.FormatCount(s.Saver.RecordsSubmitted)),
+		slog.String("ok", logging.FormatCount(s.Saver.RecordsSaved)),
+		slog.String("failed", logging.FormatCount(s.Saver.RecordsFailed)),
+		slog.String("success", logging.FormatRate(s.Saver.RecordsSaved, s.Saver.RecordsFailed)),
+		slog.String("rows", logging.FormatCount(s.Saver.RowsAffected)),
+		slog.String("avg", logging.FormatDuration(saverAvg)),
+	)
+}
+
+// PrintFinalReport logs a cumulative end-of-run stage report (absolute totals).
 func (p *Pipeline) PrintFinalReport() {
 	stats := p.Stats()
-	p.logger.Info("==================================================")
-	p.logger.Info("           PIPELINE END REPORT                  ")
-	p.logger.Info("==================================================")
-	p.logger.Info("Execution Time", slog.Duration("duration", stats.UptimeDuration))
-	p.logger.Info("Fetcher",
-		slog.Int64("submitted", stats.Fetcher.Submitted),
-		slog.Int64("completed", stats.Fetcher.Completed),
-		slog.Int64("failed", stats.Fetcher.Failed),
+	p.logger.Info("pipeline end report",
+		slog.String("duration", logging.FormatDuration(stats.UptimeDuration)),
 	)
-	p.logger.Info("Processor",
-		slog.Int64("submitted", stats.Processor.Submitted),
-		slog.Int64("completed", stats.Processor.Completed),
-		slog.Int64("failed", stats.Processor.Failed),
-	)
-	p.logger.Info("Saver",
-		slog.Int64("submitted", stats.Saver.RecordsSubmitted),
-		slog.Int64("saved", stats.Saver.RecordsSaved),
-		slog.Int64("failed", stats.Saver.RecordsFailed),
-		slog.Int64("rows", stats.Saver.RowsAffected),
-	)
-	p.logger.Info("==================================================")
+	p.LogStageReport("total", stats)
 }
 
 // IsStopped returns true if the pipeline has been stopped.
@@ -130,10 +193,10 @@ func (p *Pipeline) Stop() {
 
 	stats := p.Stats()
 	p.logger.Info("pipeline stopped",
-		slog.Int64("fetched", stats.Fetcher.Completed),
-		slog.Int64("processed", stats.Processor.Completed),
-		slog.Int64("saved", stats.Saver.RecordsSaved),
-		slog.Duration("uptime", stats.UptimeDuration),
+		slog.String("fetched", logging.FormatCount(stats.Fetcher.Completed)),
+		slog.String("processed", logging.FormatCount(stats.Processor.Completed)),
+		slog.String("saved", logging.FormatCount(stats.Saver.RecordsSaved)),
+		slog.String("uptime", logging.FormatDuration(stats.UptimeDuration)),
 	)
 }
 

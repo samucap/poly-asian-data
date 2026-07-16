@@ -3,16 +3,18 @@ package config
 import (
 	"fmt"
 	"os"
-
-	"github.com/joho/godotenv"
 	"runtime"
 	"strconv"
+	"time"
+
+	"github.com/joho/godotenv"
 )
 
 // DefaultEndpoints holds default API URLs.
 var DefaultEndpoints = map[string]any{
 	"gamma":    "https://gamma-api.polymarket.com",
 	"clob":     "https://clob.polymarket.com",
+	"data_api": "https://data-api.polymarket.com",
 	"subgraph": "https://api.thegraph.com/subgraphs", // Default placeholder
 }
 
@@ -24,15 +26,28 @@ type Config struct {
 	SubgraphAPIKey string
 	Services       ServicesConfig
 
-    // Worker Pool Configs
-    FetcherCfg   WorkerPoolConfig
-    ProcessorCfg WorkerPoolConfig
-    SaverCfg     WorkerPoolConfig
+	// Worker Pool Configs
+	FetcherCfg   WorkerPoolConfig
+	ProcessorCfg WorkerPoolConfig
+	SaverCfg     WorkerPoolConfig
+
+	// TopMarketsCfg drives cmd/top-markets refresh filters and interval.
+	TopMarkets TopMarketsConfig
 }
 
 type WorkerPoolConfig struct {
-    NumWorkers int
-    Qsize      int
+	NumWorkers int
+	Qsize      int
+}
+
+// TopMarketsConfig holds market-ranking filter thresholds and refresh cadence.
+type TopMarketsConfig struct {
+	RefreshInterval time.Duration
+	MinVolume24hr   float64
+	MinLiquidity    float64
+	MaxSpread       float64
+	MinVolatility   float64
+	MaxN            int
 }
 
 type ServicesConfig struct {
@@ -70,6 +85,14 @@ func Load() (*Config, error) {
 		SaverCfg: WorkerPoolConfig{
 			NumWorkers: getEnvInt("SAVER_WORKERS", defaultWorkers/2+1), // Safer writes
 			Qsize:      getEnvInt("SAVER_QUEUE_SIZE", 200),
+		},
+		TopMarkets: TopMarketsConfig{
+			RefreshInterval: getEnvDuration("REFRESH_INTERVAL", 10*time.Minute),
+			MinVolume24hr:   getEnvFloat("MIN_VOLUME", 30000.0),
+			MinLiquidity:    getEnvFloat("MIN_LIQUIDITY", 15000.0),
+			MaxSpread:       getEnvFloat("MAX_SPREAD", 0.05),
+			MinVolatility:   getEnvFloat("MIN_VOLATILITY", 0.01),
+			MaxN:            getEnvInt("MAX_N", 500),
 		},
 	}
 
@@ -121,6 +144,24 @@ func getEnvInt(key string, defaultVal int) int {
 	if val, ok := os.LookupEnv(key); ok {
 		if i, err := strconv.Atoi(val); err == nil {
 			return i
+		}
+	}
+	return defaultVal
+}
+
+func getEnvFloat(key string, defaultVal float64) float64 {
+	if val, ok := os.LookupEnv(key); ok {
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			return f
+		}
+	}
+	return defaultVal
+}
+
+func getEnvDuration(key string, defaultVal time.Duration) time.Duration {
+	if val, ok := os.LookupEnv(key); ok {
+		if d, err := time.ParseDuration(val); err == nil {
+			return d
 		}
 	}
 	return defaultVal

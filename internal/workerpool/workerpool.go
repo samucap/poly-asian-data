@@ -105,6 +105,9 @@ type Pool[T, R any] struct {
 	OutputQ     chan Result[R]
 	processFunc func(context.Context, T) (R, error)
 	ownsOutput  bool
+	// discardOutput is for terminal stages (e.g. saver): processItem still updates
+	// stats; results are not pushed to OutputQ (no Drain consumer required).
+	discardOutput bool
 
 	wg       sync.WaitGroup
 	ctx      context.Context
@@ -112,6 +115,21 @@ type Pool[T, R any] struct {
 	stopped  atomic.Bool
 	stopOnce sync.Once
 	idSeq    atomic.Uint64
+}
+
+// PoolOption configures optional pool behavior.
+type PoolOption func(*poolOptions)
+
+type poolOptions struct {
+	discardOutput bool
+}
+
+// WithDiscardOutput makes the pool a terminal stage: workers still run processFunc
+// and update Submitted/Completed/Failed/InProgress stats, but never send on OutputQ.
+func WithDiscardOutput() PoolOption {
+	return func(o *poolOptions) {
+		o.discardOutput = true
+	}
 }
 
 // Submitter is anything that accepts jobs with backpressure.
@@ -126,6 +144,7 @@ func NewPool[T, R any](
 	numWorkers, queueSize int,
 	logger *slog.Logger,
 	processFunc func(context.Context, T) (R, error),
+	opts ...PoolOption,
 ) (*Pool[T, R], error) {
 	if numWorkers <= 0 {
 		return nil, errors.Join(ErrInvalidConfig, errors.New("numWorkers must be > 0"))
@@ -143,6 +162,13 @@ func NewPool[T, R any](
 		name = "pool"
 	}
 
+	var po poolOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&po)
+		}
+	}
+
 	logger = logger.With(slog.String("pool", name))
 	poolCtx, cancel := context.WithCancel(ctx)
 
@@ -155,16 +181,24 @@ func NewPool[T, R any](
 	}
 
 	p := &Pool[T, R]{
-		Name:        name,
-		numWorkers:  numWorkers,
-		queueSize:   queueSize,
-		InputQ:      make(chan Input[T], queueSize),
-		OutputQ:     make(chan Result[R], outSize),
-		processFunc: processFunc,
-		logger:      logger,
-		ctx:         poolCtx,
-		cancel:      cancel,
-		ownsOutput:  true,
+		Name:          name,
+		numWorkers:    numWorkers,
+		queueSize:     queueSize,
+		InputQ:        make(chan Input[T], queueSize),
+		processFunc:   processFunc,
+		logger:        logger,
+		ctx:           poolCtx,
+		cancel:        cancel,
+		discardOutput: po.discardOutput,
+	}
+
+	if po.discardOutput {
+		// Terminal stage: no consumer needed; keep a closed-ready channel unused.
+		p.OutputQ = nil
+		p.ownsOutput = false
+	} else {
+		p.OutputQ = make(chan Result[R], outSize)
+		p.ownsOutput = true
 	}
 
 	for i := 0; i < numWorkers; i++ {
@@ -175,6 +209,7 @@ func NewPool[T, R any](
 	logger.Debug("pool started",
 		slog.Int("workers", numWorkers),
 		slog.Int("queue_size", queueSize),
+		slog.Bool("discard_output", po.discardOutput),
 	)
 	return p, nil
 }
@@ -191,12 +226,18 @@ func (p *Pool[T, R]) worker(id int) {
 				return
 			}
 			input.WorkerID = id
-			p.sendResult(p.processItem(input))
+			result := p.processItem(input)
+			if !p.discardOutput {
+				p.sendResult(result)
+			}
 		}
 	}
 }
 
 func (p *Pool[T, R]) sendResult(result Result[R]) {
+	if p.OutputQ == nil {
+		return
+	}
 	select {
 	case p.OutputQ <- result:
 	case <-p.ctx.Done():
@@ -287,8 +328,14 @@ func (p *Pool[T, R]) SubmitWait(ctx context.Context, data T) error {
 }
 
 // Outputs returns the result channel (receive-only).
+// For discard-output (terminal) pools, returns nil.
 func (p *Pool[T, R]) Outputs() <-chan Result[R] {
 	return p.OutputQ
+}
+
+// DiscardsOutput reports whether this pool is a terminal stage (no OutputQ sends).
+func (p *Pool[T, R]) DiscardsOutput() bool {
+	return p.discardOutput
 }
 
 // Stats returns a pointer to live atomic stats.
@@ -318,11 +365,11 @@ func (p *Pool[T, R]) Stop() {
 		close(p.InputQ)
 		p.wg.Wait()
 		p.cancel()
-		if p.ownsOutput {
+		if p.ownsOutput && p.OutputQ != nil {
 			close(p.OutputQ)
 		}
 		snap := p.stats.Snapshot()
-		p.logger.Info("pool stopped",
+		p.logger.Debug("pool stopped",
 			slog.Int64("completed", snap.Completed),
 			slog.Int64("failed", snap.Failed),
 		)
@@ -336,7 +383,7 @@ func (p *Pool[T, R]) StopNow() {
 		p.cancel()
 		close(p.InputQ)
 		p.wg.Wait()
-		if p.ownsOutput {
+		if p.ownsOutput && p.OutputQ != nil {
 			close(p.OutputQ)
 		}
 	})

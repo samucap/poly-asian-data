@@ -18,7 +18,7 @@ import (
 // Mock pipeline concurrency harness: old async-router vs new bounded-requeue router.
 // No HTTP / DB.
 //
-// Regenerate report (writes internal/pipeline/bench_results.md):
+// Append a run section to internal/pipeline/bench_results.md (header written once):
 //
 //	go test ./internal/pipeline/ -run TestConcurrencyBenchReport -count=1 -v
 
@@ -509,58 +509,76 @@ func TestConcurrencyBenchReport(t *testing.T) {
 		}
 	}
 
-	// Always write next to this test file so path is stable regardless of -cwd.
+	// Append next to this test package so path is stable regardless of -cwd.
+	// First run writes header + interpretation; later runs only append a ## Run section.
 	path := filepath.Join("bench_results.md")
-	f, err := os.Create(path)
-	if err != nil {
+	if err := appendBenchResults(path, ordered); err != nil {
 		t.Fatalf("write report: %v", err)
 	}
-	defer f.Close()
-
-	fmt.Fprintf(f, "# Pipeline concurrency bench results\n\n")
-	fmt.Fprintf(f, "Generated: %s  \n", time.Now().Format(time.RFC3339))
-	fmt.Fprintf(f, "Go: %s  \n", runtime.Version())
-	fmt.Fprintf(f, "GOMAXPROCS: %d  \n\n", runtime.GOMAXPROCS(0))
-
-	fmt.Fprintf(f, "## How to reproduce\n\n")
-	fmt.Fprintf(f, "```bash\n")
-	fmt.Fprintf(f, "go test ./internal/pipeline/ -run TestConcurrencyBenchReport -count=1 -v\n")
-	fmt.Fprintf(f, "# writes internal/pipeline/bench_results.md\n")
-	fmt.Fprintf(f, "```\n\n")
-
-	fmt.Fprintf(f, "Harness compares **old_async_router** (unbounded per-item `go SubmitWait`, idle = pool pending only, then `StopNow`) vs **new_sync_router** (sync saves + bounded requeue workers for feedback, idle includes `routerInflight`).\n\n")
-
-	fmt.Fprintf(f, "### Metric definitions\n\n")
-	fmt.Fprintf(f, "| Metric | Meaning |\n")
-	fmt.Fprintf(f, "|--------|--------|\n")
-	fmt.Fprintf(f, "| **Wall** | End-to-end duration until harness stops |\n")
-	fmt.Fprintf(f, "| **Saves/s** | `Saves ok / Wall` (throughput) |\n")
-	fmt.Fprintf(f, "| **Saves ok / Expected / Lost** | Completeness vs expected job count |\n")
-	fmt.Fprintf(f, "| **G/job** | `Max G / Saves ok` — concurrency cost per completed save |\n")
-	fmt.Fprintf(f, "| **Max G** | Peak `runtime.NumGoroutine()` during the run |\n")
-	fmt.Fprintf(f, "| **Peak HeapInuse (KiB)** | Peak `MemStats.HeapInuse` while running |\n")
-	fmt.Fprintf(f, "| **Peak HeapAlloc (KiB)** | Peak `MemStats.HeapAlloc` while running |\n")
-	fmt.Fprintf(f, "| **Δ HeapInuse (KiB)** | `end.HeapInuse - start.HeapInuse` (after start GC; end not forced GC) |\n")
-	fmt.Fprintf(f, "| **Δ TotalAlloc (KiB)** | Bytes allocated during the run (`TotalAlloc` delta) |\n")
-	fmt.Fprintf(f, "| **GCs** | Number of GC cycles during the run |\n\n")
-
-	fmt.Fprintf(f, "| Model | Scenario | Wall | Saves/s | Saves ok | Expected | Lost | G/job | Max G | Peak Inuse KiB | Peak Alloc KiB | Δ Inuse KiB | Δ TotalAlloc KiB | GCs |\n")
-	fmt.Fprintf(f, "|-------|----------|------|---------|----------|----------|------|-------|-------|----------------|----------------|-------------|------------------|-----|\n")
-	for _, r := range ordered {
-		fmt.Fprintln(f, formatResultRow(r))
-	}
-
-	fmt.Fprintf(f, "\n## Interpretation\n\n")
-	fmt.Fprintf(f, "- **Primary resource win: Max G and G/job.** Under `slow_saver`, old_async often approaches ~1 goroutine per save; new_sync stays O(workers).\n")
-	fmt.Fprintf(f, "- **Throughput (Saves/s)** is often similar when the saver is the bottleneck — that is expected.\n")
-	fmt.Fprintf(f, "- **Heap columns** measure Go heap; goroutine stacks may not fully dominate `HeapInuse`. Prefer Max G / G/job as the concurrency-cost signal; use Δ TotalAlloc for allocation volume.\n")
-	fmt.Fprintf(f, "- Numbers vary slightly run-to-run (scheduler, GC). Compare old vs new within the same generated file.\n")
 
 	for _, r := range ordered {
 		t.Logf("%s %s wall=%s saves/s=%.0f maxG=%d g/job=%.2f peakInuseKiB=%d ΔtotalKiB=%d",
 			r.Model, r.Scenario, r.Wall, r.SavesPerSec, r.MaxG, r.GPerJob,
 			kib(r.PeakHeapInuse), kib(r.DeltaTotalAlloc))
 	}
+}
+
+// appendBenchResults writes or appends to bench_results.md.
+// Empty/new file → full header + metric definitions + interpretation once.
+// Existing file → append "## Run: ..." table only.
+func appendBenchResults(path string, ordered []benchResult) error {
+	info, err := os.Stat(path)
+	needHeader := err != nil && os.IsNotExist(err)
+	if err == nil && info.Size() == 0 {
+		needHeader = true
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if needHeader {
+		fmt.Fprintf(f, "# Pipeline concurrency bench results\n\n")
+		fmt.Fprintf(f, "## How to reproduce\n\n")
+		fmt.Fprintf(f, "```bash\n")
+		fmt.Fprintf(f, "go test ./internal/pipeline/ -run TestConcurrencyBenchReport -count=1 -v\n")
+		fmt.Fprintf(f, "# appends a ## Run section to internal/pipeline/bench_results.md\n")
+		fmt.Fprintf(f, "```\n\n")
+		fmt.Fprintf(f, "Harness compares **old_async_router** (unbounded per-item `go SubmitWait`, idle = pool pending only, then `StopNow`) vs **new_sync_router** (sync saves + bounded requeue workers for feedback, idle includes `routerInflight`).\n\n")
+		fmt.Fprintf(f, "### Metric definitions\n\n")
+		fmt.Fprintf(f, "| Metric | Meaning |\n")
+		fmt.Fprintf(f, "|--------|--------|\n")
+		fmt.Fprintf(f, "| **Wall** | End-to-end duration until harness stops |\n")
+		fmt.Fprintf(f, "| **Saves/s** | `Saves ok / Wall` (throughput) |\n")
+		fmt.Fprintf(f, "| **Saves ok / Expected / Lost** | Completeness vs expected job count |\n")
+		fmt.Fprintf(f, "| **G/job** | `Max G / Saves ok` — concurrency cost per completed save |\n")
+		fmt.Fprintf(f, "| **Max G** | Peak `runtime.NumGoroutine()` during the run |\n")
+		fmt.Fprintf(f, "| **Peak HeapInuse (KiB)** | Peak `MemStats.HeapInuse` while running |\n")
+		fmt.Fprintf(f, "| **Peak HeapAlloc (KiB)** | Peak `MemStats.HeapAlloc` while running |\n")
+		fmt.Fprintf(f, "| **Δ HeapInuse (KiB)** | `end.HeapInuse - start.HeapInuse` (after start GC; end not forced GC) |\n")
+		fmt.Fprintf(f, "| **Δ TotalAlloc (KiB)** | Bytes allocated during the run (`TotalAlloc` delta) |\n")
+		fmt.Fprintf(f, "| **GCs** | Number of GC cycles during the run |\n\n")
+		fmt.Fprintf(f, "## Interpretation\n\n")
+		fmt.Fprintf(f, "- **Primary resource win: Max G and G/job.** Under `slow_saver`, old_async often approaches ~1 goroutine per save; new_sync stays O(workers).\n")
+		fmt.Fprintf(f, "- **Throughput (Saves/s)** is often similar when the saver is the bottleneck — that is expected.\n")
+		fmt.Fprintf(f, "- **Heap columns** measure Go heap; goroutine stacks may not fully dominate `HeapInuse`. Prefer Max G / G/job as the concurrency-cost signal; use Δ TotalAlloc for allocation volume.\n")
+		fmt.Fprintf(f, "- Numbers vary slightly run-to-run (scheduler, GC). Compare old vs new within the same run section; history is preserved by appending runs.\n\n")
+	}
+
+	fmt.Fprintf(f, "## Run: %s\n\n", time.Now().Format(time.RFC3339))
+	fmt.Fprintf(f, "Go: %s · GOMAXPROCS: %d\n\n", runtime.Version(), runtime.GOMAXPROCS(0))
+	fmt.Fprintf(f, "| Model | Scenario | Wall | Saves/s | Saves ok | Expected | Lost | G/job | Max G | Peak Inuse KiB | Peak Alloc KiB | Δ Inuse KiB | Δ TotalAlloc KiB | GCs |\n")
+	fmt.Fprintf(f, "|-------|----------|------|---------|----------|----------|------|-------|-------|----------------|----------------|-------------|------------------|-----|\n")
+	for _, r := range ordered {
+		fmt.Fprintln(f, formatResultRow(r))
+	}
+	fmt.Fprintln(f)
+	return nil
 }
 
 func BenchmarkPipelineConcurrency(b *testing.B) {

@@ -47,23 +47,26 @@ func NewFactory(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*
 		logger = slog.Default()
 	}
 
-	poolConfig, err := pgxpool.ParseConfig(cfg.PostgresURL)
+	dbCfg, err := internaldb.StartDB(ctx, internaldb.Options{
+		ConnStr:        cfg.PostgresURL,
+		ConnectTimeout: 10 * time.Second,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("parsing postgres config: %w", err)
+		return nil, fmt.Errorf("starting db config: %w", err)
 	}
-	db, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	pool, err := dbCfg.ConnectDB(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("creating postgres pool: %w", err)
+		return nil, fmt.Errorf("connecting postgres: %w", err)
 	}
-	if err := internaldb.InitDB(ctx, db, false); err != nil {
-		db.Close()
+	if err := internaldb.InitDB(ctx, pool, false); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("initializing db schema: %w", err)
 	}
 
 	return &Factory{
 		cfg:    cfg,
 		logger: logger.With(slog.String("component", "pipeline-factory")),
-		db:     db,
+		db:     pool,
 	}, nil
 }
 
@@ -130,6 +133,8 @@ func (f *Factory) Create(ctx context.Context, opts Options) (*Pipeline, error) {
 	p.accepting.Store(true)
 
 	// Wire stages with backpressure-preserving bridges.
+	// fetcher → processor (generic Bridge); processor → saver/feedback (domain fan-out).
+	// Saver is a discard-output terminal pool — no Drain required.
 	workerpool.StartBridge(pipelineCtx, fetcherPool.Outputs(), submitAdapter[*fetcher.Response]{
 		submit: func(ctx context.Context, v *fetcher.Response) error {
 			return processorPool.SubmitWait(ctx, v)
@@ -139,7 +144,6 @@ func (f *Factory) Create(ctx context.Context, opts Options) (*Pipeline, error) {
 	})
 
 	go p.routeProcessorOutput(pipelineCtx)
-	workerpool.StartDrain(pipelineCtx, saverPool.Outputs())
 
 	p.logger.Info("pipeline created",
 		slog.Int("fetcher_workers", fw),

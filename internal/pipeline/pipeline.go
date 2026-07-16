@@ -13,6 +13,7 @@ import (
 
 	"github.com/samucap/poly-asian-data/internal/config"
 	"github.com/samucap/poly-asian-data/internal/fetcher"
+	"github.com/samucap/poly-asian-data/internal/logging"
 	"github.com/samucap/poly-asian-data/internal/processor"
 	"github.com/samucap/poly-asian-data/internal/saver"
 	"github.com/samucap/poly-asian-data/internal/services"
@@ -95,12 +96,26 @@ func (p *Pipeline) SubmitFetch(ctx context.Context, req *fetcher.Request) error 
 	return p.fetcherPool.SubmitWait(ctx, req)
 }
 
+// SubmitSave enqueues a single save record with backpressure.
+func (p *Pipeline) SubmitSave(ctx context.Context, record *saver.Record) error {
+	if !p.accepting.Load() || p.stopped.Load() {
+		return ErrNotAccepting
+	}
+	return p.saverPool.SubmitWait(ctx, record)
+}
+
+// TakeMergedOI returns conditionID → open-interest values collected by the
+// processor when enrichment used Metadata MergeOI=true (top-markets path).
+func (p *Pipeline) TakeMergedOI() map[string]float64 {
+	return p.processorPool.TakeMergedOI()
+}
+
 func (p *Pipeline) logCycleComplete(phase string) {
 	stats := p.Stats()
 	p.logger.Info("cycle complete",
 		slog.String("phase", phase),
-		slog.Int64("fetched", stats.Fetcher.Completed),
-		slog.Int64("processed", stats.Processor.Completed),
-		slog.Int64("saved", stats.Saver.RecordsSaved),
+		slog.String("fetched", logging.FormatCount(stats.Fetcher.Completed)),
+		slog.String("processed", logging.FormatCount(stats.Processor.Completed)),
+		slog.String("saved", logging.FormatCount(stats.Saver.RecordsSaved)),
 	)
 }

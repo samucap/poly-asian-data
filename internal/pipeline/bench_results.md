@@ -1,6 +1,6 @@
 # Pipeline concurrency bench results
 
-Generated: 2026-07-14T00:58:52-07:00  
+Generated: 2026-07-16T04:49:43-07:00  
 Go: go1.24.5  
 GOMAXPROCS: 12  
 
@@ -30,12 +30,12 @@ Harness compares **old_async_router** (unbounded per-item `go SubmitWait`, idle 
 
 | Model | Scenario | Wall | Saves/s | Saves ok | Expected | Lost | G/job | Max G | Peak Inuse KiB | Peak Alloc KiB | Δ Inuse KiB | Δ TotalAlloc KiB | GCs |
 |-------|----------|------|---------|----------|----------|------|-------|-------|----------------|----------------|-------------|------------------|-----|
-| old_async_router | balanced | 17ms | 23973 | 400 | 400 | 0 | 0.23 | 92 | 1384 | 509 | +272 | 132 | 0 |
-| new_sync_router | balanced | 161ms | 2486 | 400 | 400 | 0 | 0.06 | 22 | 1192 | 425 | +16 | 14 | 0 |
-| old_async_router | slow_saver | 1.044s | 958 | 1000 | 1000 | 0 | 1.00 | 1000 | 2360 | 1263 | +1232 | 850 | 0 |
-| new_sync_router | slow_saver | 1.256s | 796 | 1000 | 1000 | 0 | 0.03 | 28 | 1808 | 872 | +40 | 35 | 0 |
-| old_async_router | high_feedback | 72ms | 3334 | 240 | 240 | 0 | 1.07 | 256 | 1848 | 948 | +72 | 105 | 0 |
-| new_sync_router | high_feedback | 287ms | 836 | 240 | 240 | 0 | 0.08 | 20 | 1816 | 859 | +40 | 11 | 0 |
+| old_async_router | balanced | 17ms | 24214 | 400 | 400 | 0 | 0.23 | 92 | 1464 | 523 | +352 | 147 | 0 |
+| new_sync_router | balanced | 146ms | 2736 | 400 | 400 | 0 | 0.06 | 22 | 1200 | 429 | +24 | 14 | 0 |
+| old_async_router | slow_saver | 1.044s | 958 | 1000 | 1000 | 0 | 1.00 | 1002 | 2296 | 1267 | +1152 | 845 | 0 |
+| new_sync_router | slow_saver | 1.256s | 796 | 1000 | 1000 | 0 | 0.03 | 28 | 1856 | 879 | +48 | 38 | 0 |
+| old_async_router | high_feedback | 72ms | 3333 | 240 | 240 | 0 | 1.07 | 256 | 1872 | 945 | +64 | 97 | 0 |
+| new_sync_router | high_feedback | 287ms | 836 | 240 | 240 | 0 | 0.08 | 20 | 1816 | 855 | +40 | 10 | 0 |
 
 ## Interpretation
 
@@ -43,3 +43,29 @@ Harness compares **old_async_router** (unbounded per-item `go SubmitWait`, idle 
 - **Throughput (Saves/s)** is often similar when the saver is the bottleneck — that is expected.
 - **Heap columns** measure Go heap; goroutine stacks may not fully dominate `HeapInuse`. Prefer Max G / G/job as the concurrency-cost signal; use Δ TotalAlloc for allocation volume.
 - Numbers vary slightly run-to-run (scheduler, GC). Compare old vs new within the same generated file.
+## Run: 2026-07-16T06:22:08-07:00
+
+Go: go1.24.5 · GOMAXPROCS: 12
+
+| Model | Scenario | Wall | Saves/s | Saves ok | Expected | Lost | G/job | Max G | Peak Inuse KiB | Peak Alloc KiB | Δ Inuse KiB | Δ TotalAlloc KiB | GCs |
+|-------|----------|------|---------|----------|----------|------|-------|-------|----------------|----------------|-------------|------------------|-----|
+| old_async_router | balanced | 17ms | 23774 | 400 | 400 | 0 | 0.23 | 90 | 1440 | 518 | +320 | 136 | 0 |
+| new_sync_router | balanced | 161ms | 2484 | 400 | 400 | 0 | 0.06 | 22 | 1216 | 433 | +24 | 15 | 0 |
+| old_async_router | slow_saver | 1.044s | 958 | 1000 | 1000 | 0 | 1.00 | 1000 | 2320 | 1262 | +1160 | 842 | 0 |
+| new_sync_router | slow_saver | 1.258s | 795 | 1000 | 1000 | 0 | 0.03 | 28 | 1944 | 878 | +72 | 34 | 0 |
+| old_async_router | high_feedback | 72ms | 3332 | 240 | 240 | 0 | 1.07 | 256 | 2032 | 956 | +176 | 108 | 0 |
+| new_sync_router | high_feedback | 287ms | 836 | 240 | 240 | 0 | 0.08 | 20 | 1888 | 871 | +24 | 10 | 0 |
+
+## Run: 2026-07-16T06:22:12-07:00
+
+Go: go1.24.5 · GOMAXPROCS: 12
+
+| Model | Scenario | Wall | Saves/s | Saves ok | Expected | Lost | G/job | Max G | Peak Inuse KiB | Peak Alloc KiB | Δ Inuse KiB | Δ TotalAlloc KiB | GCs |
+|-------|----------|------|---------|----------|----------|------|-------|-------|----------------|----------------|-------------|------------------|-----|
+| old_async_router | balanced | 17ms | 23670 | 400 | 400 | 0 | 0.23 | 91 | 1328 | 518 | +264 | 135 | 0 |
+| new_sync_router | balanced | 161ms | 2482 | 400 | 400 | 0 | 0.06 | 22 | 1128 | 429 | +32 | 13 | 0 |
+| old_async_router | slow_saver | 1.039s | 963 | 1000 | 1000 | 0 | 1.00 | 1002 | 2352 | 1262 | +1264 | 853 | 0 |
+| new_sync_router | slow_saver | 1.256s | 796 | 1000 | 1000 | 0 | 0.03 | 28 | 1824 | 872 | +64 | 40 | 0 |
+| old_async_router | high_feedback | 72ms | 3335 | 240 | 240 | 0 | 1.07 | 256 | 1832 | 947 | +80 | 105 | 0 |
+| new_sync_router | high_feedback | 287ms | 836 | 240 | 240 | 0 | 0.08 | 20 | 1816 | 856 | +56 | 10 | 0 |
+

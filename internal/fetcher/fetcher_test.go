@@ -19,16 +19,7 @@ func TestBuildNextPageRequest_Subgraph(t *testing.T) {
 
 	// Setup initial request
 	query := "query { items { id } }"
-	initialBody := map[string]any{
-		"query": query,
-		"variables": map[string]int{
-			"first": 1000,
-			"skip": 0,
-		},
-	}
-	// We don't actually need the body reader for BuildNextPageRequest logic check
-	// unless we want to verify it doesn't crash on nil body?
-	// But BuildNextPageRequest doesn't read Input Body, it generates New Body.
+	// BuildNextPageRequest regenerates body from Metadata; input body is unused.
 
 	req := &Request{
 		URL:    "http://test.com/graphql",

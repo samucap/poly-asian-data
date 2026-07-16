@@ -241,3 +241,95 @@ func TestPool_ConcurrentSubmit(t *testing.T) {
 	assert.Equal(t, int64(n), p.Stats().Snapshot().Completed)
 	p.Stop()
 }
+
+func TestPool_DiscardOutput_StatsAccurate(t *testing.T) {
+	ctx := context.Background()
+	p, err := NewPool[int, int](ctx, "terminal", 2, 16, testLogger(), func(_ context.Context, x int) (int, error) {
+		if x < 0 {
+			return 0, errors.New("neg")
+		}
+		return x, nil
+	}, WithDiscardOutput())
+	require.NoError(t, err)
+	defer p.Stop()
+
+	assert.True(t, p.DiscardsOutput())
+	assert.Nil(t, p.Outputs())
+
+	const n = 20
+	for i := 0; i < n; i++ {
+		require.NoError(t, p.SubmitWait(ctx, i))
+	}
+	require.NoError(t, p.SubmitWait(ctx, -1))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for p.Pending() > 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.Equal(t, int64(0), p.Pending())
+	snap := p.Stats().Snapshot()
+	// Stats come from processItem — discard must not skip counters.
+	assert.Equal(t, int64(n), snap.Completed)
+	assert.Equal(t, int64(1), snap.Failed)
+	assert.Equal(t, int64(n+1), snap.Submitted)
+}
+
+func TestDrain_ConsumesUntilClosed(t *testing.T) {
+	ctx := context.Background()
+	p, err := NewPool[int, int](ctx, "t", 2, 8, testLogger(), func(_ context.Context, x int) (int, error) {
+		return x, nil
+	})
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	go func() {
+		Drain(ctx, p.Outputs())
+		close(done)
+	}()
+
+	for i := 0; i < 10; i++ {
+		require.NoError(t, p.SubmitWait(ctx, i))
+	}
+	p.Stop()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Drain did not return after pool Stop closed Outputs")
+	}
+	assert.Equal(t, int64(10), p.Stats().Snapshot().Completed)
+}
+
+func TestPool_SubmitWait_BackpressureUnblocks(t *testing.T) {
+	ctx := context.Background()
+	release := make(chan struct{})
+	p, err := NewPool[int, int](ctx, "t", 1, 1, testLogger(), func(_ context.Context, x int) (int, error) {
+		<-release
+		return x, nil
+	}, WithDiscardOutput())
+	require.NoError(t, err)
+	defer p.StopNow()
+
+	require.NoError(t, p.SubmitWait(ctx, 1))
+	time.Sleep(20 * time.Millisecond)
+	require.NoError(t, p.SubmitWait(ctx, 2))
+
+	blocked := make(chan error, 1)
+	go func() {
+		blocked <- p.SubmitWait(ctx, 3)
+	}()
+
+	select {
+	case <-blocked:
+		t.Fatal("SubmitWait should block while queue is full")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case err := <-blocked:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("SubmitWait did not unblock after workers drained")
+	}
+}

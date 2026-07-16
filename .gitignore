@@ -11,6 +11,8 @@
 # Go
 vendor/
 go.work
+.gocache
+.gopath
 
 # Test Output
 coverage.out
@@ -34,3 +36,5 @@ gocache
 
 secret-plans
 .agents
+
+.grok
