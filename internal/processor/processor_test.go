@@ -49,8 +49,9 @@ func TestProcessor_ProcessSports(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 2, output.ItemCount)
 		
-		// Check payloads
-		require.Len(t, output.SaverPayloads, 2) // leagues + hierarchy
+		// Check payloads (leagues table only — hierarchy is handled at save time)
+		require.Len(t, output.SaverPayloads, 1)
+		assert.Equal(t, "leagues", output.SaverPayloads[0].TableName)
 		leagues := output.SaverPayloads[0].Data.([]services.PlyMktSport)
 		assert.Equal(t, "basketball", leagues[0].Sport)
 	})
@@ -246,8 +247,10 @@ func TestProcessor_ProcessOrderbook(t *testing.T) {
 		payload := output.SaverPayloads[0]
 		assert.Equal(t, "orderbooks", payload.TableName)
 		
-		item := payload.Data.(services.PlyMktOrderbook)
-		assert.Equal(t, "123", item.TokenID)
-		assert.InDelta(t, 0.20, item.Spread, 0.0001) // 0.60 - 0.40
+		items, ok := payload.Data.([]services.PlyMktOrderbook)
+		require.True(t, ok, "orderbook payload should be []PlyMktOrderbook")
+		require.Len(t, items, 1)
+		assert.Equal(t, "123", items[0].TokenID)
+		assert.InDelta(t, 0.20, items[0].Spread, 0.0001) // 0.60 - 0.40
 	})
 }

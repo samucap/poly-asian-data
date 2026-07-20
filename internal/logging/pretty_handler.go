@@ -8,12 +8,14 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"time"
 )
 
 const (
-	timeFormat = "15:04:05.000"
+	// Second precision — avoid millisecond spam in default CLI output.
+	timeFormat = "15:04:05"
 
-	// ASNI Color Codes
+	// ANSI Color Codes
 	colorReset   = "\033[0m"
 	colorRed     = "\033[31m"
 	colorGreen   = "\033[32m"
@@ -158,14 +160,16 @@ func (h *PrettyHandler) appendAttr(buf *bytes.Buffer, a slog.Attr, groupPrefix s
 	val := a.Value.Any()
 	// Special handling if error to make it red? Or just keep simple.
 	// User said "colorize things like field names like component|idk... you get it"
-	// User didn't strictly say values need color, but let's see. 
+	// User didn't strictly say values need color, but let's see.
 	// For now let's stick to field names colored as requested.
+
+	if a.Value.Kind() == slog.KindDuration {
+		buf.WriteString(FormatDuration(a.Value.Duration()))
+		return
+	}
 
 	switch v := val.(type) {
 	case string:
-		// if it contains spaces, maybe quote it? slog text handler does.
-		// but for pretty logs, sometimes raw is nicer.
-		// Let's use %q if implies needing quotes, or just %s
 		if needsQuote(v) {
 			fmt.Fprintf(buf, "%q", v)
 		} else {
@@ -175,8 +179,9 @@ func (h *PrettyHandler) appendAttr(buf *bytes.Buffer, a slog.Attr, groupPrefix s
 		buf.WriteString(colorRed)
 		buf.WriteString(v.Error())
 		buf.WriteString(colorReset)
+	case time.Duration:
+		buf.WriteString(FormatDuration(v))
 	default:
-		// Use JSON encoding for complex types or fmt.Sprint for simple ones
 		b, err := json.Marshal(v)
 		if err == nil {
 			buf.Write(b)

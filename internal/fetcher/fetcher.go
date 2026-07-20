@@ -80,13 +80,13 @@ func New(ctx context.Context, config *config.Config, numWorkers, qSize int) (*Fe
 
 	// Create fetcher first so we can pass its method to the pool
 	f := &Fetcher{
-		httpClient:  newSecureHTTPClient(),
+		httpClient:  NewSecureHTTPClient(),
 		cfg:         config,
 		logger:      logger,
 		globalLimit: 1000, // Default to 1000 as requested
 	}
 
-	pool, err := workerpool.NewPool[*Request, *Response](ctx, "fetcher", numWorkers, qSize, logger, f.workerTask)
+	pool, err := workerpool.NewPool(ctx, "fetcher", numWorkers, qSize, logger, f.workerTask)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +109,7 @@ func (f *Fetcher) workerTask(ctx context.Context, req *Request) (*Response, erro
 		}
 	}
 
-	f.logger.Info("fetching url", logAttrs...)
+	f.logger.Debug("fetching url", logAttrs...)
 
 	return f.Fetch(ctx, req)
 }
@@ -141,7 +141,9 @@ func (f *Fetcher) doRequest(ctx context.Context, httpReq *http.Request) (*Respon
 // HTTP Client
 // =============================================================================
 
-func newSecureHTTPClient() *http.Client {
+// NewSecureHTTPClient returns the shared TLS 1.3 HTTP client used by fetcher
+// workers and synchronous helpers (e.g. FetchPaginated).
+func NewSecureHTTPClient() *http.Client {
 	tlsConfig := &tls.Config{
 		MinVersion: tls.VersionTLS13,
 	}
@@ -165,9 +167,6 @@ func newSecureHTTPClient() *http.Client {
 	}
 }
 
-// Fetch is the work function that fetches data from a URL.
-// This is the domain-specific operation for the fetcher stage.
-// Note: Pagination logic has been moved to the processor.
 func (f *Fetcher) Fetch(ctx context.Context, inputReqDetails *Request) (*Response, error) {
 	const (
 		maxRetries = 3
@@ -213,7 +212,7 @@ func (f *Fetcher) Fetch(ctx context.Context, inputReqDetails *Request) (*Respons
 
 					// If current batch size exceeds global limit, clamp it
 					if current > limitCap {
-						f.logger.Info("clamping batch size to global limit",
+						f.logger.Debug("clamping batch size to global limit",
 							slog.Int("original", current),
 							slog.Int("limit", limitCap))
 
@@ -273,7 +272,7 @@ func (f *Fetcher) Fetch(ctx context.Context, inputReqDetails *Request) (*Respons
 			resp.Duration = time.Since(start)
 			resp.Request = inputReqDetails
 
-			f.logger.Info("fetch completed",
+			f.logger.Debug("fetch completed",
 				slog.String("url", inputReqDetails.URL),
 				slog.Int("bytes", len(resp.Data)),
 			)
@@ -365,7 +364,7 @@ func (f *Fetcher) BuildNextPageRequest(req *Request, itemCount int) *Request {
 
 	// If we got fewer items than the limit, we've reached the last page
 	if itemCount < limit {
-		f.logger.Info("reached last page",
+		f.logger.Debug("reached last page",
 			slog.String("url", req.URL),
 			slog.Int("itemCount", itemCount),
 			slog.Int("limit", limit),
@@ -435,7 +434,7 @@ func (f *Fetcher) BuildNextPageRequest(req *Request, itemCount int) *Request {
 		Body:     newBody,
 	}
 
-	f.logger.Info("built next page request",
+	f.logger.Debug("built next page request",
 		slog.String("url", nextReq.URL),
 		slog.Int("newOffset", offset+limit),
 	)

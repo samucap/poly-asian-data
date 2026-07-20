@@ -16,48 +16,44 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Initialize logger with default env (will be overridden after config load)
 	env := os.Getenv("ENV")
 	if env == "" {
 		env = "dev"
 	}
 	logging.Init(env)
 
-	logging.Info("Starting Poly Asian Data Pipeline...")
-
-	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {
 		logging.Error("Failed to load configuration", slog.Any("error", err))
 		os.Exit(1)
 	}
-
-	// Re-initialize logger with proper environment from config
 	logging.Init(cfg.ENV)
 
-	// Log startup info (demonstrating redaction)
-	logging.Info("Configuration loaded successfully",
+	logging.Info("Starting Poly Asian Data Pipeline...",
 		slog.String("environment", cfg.ENV),
-		slog.String("log level", cfg.LogLevel),
 	)
 
-	logging.Info("Application initialized. Starting data pipeline...")
+	factory, err := pipeline.NewFactory(ctx, cfg, logging.Logger)
+	if err != nil {
+		logging.Error("Failed to create pipeline factory", slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer factory.Close()
 
-	// Graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go sportsTagsSync(ctx, cfg)
-
-	<-sigChan
-	logging.Info("Shutdown signal received. Exiting...")
-}
-
-func sportsTagsSync(ctx context.Context, cfg *config.Config) {
-	plyMktPipeline, err := pipeline.New(ctx, logging.Logger, cfg)
+	pipe, err := factory.Create(ctx, pipeline.Options{Name: "sports-tags"})
 	if err != nil {
 		logging.Error("Failed to create pipeline", slog.Any("error", err))
 		os.Exit(1)
 	}
-	plyMktPipeline.RunSportsTagsSync()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		logging.Info("Shutdown signal received")
+		cancel()
+		pipe.Stop()
+	}()
+
+	pipe.RunSportsTagsSync()
 }

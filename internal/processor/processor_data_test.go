@@ -107,26 +107,16 @@ func TestProcessHolders(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, output)
 
-	// Verify SaverPayloads
-	require.Len(t, output.SaverPayloads, 2)
-	
-	// Payload 1: Users
-	payloadUsers := output.SaverPayloads[0]
-	assert.Equal(t, "plymkt_users", payloadUsers.TableName)
-	users, ok := payloadUsers.Data.([]services.PlyMktUser)
-	require.True(t, ok)
-	require.Len(t, users, 1)
-	assert.Equal(t, "0xHolder1", users[0].ProxyWallet)
+	// Holders are saved as a single bundle payload (users + holder records)
+	require.Len(t, output.SaverPayloads, 1)
+	assert.Equal(t, "plymkt_holders_bundle", output.SaverPayloads[0].TableName)
 
-	// Payload 2: Holders
-	payloadHolders := output.SaverPayloads[1]
-	assert.Equal(t, "plymkt_holders", payloadHolders.TableName)
-	
-	records, ok := payloadHolders.Data.([]services.PlyMktHolderRecord)
-	require.True(t, ok, "Payload data should be []PlyMktHolderRecord")
-	require.Len(t, records, 1)
-	
-	r := records[0]
+	bundle, ok := output.SaverPayloads[0].Data.(services.PlyMktHoldersBundle)
+	require.True(t, ok)
+	require.NotEmpty(t, bundle.Users)
+	assert.Equal(t, "0xHolder1", bundle.Users[0].ProxyWallet)
+	require.NotEmpty(t, bundle.Holders)
+	r := bundle.Holders[0]
 	assert.Equal(t, "0xToken1", r.TokenID)
 	assert.Equal(t, "0xHolder1", r.ProxyWallet)
 	assert.Equal(t, 100.5, r.Amount)

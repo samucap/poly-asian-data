@@ -48,6 +48,10 @@ type Processor struct {
 	// Dedup
 	processedConditions map[string]bool
 	conditionsMu        sync.Mutex
+
+	// OI merge buffer for top-markets: conditionID → oi value (MergeOI metadata).
+	oiMergeMu sync.Mutex
+	oiMerge   map[string]float64
 }
 
 // SaverPayload represents a chunk of data destined for a specific table.
@@ -124,41 +128,22 @@ func New(ctx context.Context, cfg *config.Config, numWorkers, qSize int) (*Proce
 		logger:              logger,
 		cfg:                 cfg,
 		processedConditions: make(map[string]bool),
+		oiMerge:             make(map[string]float64),
 	}
 
-	pool, err := workerpool.NewPool[*fetcher.Response, *Output](ctx, "processor", numWorkers, qSize, logger, p.workerTask)
+	pool, err := workerpool.NewPool(ctx, "processor", numWorkers, qSize, logger, p.workerTask)
 	if err != nil {
 		return nil, err
 	}
 
 	p.Pool = pool
 
-	logger.Info("processor initialized",
+	logger.Debug("processor initialized",
 		slog.Int("workers", numWorkers),
 		slog.Int("queue_size", qSize),
 	)
 
 	return p, nil
-}
-
-// SubscribeToFetcher connects to the fetcher's output channel.
-func (p *Processor) SubscribeToFetcher(ctx context.Context, upstream <-chan workerpool.Result[*fetcher.Response]) {
-	for {
-		select {
-		case result, ok := <-upstream:
-			if !ok {
-				return
-			}
-			if result.Err != nil {
-				p.logger.Warn("skipping failed fetch result",
-					slog.String("error", result.Err.Error()))
-				continue
-			}
-			_ = p.SubmitWait(result.Value)
-		case <-ctx.Done():
-			return
-		}
-	}
 }
 
 // =============================================================================
@@ -172,7 +157,7 @@ func (p *Processor) workerTask(ctx context.Context, resp *fetcher.Response) (*Ou
 		return nil, errors.New("nil response or request")
 	}
 
-	p.logger.Info("processing response",
+	p.logger.Debug("processing response",
 		slog.String("url", resp.URL),
 		slog.Int("bytes", len(resp.Data)),
 	)
@@ -183,7 +168,27 @@ func (p *Processor) workerTask(ctx context.Context, resp *fetcher.Response) (*Ou
 	// Dispatch based on URL path or logic
 	// Note: We need to differentiate "/tags", "/events", "/sports" (leagues), "/teams"
 	urlPath := resp.URL // In real usage, check parsed URL path better
+
+	// Intercept top_markets entity requests
+	entity := ""
+	if resp.Request.Metadata != nil {
+		entity = resp.Request.Metadata["Entity"]
+	}
+
 	switch {
+	case strings.HasPrefix(entity, "top_markets_"):
+		switch entity {
+		case "top_markets_oi":
+			output, err = p.processTopMarketsOI(resp)
+		case "top_markets_trades":
+			output, err = p.processTopMarketsTrades(resp)
+		case "top_markets_prices":
+			output, err = p.processTopMarketsPrices(resp)
+		case "top_markets_orderbooks":
+			output, err = p.processTopMarketsOrderbooks(resp)
+		default:
+			err = fmt.Errorf("unknown top_markets entity type: %s", entity)
+		}
 	case strings.Contains(urlPath, "/tags"):
 		output, err = p.processTags(resp)
 	case strings.Contains(urlPath, "/events"):
@@ -231,7 +236,7 @@ func (p *Processor) workerTask(ctx context.Context, resp *fetcher.Response) (*Ou
 	p.stats.BytesProcessed.Add(int64(len(resp.Data)))
 	p.stats.TotalDuration.Add(int64(output.Duration))
 
-	p.logger.Info("processed response",
+	p.logger.Debug("processed response",
 		slog.String("url", resp.URL),
 		slog.Int("itemCount", output.ItemCount),
 		slog.Int("derivedRequests", len(output.DerivedRequests)),
@@ -433,8 +438,7 @@ func (p *Processor) processEvents(resp *fetcher.Response) (*Output, error) {
 					Headers:  resp.Request.Headers,
 					Metadata: resp.Request.Metadata,
 				}
-				p.logger.Info("built next page request",
-					slog.String("component", "processor"),
+				p.logger.Debug("built next page request",
 					slog.String("url", nextReq.URL),
 					slog.Int("newOffset", newOffset),
 				)
@@ -761,7 +765,7 @@ func (p *Processor) processSubgraph(resp *fetcher.Response) (*Output, error) {
 				currentPage, _ = strconv.Atoi(cpStr)
 			}
 			if currentPage >= maxPages {
-				p.logger.Info("reached max pages limit",
+				p.logger.Debug("reached max pages limit",
 					slog.Int("maxPages", maxPages),
 					slog.Int("currentPage", currentPage),
 				)

@@ -1664,3 +1664,24 @@ func (ply *PlyMktService) GetMarketFillsReqs(ctx context.Context, marketIDs []st
 
 	return reqs, nil
 }
+
+type PlyMktOrderbookSnapshot struct {
+	Time          time.Time `json:"-" db:"time"`
+	MarketID      string    `json:"-" db:"market_id"`
+	TokenID       string    `json:"-" db:"token_id"`
+	BestBid       float64   `json:"-" db:"best_bid"`
+	BestAsk       float64   `json:"-" db:"best_ask"`
+	Imbalance     float64   `json:"-" db:"imbalance"`
+	TotalBidDepth float64   `json:"-" db:"total_bid_depth"`
+	TotalAskDepth float64   `json:"-" db:"total_ask_depth"`
+	DepthJSON     []byte    `json:"-" db:"depth_json"`
+	RawJSON       []byte    `json:"-" db:"raw_response_json"`
+	NegRisk       bool      `json:"-" db:"neg_risk"`
+	Timestamp     string    `json:"-" db:"timestamp"`
+}
+
+type PlyMktMarketOI struct {
+	Market string  `json:"market"`
+	Value  float64 `json:"value"`
+}
+
