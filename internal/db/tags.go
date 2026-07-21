@@ -80,8 +80,8 @@ func FetchTopCategoryTags(ctx context.Context, conn DBInterface, parentTagID str
 		FROM tags WHERE parent_tag_id = $1`, parentTagID)
 }
 
-// FetchTagSubtree loads all tags under rootParentID: direct children (top-level)
-// and their children (subtags). Used for hierarchical catalog loads.
+// FetchTagSubtree loads the full descendant tree under rootParentID (recursive).
+// Needed for sports chains like mlb → baseball → Sports → Categories (depth 3+).
 // maxUpdated is the newest updated_at among returned rows.
 func FetchTagSubtree(ctx context.Context, conn DBInterface, rootParentID string) ([]*services.PlyMktTag, time.Time, error) {
 	if conn == nil {
@@ -90,12 +90,20 @@ func FetchTagSubtree(ctx context.Context, conn DBInterface, rootParentID string)
 	if rootParentID == "" {
 		return nil, time.Time{}, fmt.Errorf("db: rootParentID is required")
 	}
-	// Depth-1 and depth-2 under root (matches fetchCategories related-tags walk).
+	// Recursive CTE with depth cap to avoid cycles; sports trees are shallow.
 	query := `
+		WITH RECURSIVE tree AS (
+			SELECT id, label, slug, force_show, force_hide, parent_tag_id, updated_at, 1 AS depth
+			FROM tags
+			WHERE parent_tag_id = $1
+			UNION ALL
+			SELECT t.id, t.label, t.slug, t.force_show, t.force_hide, t.parent_tag_id, t.updated_at, tree.depth + 1
+			FROM tags t
+			INNER JOIN tree ON t.parent_tag_id = tree.id
+			WHERE tree.depth < 8
+		)
 		SELECT id, label, slug, force_show, force_hide, parent_tag_id, updated_at
-		FROM tags
-		WHERE parent_tag_id = $1
-		   OR parent_tag_id IN (SELECT id FROM tags WHERE parent_tag_id = $1)`
+		FROM tree`
 	return fetchTagsWhere(ctx, conn, query, rootParentID)
 }
 
@@ -146,6 +154,10 @@ func UpdateTags(ctx context.Context, conn DBInterface, tags []*services.PlyMktTa
 		return ErrNilDB
 	}
 
+	// parent_tag_id: writer is authoritative when non-empty (catalog-markets overlays
+	// sports hierarchy as Gamma parent tag ids before calling this). Never use
+	// tags.sport_id (UUID) as hierarchy — that is only a sports-table FK for leagues/teams.
+	// label/slug: never replace a non-empty value with empty/null from a sparse writer.
 	sql := `
 		INSERT INTO tags (
 			id, label, slug, force_show, force_hide, parent_tag_id,
@@ -155,11 +167,20 @@ func UpdateTags(ctx context.Context, conn DBInterface, tags []*services.PlyMktTa
 			$7, $8, $9, $10
 		)
 		ON CONFLICT (id) DO UPDATE SET
-			label = EXCLUDED.label,
-			slug = EXCLUDED.slug,
+			label = CASE
+				WHEN EXCLUDED.label IS NOT NULL AND EXCLUDED.label <> '' THEN EXCLUDED.label
+				ELSE tags.label
+			END,
+			slug = CASE
+				WHEN EXCLUDED.slug IS NOT NULL AND EXCLUDED.slug <> '' THEN EXCLUDED.slug
+				ELSE tags.slug
+			END,
 			force_show = EXCLUDED.force_show,
 			force_hide = EXCLUDED.force_hide,
-			parent_tag_id = EXCLUDED.parent_tag_id,
+			parent_tag_id = CASE
+				WHEN EXCLUDED.parent_tag_id IS NOT NULL THEN EXCLUDED.parent_tag_id
+				ELSE tags.parent_tag_id
+			END,
 			total_vol = EXCLUDED.total_vol,
 			total_vol_24hr = EXCLUDED.total_vol_24hr,
 			total_liq = EXCLUDED.total_liq,

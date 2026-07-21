@@ -607,6 +607,34 @@ CREATE INDEX IF NOT EXISTS idx_hot_vol_24hr ON hot_markets_vol (volume_24hr DESC
 CREATE INDEX IF NOT EXISTS idx_hot_score ON hot_markets_vol (score DESC, time DESC);
 CREATE INDEX IF NOT EXISTS idx_hot_category ON hot_markets_vol (category, time DESC);
 
+-- Current edge-scan board (latest snapshot per condition; not a hypertable).
+-- Replaced each edge-scan cycle for strategy 'default' (or named strategies later).
+CREATE TABLE IF NOT EXISTS edge_board (
+    strategy              TEXT NOT NULL DEFAULT 'default',
+    condition_id          TEXT NOT NULL,
+    market_id             TEXT,
+    question_short        TEXT,
+    category              TEXT,
+    clob_token_ids        TEXT[] NOT NULL DEFAULT '{}',
+    rank                  INTEGER NOT NULL,
+    score                 DOUBLE PRECISION,
+    edge_bps              DOUBLE PRECISION,
+    strategy_version_id   BIGINT,
+    neg_risk              BOOLEAN NOT NULL DEFAULT FALSE,
+    neg_risk_group_id     TEXT,
+    related_legs          TEXT[] NOT NULL DEFAULT '{}',
+    volume_24hr           DOUBLE PRECISION,
+    liquidity             DOUBLE PRECISION,
+    spread                DOUBLE PRECISION,
+    selected_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    run_id                TEXT,
+    PRIMARY KEY (strategy, condition_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_edge_board_rank ON edge_board (strategy, rank);
+CREATE INDEX IF NOT EXISTS idx_edge_board_group ON edge_board (neg_risk_group_id) WHERE neg_risk_group_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_edge_board_selected ON edge_board (selected_at DESC);
+
 CREATE TABLE IF NOT EXISTS oi_history (
     time         TIMESTAMPTZ      NOT NULL,
     condition_id TEXT             NOT NULL,

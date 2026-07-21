@@ -35,6 +35,8 @@ type Config struct {
 	TopMarkets TopMarketsConfig
 	// Catalog drives cmd/catalog-markets (full open-universe sync, no enrichment).
 	Catalog CatalogConfig
+	// EdgeScan drives cmd/edge-scan (filtered candidates → board).
+	EdgeScan EdgeScanConfig
 }
 
 type WorkerPoolConfig struct {
@@ -50,6 +52,32 @@ type CatalogConfig struct {
 	RefreshInterval time.Duration
 	// PaginateDelay is the wait between paginated HTTP pages (keyset / offset).
 	PaginateDelay time.Duration
+}
+
+// EdgeScanConfig holds cadence, keyset filters, Stage-1 thresholds, and board size for cmd/edge-scan.
+type EdgeScanConfig struct {
+	RefreshInterval time.Duration
+	PaginateDelay   time.Duration
+	// Strategy name for edge_board PK partition (default "default").
+	Strategy string
+	// Keyset server-side filters (Gamma event-level).
+	KeysetVolumeMin    float64
+	KeysetLiquidityMin float64
+	EndDateMinOffset   time.Duration // end_date_min = now - offset; 0 omits
+	EndDateMaxOffset   time.Duration // end_date_max = now + offset; 0 omits
+	// KeysetEventCap stops pagination after N events (0 = unlimited). Default 3000.
+	KeysetEventCap int
+	// Stage-1 in-process filters (market-level).
+	MinVolume24hr float64
+	MinLiquidity  float64
+	MaxSpread     float64
+	MinVolatility float64 // 0 = do not require |Δp|
+	// Stage1MaxN is max markets after Stage-1 score (enrichment budget). Default 200.
+	Stage1MaxN int
+	// BoardMaxN is final edge board size. Default 50 (plan: 30–80).
+	BoardMaxN int
+	// Sticky keeps prior board members that still pass Stage-1 when possible.
+	Sticky bool
 }
 
 // TopMarketsConfig holds market-ranking filter thresholds, keyset scan filters,
@@ -117,6 +145,7 @@ func Load() (*Config, error) {
 		},
 		TopMarkets: loadTopMarketsConfig(),
 		Catalog:    loadCatalogConfig(),
+		EdgeScan:   loadEdgeScanConfig(),
 	}
 
 	// Compose PostgresURL if not set
@@ -195,6 +224,29 @@ func loadCatalogConfig() CatalogConfig {
 		RefreshInterval: getEnvDuration("CATALOG_REFRESH_INTERVAL", 10*time.Minute),
 		// Fall back to PAGINATE_DELAY when CATALOG_PAGINATE_DELAY unset (shared throttle).
 		PaginateDelay: getEnvDuration("CATALOG_PAGINATE_DELAY", getEnvDuration("PAGINATE_DELAY", 0)),
+	}
+}
+
+func loadEdgeScanConfig() EdgeScanConfig {
+	minVol := getEnvFloat("EDGE_MIN_VOLUME", getEnvFloat("MIN_VOLUME", 30000.0))
+	minLiq := getEnvFloat("EDGE_MIN_LIQUIDITY", getEnvFloat("MIN_LIQUIDITY", 15000.0))
+	return EdgeScanConfig{
+		RefreshInterval:    getEnvDuration("EDGE_REFRESH_INTERVAL", 2*time.Minute),
+		PaginateDelay:      getEnvDuration("EDGE_PAGINATE_DELAY", getEnvDuration("PAGINATE_DELAY", 0)),
+		Strategy:           getEnv("EDGE_STRATEGY", "default"),
+		KeysetVolumeMin:    getEnvFloat("EDGE_KEYSET_VOLUME_MIN", minVol),
+		KeysetLiquidityMin: getEnvFloat("EDGE_KEYSET_LIQUIDITY_MIN", minLiq),
+		EndDateMinOffset:   getEnvDuration("EDGE_END_DATE_MIN_OFFSET", 0),
+		EndDateMaxOffset:   getEnvDuration("EDGE_END_DATE_MAX_OFFSET", 0),
+		KeysetEventCap:     getEnvInt("EDGE_KEYSET_EVENT_CAP", 3000),
+		MinVolume24hr:      minVol,
+		MinLiquidity:       minLiq,
+		MaxSpread:          getEnvFloat("EDGE_MAX_SPREAD", getEnvFloat("MAX_SPREAD", 0.05)),
+		// Default 0: do not require prior 1d move for board membership (M2).
+		MinVolatility: getEnvFloat("EDGE_MIN_VOLATILITY", 0),
+		Stage1MaxN:    getEnvInt("EDGE_STAGE1_MAX_N", 200),
+		BoardMaxN:     getEnvInt("EDGE_BOARD_MAX_N", 50),
+		Sticky:        getEnv("EDGE_STICKY", "true") != "false",
 	}
 }
 

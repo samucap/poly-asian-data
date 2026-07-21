@@ -24,6 +24,10 @@ build-top-markets:
 	@echo "Building top-markets..."
 	CGO_ENABLED=0 go build -ldflags="-w -s" -o bin/top-markets ./cmd/top-markets
 
+build-edge-scan:
+	@echo "Building edge-scan..."
+	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/edge-scan ./cmd/edge-scan
+
 # One catalog cycle then exit (needs Postgres + network)
 run-catalog-once:
 	go run ./cmd/catalog-markets --once
@@ -31,6 +35,9 @@ run-catalog-once:
 # Wipe tags (FK-safe) + sports-sync + force API catalog rebuild
 run-catalog-reset-tags:
 	go run ./cmd/catalog-markets --reset-tags --once
+
+run-edge-scan-once:
+	go run ./cmd/edge-scan --once
 
 # Clean build artifacts
 clean:

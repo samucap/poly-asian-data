@@ -33,6 +33,7 @@ import (
 	"github.com/samucap/poly-asian-data/internal/pipeline"
 	"github.com/samucap/poly-asian-data/internal/saver"
 	"github.com/samucap/poly-asian-data/internal/services"
+	"github.com/samucap/poly-asian-data/internal/sportstags"
 	"github.com/samucap/poly-asian-data/internal/tagagg"
 )
 
@@ -87,6 +88,8 @@ func main() {
 
 	dbPool := factory.DB()
 	httpClient := fetcher.NewSecureHTTPClient()
+	// After --reset-tags sports-sync, skip one BeforeAPIRefresh sports-sync in the next cycle.
+	skipNextSportsSync := false
 
 	if *resetTags {
 		logger.Warn("resetting tag catalog (null sports.primary_tag_id, delete all tags, clear watermark)")
@@ -108,6 +111,7 @@ func main() {
 			os.Exit(1)
 		}
 		logger.Info("sports-sync after reset complete")
+		skipNextSportsSync = true
 
 		// Always run one catalog rebuild after wipe so DB is not left empty.
 		if !*once {
@@ -121,9 +125,20 @@ func main() {
 		var cycleErrs []artifacts.ErrorItem
 		status := artifacts.StatusSuccess
 
-		// 0. Tag catalog
+		// 0. Tag catalog. On API refresh: sports-sync first (seeds sports tags+parents),
+		// then related-tags BFS (sports parents locked). Fresh watermark → DB load only.
 		stage := time.Now()
-		tagRes := catalog.LoadTagCatalog(ctx, logger, dbPool, httpClient, cfg, start)
+		tagRes := catalog.LoadTagCatalog(ctx, logger, dbPool, httpClient, cfg, start, catalog.LoadTagCatalogOptions{
+			BeforeAPIRefresh: func(ctx context.Context) error {
+				// One-shot skip after --reset-tags (sports-sync already ran).
+				if skipNextSportsSync {
+					skipNextSportsSync = false
+					logger.Info("skipping sports-sync in cycle (already ran after --reset-tags)")
+					return nil
+				}
+				return pipe.SyncSportsTags()
+			},
+		})
 		catMap := tagRes.Catalog
 		logger.Info("stage complete",
 			"stage", "catalog",
@@ -137,6 +152,26 @@ func main() {
 			})
 			status = artifacts.StatusPartial
 		}
+
+		// 0b. Apply sports edges from DB (leagues/teams already synced) onto catMap
+		// before Aggregate. Cheap CPU rebuild; not a post-metrics parent fix.
+		stage = time.Now()
+		sportsEdges, err := catalog.OverlaySportsHierarchy(ctx, logger, dbPool, catMap)
+		if err != nil {
+			logger.Warn("sports hierarchy overlay failed; continuing without", "error", err)
+			sportsEdges = nil
+			cycleErrs = append(cycleErrs, artifacts.ErrorItem{
+				Code: "sports_hierarchy_overlay_failed", Message: err.Error(), Component: "sports_hierarchy",
+			})
+			if status == artifacts.StatusSuccess {
+				status = artifacts.StatusPartial
+			}
+		}
+		logger.Info("stage complete",
+			"stage", "sports_hierarchy",
+			"duration", logging.FormatDuration(time.Since(stage)),
+			"edges", logging.FormatCount(int64(len(sportsEdges))),
+		)
 
 		// 1. Full open-universe keyset
 		stage = time.Now()
@@ -169,6 +204,11 @@ func main() {
 					"unresolved_markets", logging.FormatCount(int64(agg.UnresolvedMarkets)),
 				)
 			}
+		}
+		// Re-assert sports parents on working tags so discovery does not clobber hierarchy.
+		// Must happen before UpdateTags (same parents Aggregate used for rollup).
+		if len(sportsEdges) > 0 {
+			sportstags.ApplyParents(agg.Tags, sportsEdges)
 		}
 		logger.Info("stage complete",
 			"stage", "aggregate",
@@ -204,15 +244,26 @@ func main() {
 			}
 		}
 
-		// 3. Update tags
+		// 3. Update tags once: metrics + parents already set on agg.Tags (sports via edges).
+		// No post-UpdateTags hierarchy rewrite — Aggregate already used these parents.
 		stage = time.Now()
-		if len(catMap) > 0 {
+		if len(catMap) > 0 || len(agg.Tags) > 0 {
 			toWrite := tagagg.TagsForUpdate(agg.Tags)
 			toWrite = append([]*services.PlyMktTag{{
 				ID:    catalog.CategoriesRootTagID,
 				Label: "Categories",
 				Slug:  "categories",
 			}}, toWrite...)
+			for _, t := range toWrite {
+				if t == nil {
+					continue
+				}
+				if t.ID == sportstags.TagIDSports {
+					t.ParentTagID = catalog.CategoriesRootTagID
+				} else if p, ok := sportstags.ParentOf(t.ID, sportsEdges); ok {
+					t.ParentTagID = p
+				}
+			}
 			if err := db.UpdateTags(ctx, dbPool, toWrite); err != nil {
 				logger.Error("failed to update tags", "error", err)
 				cycleErrs = append(cycleErrs, artifacts.ErrorItem{

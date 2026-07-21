@@ -49,11 +49,17 @@ func TestProcessor_ProcessSports(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 2, output.ItemCount)
 		
-		// Check payloads (leagues table only — hierarchy is handled at save time)
+		// leagues only; hierarchy applied later after tag defs
 		require.Len(t, output.SaverPayloads, 1)
 		assert.Equal(t, "leagues", output.SaverPayloads[0].TableName)
 		leagues := output.SaverPayloads[0].Data.([]services.PlyMktSport)
 		assert.Equal(t, "basketball", leagues[0].Sport)
+		assert.Empty(t, output.DerivedRequests)
+		ids := p.TakePendingSportTagIDs()
+		assert.Contains(t, ids, "1")
+		assert.Contains(t, ids, "64")
+		pending := p.TakePendingLeagues()
+		require.Len(t, pending, 2)
 	})
 }
 

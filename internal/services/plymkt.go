@@ -748,33 +748,42 @@ func (ply *PlyMktService) GetSportsReqs(ctx context.Context) ([]*fetcher.Request
 		return nil, err
 	}
 
-	// Order matters: tags first (sports.primary_tag_id FK references tags), then sports, then teams
+	// Do NOT bulk-fetch /tags?offset=… — that returns the entire global tag dump
+	// (many inactive) and Gamma rejects deep offsets with non-JSON errors.
+	// Tag definitions are loaded by-id from IDs discovered on /sports league rows
+	// (see processor.processLeagues → GET /tags/{id}).
+	//
+	// Order: leagues first (queue tag defs + hierarchy for post-batch), then teams.
 	targets := []struct {
 		path  string
 		limit int
+		pages int
 	}{
-		{path: "/tags", limit: 300},
-		{path: "/sports", limit: 500},
-		{path: "/teams", limit: 500},
+		{path: "/sports", limit: 500, pages: 2},
+		{path: "/teams", limit: 500, pages: 4},
 	}
 
 	var reqs []*fetcher.Request
-	offset := 0
 	for _, target := range targets {
-		currQuery := url.Values{}
-		currQuery.Add("limit", fmt.Sprintf("%d", target.limit))
-		currQuery.Add("offset", fmt.Sprintf("%d", offset))
-		fullURL := baseUrl.JoinPath(target.path)
-		fullURL.RawQuery = currQuery.Encode()
+		for page := 0; page < target.pages; page++ {
+			offset := page * target.limit
+			currQuery := url.Values{}
+			currQuery.Set("limit", fmt.Sprintf("%d", target.limit))
+			currQuery.Set("offset", fmt.Sprintf("%d", offset))
+			fullURL := baseUrl.JoinPath(target.path)
+			fullURL.RawQuery = currQuery.Encode()
 
-		r := &fetcher.Request{
-			URL:     fullURL.String(),
-			Headers: map[string]string{"Content-Type": "application/json"},
-			Method:  "GET",
-			Params:  fullURL.Query(),
+			reqs = append(reqs, &fetcher.Request{
+				URL:     fullURL.String(),
+				Headers: map[string]string{"Content-Type": "application/json"},
+				Method:  "GET",
+				Params:  fullURL.Query(),
+				Metadata: map[string]string{
+					"Entity": target.path,
+					"Offset": fmt.Sprintf("%d", offset),
+				},
+			})
 		}
-		reqs = append(reqs, r)
-		offset += target.limit
 	}
 
 	return reqs, nil
