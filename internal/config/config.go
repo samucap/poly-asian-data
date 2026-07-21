@@ -40,14 +40,31 @@ type WorkerPoolConfig struct {
 	Qsize      int
 }
 
-// TopMarketsConfig holds market-ranking filter thresholds and refresh cadence.
+// TopMarketsConfig holds market-ranking filter thresholds, keyset scan filters,
+// enrichment tuning, and refresh cadence for cmd/top-markets.
 type TopMarketsConfig struct {
 	RefreshInterval time.Duration
-	MinVolume24hr   float64
-	MinLiquidity    float64
-	MaxSpread       float64
-	MinVolatility   float64
-	MaxN            int
+	// Rank filters (applied in-process after the scan).
+	MinVolume24hr float64
+	MinLiquidity  float64
+	MaxSpread     float64
+	MinVolatility float64
+	MaxN          int
+	// Keyset server-side filters (Gamma /events/keyset query params).
+	// volume_min is Gamma event volume (not necessarily 24h).
+	KeysetVolumeMin    float64
+	KeysetLiquidityMin float64
+	// EndDateMinOffset: if > 0, set end_date_min = now - offset. Zero omits the param.
+	EndDateMinOffset time.Duration
+	// EndDateMaxOffset: if > 0, set end_date_max = now + offset. Zero omits the param.
+	EndDateMaxOffset time.Duration
+	// Enrichment (ranked markets only).
+	PriceLookback   time.Duration // first-cycle price history window (default 30d for backtests)
+	PriceFidelity   int           // minutes; higher = fewer points
+	PriceBatchSize  int
+	TradesBatchSize int
+	// PaginateDelay is the wait between paginated HTTP pages (keyset / offset). Default 0.
+	PaginateDelay time.Duration
 }
 
 type ServicesConfig struct {
@@ -86,14 +103,7 @@ func Load() (*Config, error) {
 			NumWorkers: getEnvInt("SAVER_WORKERS", defaultWorkers/2+1), // Safer writes
 			Qsize:      getEnvInt("SAVER_QUEUE_SIZE", 200),
 		},
-		TopMarkets: TopMarketsConfig{
-			RefreshInterval: getEnvDuration("REFRESH_INTERVAL", 10*time.Minute),
-			MinVolume24hr:   getEnvFloat("MIN_VOLUME", 30000.0),
-			MinLiquidity:    getEnvFloat("MIN_LIQUIDITY", 15000.0),
-			MaxSpread:       getEnvFloat("MAX_SPREAD", 0.05),
-			MinVolatility:   getEnvFloat("MIN_VOLATILITY", 0.01),
-			MaxN:            getEnvInt("MAX_N", 500),
-		},
+		TopMarkets: loadTopMarketsConfig(),
 	}
 
 	// Compose PostgresURL if not set
@@ -127,10 +137,10 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) Validate() error {
-    if c.PostgresURL == "" {
-        return &ValidationError{Field: "PostgresURL", Message: "POSTGRES_URL is required"}
-    }
-    return nil
+	if c.PostgresURL == "" {
+		return &ValidationError{Field: "PostgresURL", Message: "POSTGRES_URL is required"}
+	}
+	return nil
 }
 
 func getEnv(key, defaultVal string) string {
@@ -165,4 +175,26 @@ func getEnvDuration(key string, defaultVal time.Duration) time.Duration {
 		}
 	}
 	return defaultVal
+}
+
+func loadTopMarketsConfig() TopMarketsConfig {
+	minVol := getEnvFloat("MIN_VOLUME", 30000.0)
+	minLiq := getEnvFloat("MIN_LIQUIDITY", 15000.0)
+	return TopMarketsConfig{
+		RefreshInterval:    getEnvDuration("REFRESH_INTERVAL", 10*time.Minute),
+		MinVolume24hr:      minVol,
+		MinLiquidity:       minLiq,
+		MaxSpread:          getEnvFloat("MAX_SPREAD", 0.05),
+		MinVolatility:      getEnvFloat("MIN_VOLATILITY", 0.01),
+		MaxN:               getEnvInt("MAX_N", 500),
+		KeysetVolumeMin:    getEnvFloat("KEYSET_VOLUME_MIN", minVol),
+		KeysetLiquidityMin: getEnvFloat("KEYSET_LIQUIDITY_MIN", minLiq),
+		EndDateMinOffset:   getEnvDuration("END_DATE_MIN_OFFSET", 24*time.Hour),
+		EndDateMaxOffset:   getEnvDuration("END_DATE_MAX_OFFSET", 0),
+		PriceLookback:      getEnvDuration("PRICE_LOOKBACK", 30*24*time.Hour),
+		PriceFidelity:      getEnvInt("PRICE_FIDELITY", 60),
+		PriceBatchSize:     getEnvInt("PRICE_BATCH_SIZE", 20),
+		TradesBatchSize:    getEnvInt("TRADES_BATCH_SIZE", 40),
+		PaginateDelay:      getEnvDuration("PAGINATE_DELAY", 0),
+	}
 }

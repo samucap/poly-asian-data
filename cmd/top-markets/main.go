@@ -78,6 +78,7 @@ func main() {
 		MaxN:          cfg.TopMarkets.MaxN,
 	}
 	fetchInterval := cfg.TopMarkets.RefreshInterval
+	fetcher.PaginateDelay = cfg.TopMarkets.PaginateDelay
 
 	// Tag catalog under 102982: DB when watermark fresh; API related-tags BFS when stale.
 	// Metric aggregates are recomputed every cycle after the market pass.
@@ -86,12 +87,18 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 
+	// TODO: change this into separate pipelines. one for full event/tag fetching and syncing, another for top-market watch with optimized
+	// filters for fetching events
 	runCycle := func() {
 		logger.Info("market refresh cycle starting")
 		start := time.Now()
-		catalog := loadTagCatalog(ctx, logger, dbPool, httpClient, cfg, start)
+		stage := start
 
-		// 1. Keyset-fetch all open events (no offset; cursor only).
+		catalog := loadTagCatalog(ctx, logger, dbPool, httpClient, cfg, start)
+		logger.Info("stage complete", "stage", "catalog", "duration", logging.FormatDuration(time.Since(stage)), "tags", logging.FormatCount(int64(len(catalog))))
+
+		// 1. Keyset-fetch open events (sequential pages; filters shrink the universe).
+		stage = time.Now()
 		gammaBase, _ := cfg.Services.PlyMkt.Endpoints["gamma"].(string)
 		u, err := url.Parse(gammaBase + "/events/keyset")
 		if err != nil {
@@ -99,6 +106,8 @@ func main() {
 			return
 		}
 		// Documented keyset params only — omit offset (callers must not set it).
+		// No volume_min / liquidity_min / end_date_* for now: full open-universe scan
+		// so tag aggregates and market saves are not undercounted. Rank filters stay in-process.
 		q := u.Query()
 		q.Set("closed", "false")
 		q.Set("active", "true")
@@ -112,12 +121,18 @@ func main() {
 			logger.Error("failed to fetch events (keyset)", "error", err)
 			return
 		}
-		logger.Info("events fetched", "count", logging.FormatCount(int64(len(events))))
+		logger.Info("stage complete",
+			"stage", "events_keyset",
+			"duration", logging.FormatDuration(time.Since(stage)),
+			"events", logging.FormatCount(int64(len(events))),
+		)
 
-		// 2. Classify + aggregate when a catalog exists (skip tag write if empty).
+		// 2. Classify + aggregate (single-threaded; full event list).
+		stage = time.Now()
 		var agg tagagg.Result
 		if len(catalog) == 0 {
 			logger.Warn("tag catalog map empty; cycle continues without tag aggregates")
+			// TODO: why's this here? Shouldn't it just skip?
 			agg = tagagg.Aggregate(events, nil, categoriesRootTagID)
 		} else {
 			agg = tagagg.Aggregate(events, catalog, categoriesRootTagID)
@@ -130,6 +145,12 @@ func main() {
 
 		// 3. Global rank over tradable pool.
 		ranked := marketranking.RankMarkets(agg.Tradable, defaultFilter)
+		logger.Info("stage complete",
+			"stage", "aggregate_rank",
+			"duration", logging.FormatDuration(time.Since(stage)),
+			"tradable", logging.FormatCount(int64(len(agg.Tradable))),
+			"ranked", logging.FormatCount(int64(len(ranked))),
+		)
 
 		var conditionIDs []string
 		var clobTokens []clobToken
@@ -150,7 +171,25 @@ func main() {
 			}
 		}
 
-		// 4. Enrichment then merge OI into save-side markets (and ranked).
+		// 4. Persist tags once (defs + parent + aggregates) before enrichment wait.
+		stage = time.Now()
+		if len(catalog) > 0 {
+			toWrite := tagagg.TagsForUpdate(agg.Tags)
+			// Root first so parent_tag_id FKs resolve for top categories.
+			toWrite = append([]*services.PlyMktTag{{
+				ID:    categoriesRootTagID,
+				Label: "Categories",
+				Slug:  "categories",
+			}}, toWrite...)
+			// TODO: why isn't this a parallelized process?
+			if err := db.UpdateTags(ctx, dbPool, toWrite); err != nil {
+				logger.Error("failed to update tags", "error", err)
+			}
+		}
+		logger.Info("stage complete", "stage", "update_tags", "duration", logging.FormatDuration(time.Since(stage)))
+
+		// 5. Enrichment for ranked markets only (parallel via fetcher/processor pools).
+		stage = time.Now()
 		submitEnrichment(ctx, pipe, cfg, conditionIDs, clobTokens)
 		pipe.WaitUntilIdle(ctx, 500*time.Millisecond)
 
@@ -168,21 +207,15 @@ func main() {
 				m.OpenInterest = sm.OpenInterest
 			}
 		}
+		logger.Info("stage complete",
+			"stage", "enrichment",
+			"duration", logging.FormatDuration(time.Since(stage)),
+			"conditions", logging.FormatCount(int64(len(conditionIDs))),
+			"clob_tokens", logging.FormatCount(int64(len(clobTokens))),
+		)
 
-		// 5. Persist tags (defs + parent + aggregates) only when we had a catalog to aggregate into.
-		if len(catalog) > 0 {
-			toWrite := tagagg.TagsForUpdate(agg.Tags)
-			// Root first so parent_tag_id FKs resolve for top categories.
-			toWrite = append([]*services.PlyMktTag{{
-				ID:    categoriesRootTagID,
-				Label: "Categories",
-				Slug:  "categories",
-			}}, toWrite...)
-			if err := db.UpdateTags(ctx, dbPool, toWrite); err != nil {
-				logger.Error("failed to update tags", "error", err)
-			}
-		}
-
+		// 6. Save markets (after OI merge).
+		stage = time.Now()
 		if len(agg.Markets) > 0 {
 			if err := pipe.SubmitSave(ctx, &saver.Record{
 				TableName: "plymkt_markets",
@@ -192,8 +225,8 @@ func main() {
 				logger.Error("failed to submit markets save", "error", err)
 			}
 		}
-
 		pipe.WaitUntilIdle(ctx, 500*time.Millisecond)
+		logger.Info("stage complete", "stage", "save_markets", "duration", logging.FormatDuration(time.Since(stage)))
 
 		duration := time.Since(start)
 		nextAt := time.Now().Add(fetchInterval)
@@ -296,6 +329,25 @@ func submitEnrichment(ctx context.Context, pipe *pipeline.Pipeline, cfg *config.
 	dataAPI := endpoint(cfg, "data_api", "https://data-api.polymarket.com")
 	clobAPI := endpoint(cfg, "clob", "https://clob.polymarket.com")
 
+	tm := cfg.TopMarkets
+	tradesBatchSize := tm.TradesBatchSize
+	if tradesBatchSize <= 0 {
+		tradesBatchSize = 40
+	}
+	priceBatchSize := tm.PriceBatchSize
+	if priceBatchSize <= 0 {
+		priceBatchSize = 40
+	}
+	priceFidelity := tm.PriceFidelity
+	if priceFidelity <= 0 {
+		priceFidelity = 60
+	}
+	priceLookback := tm.PriceLookback
+	if priceLookback <= 0 {
+		priceLookback = 30 * 24 * time.Hour
+	}
+
+	// OI / trades / prices / books: fetcher only downloads raw bytes; processors unmarshal.
 	for _, id := range conditionIDs {
 		if id == "" {
 			continue
@@ -314,7 +366,6 @@ func submitEnrichment(ctx context.Context, pipe *pipeline.Pipeline, cfg *config.
 		})
 	}
 
-	const tradesBatchSize = 20
 	for i := 0; i < len(conditionIDs); i += tradesBatchSize {
 		end := i + tradesBatchSize
 		if end > len(conditionIDs) {
@@ -337,15 +388,16 @@ func submitEnrichment(ctx context.Context, pipe *pipeline.Pipeline, cfg *config.
 		})
 	}
 
+	// TODO: this needs to be per market? or does the lastUpdated from any lastUpdated cover all?
 	priceFetchFrom := lastPriceFetchTs
 	if priceFetchFrom == 0 {
-		priceFetchFrom = time.Now().Unix() - 30*24*60*60
+		priceFetchFrom = time.Now().Unix() - int64(priceLookback.Seconds())
 	} else {
-		priceFetchFrom -= 3600
+		priceFetchFrom -= 3600 // small overlap with prior cycle
 	}
 	lastPriceFetchTs = time.Now().Unix()
+	fidelityStr := fmt.Sprintf("%d", priceFidelity)
 
-	const priceBatchSize = 20
 	for i := 0; i < len(clobTokens); i += priceBatchSize {
 		end := i + priceBatchSize
 		if end > len(clobTokens) {
@@ -362,7 +414,7 @@ func submitEnrichment(ctx context.Context, pipe *pipeline.Pipeline, cfg *config.
 			"markets":  markets,
 			"start_ts": float64(priceFetchFrom),
 			"interval": "max",
-			"fidelity": 5,
+			"fidelity": priceFidelity,
 		}
 		bodyBytes, _ := json.Marshal(body)
 		mapBytes, _ := json.Marshal(tokenMap)
@@ -374,7 +426,7 @@ func submitEnrichment(ctx context.Context, pipe *pipeline.Pipeline, cfg *config.
 			Metadata: map[string]string{
 				"Entity":         "top_markets_prices",
 				"TokenMarketMap": string(mapBytes),
-				"Fidelity":       "5",
+				"Fidelity":       fidelityStr,
 			},
 		})
 	}

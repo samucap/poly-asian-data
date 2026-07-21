@@ -13,6 +13,23 @@ import (
 	"github.com/samucap/poly-asian-data/internal/logging"
 )
 
+// PaginateDelay is the optional wait between successive page requests.
+// Default 0 (no artificial delay). Set from config at process start if needed
+// (e.g. after HTTP 429s). Used by FetchPaginated and FetchPaginatedKeyset.
+var PaginateDelay time.Duration
+
+func waitPaginateDelay(ctx context.Context) error {
+	if PaginateDelay <= 0 {
+		return ctx.Err()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(PaginateDelay):
+		return nil
+	}
+}
+
 // FetchPaginated collects all pages of a JSON-array API before returning.
 // limit must be ≤ the API's max page size (Gamma events/tags: 100). Stopping when
 // len(page) < limit is only valid when limit is that real page size.
@@ -92,10 +109,8 @@ func FetchPaginated[T any](ctx context.Context, cl *http.Client, baseURL *url.UR
 			break
 		}
 
-		select {
-		case <-ctx.Done():
-			return allResults, ctx.Err()
-		case <-time.After(250 * time.Millisecond):
+		if err := waitPaginateDelay(ctx); err != nil {
+			return allResults, err
 		}
 	}
 
@@ -116,8 +131,7 @@ type keysetPage[T any] struct {
 // Response: {"events":[...], "next_cursor":"..."} — next_cursor omitted on the last page.
 // Stops when events is empty, next_cursor is empty, or limitThreshold is reached.
 // limit must be ≤ API max (Gamma keyset: 500).
-//
-// TODO: inter-page delay is temporary; revisit once secure HTTP client dial is modular.
+// Inter-page wait uses package PaginateDelay (default 0).
 func FetchPaginatedKeyset[T any](ctx context.Context, cl *http.Client, baseURL *url.URL, limit int, limitThreshold int) ([]*T, error) {
 	if cl == nil {
 		cl = NewSecureHTTPClient()
@@ -186,10 +200,8 @@ func FetchPaginatedKeyset[T any](ctx context.Context, cl *http.Client, baseURL *
 		}
 		cursor = page.NextCursor
 
-		select {
-		case <-ctx.Done():
-			return allResults, ctx.Err()
-		case <-time.After(250 * time.Millisecond):
+		if err := waitPaginateDelay(ctx); err != nil {
+			return allResults, err
 		}
 	}
 
