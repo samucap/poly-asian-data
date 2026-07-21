@@ -6,7 +6,7 @@ DOCKER_COMPOSE_POSTGRES=docker-compose.postgres.yml
 DOCKER_COMPOSE_APP=docker-compose.app.yml
 MAIN_PATH=cmd/main.go
 
-.PHONY: all build clean test coverage lint run dev audit sec docker-up docker-down db-up db-down app-up app-down
+.PHONY: all build build-catalog build-top-markets clean test coverage lint run run-catalog-once dev audit sec docker-up docker-down db-up db-down app-up app-down
 
 all: build
 
@@ -14,6 +14,23 @@ all: build
 build:
 	@echo "Building..."
 	CGO_ENABLED=0 go build -ldflags="-w -s" -o bin/$(BINARY_NAME) $(MAIN_PATH)
+
+# Catalog-markets: full open-universe sync + catalog_v1 artifact
+build-catalog:
+	@echo "Building catalog-markets..."
+	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/catalog-markets ./cmd/catalog-markets
+
+build-top-markets:
+	@echo "Building top-markets..."
+	CGO_ENABLED=0 go build -ldflags="-w -s" -o bin/top-markets ./cmd/top-markets
+
+# One catalog cycle then exit (needs Postgres + network)
+run-catalog-once:
+	go run ./cmd/catalog-markets --once
+
+# Wipe tags (FK-safe) + sports-sync + force API catalog rebuild
+run-catalog-reset-tags:
+	go run ./cmd/catalog-markets --reset-tags --once
 
 # Clean build artifacts
 clean:

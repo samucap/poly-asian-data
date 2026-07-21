@@ -10,8 +10,10 @@ import (
 
 // Catalog watermark keys (stored in sync_state.sync_type — not tags.updated_at).
 const (
-	// WatermarkTopMarketsTagCatalog is set when top tags under 102982 were last
-	// refreshed from the related-tags API (definitions/hierarchy only).
+	// WatermarkTopMarketsTagCatalog is set when tags under categories root 102982
+	// were last refreshed from the related-tags API (definitions/hierarchy only).
+	// Owned by the catalog plane (cmd/catalog-markets); key string kept for
+	// compatibility with existing sync_state rows and top-markets reference.
 	WatermarkTopMarketsTagCatalog = "top_markets.tag_catalog"
 )
 

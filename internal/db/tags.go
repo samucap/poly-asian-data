@@ -17,6 +17,62 @@ type TagAggregate struct {
 	TotalMarkets int
 }
 
+// ResetTagCatalogResult counts rows touched by ResetTagCatalog.
+type ResetTagCatalogResult struct {
+	SportsCleared int64
+	TagsDeleted   int64
+	WatermarkGone bool
+}
+
+// ResetTagCatalog wipes the tags table safely for a clean API re-seed.
+//
+// Order (single transaction):
+//  1. NULL sports.primary_tag_id (FK → tags)
+//  2. NULL tags.parent_tag_id (self-FK)
+//  3. DELETE FROM tags
+//  4. DELETE sync_state row for WatermarkTopMarketsTagCatalog (force next LoadTagCatalog API path)
+//
+// Does not run every cycle — call explicitly (e.g. catalog-markets --reset-tags).
+func ResetTagCatalog(ctx context.Context, conn DBInterface) (ResetTagCatalogResult, error) {
+	var out ResetTagCatalogResult
+	if conn == nil {
+		return out, ErrNilDB
+	}
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return out, fmt.Errorf("db: reset tag catalog begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `UPDATE sports SET primary_tag_id = NULL WHERE primary_tag_id IS NOT NULL`)
+	if err != nil {
+		return out, fmt.Errorf("db: reset tag catalog clear sports.primary_tag_id: %w", err)
+	}
+	out.SportsCleared = tag.RowsAffected()
+
+	if _, err := tx.Exec(ctx, `UPDATE tags SET parent_tag_id = NULL WHERE parent_tag_id IS NOT NULL`); err != nil {
+		return out, fmt.Errorf("db: reset tag catalog clear parent_tag_id: %w", err)
+	}
+
+	tag, err = tx.Exec(ctx, `DELETE FROM tags`)
+	if err != nil {
+		return out, fmt.Errorf("db: reset tag catalog delete tags: %w", err)
+	}
+	out.TagsDeleted = tag.RowsAffected()
+
+	tag, err = tx.Exec(ctx, `DELETE FROM sync_state WHERE sync_type = $1`, WatermarkTopMarketsTagCatalog)
+	if err != nil {
+		return out, fmt.Errorf("db: reset tag catalog clear watermark: %w", err)
+	}
+	out.WatermarkGone = tag.RowsAffected() > 0
+
+	if err := tx.Commit(ctx); err != nil {
+		return out, fmt.Errorf("db: reset tag catalog commit: %w", err)
+	}
+	return out, nil
+}
+
 // FetchTopCategoryTags loads tags with the given parent_tag_id and the newest updated_at.
 // On query failure returns (nil, zero time, err).
 func FetchTopCategoryTags(ctx context.Context, conn DBInterface, parentTagID string) ([]*services.PlyMktTag, time.Time, error) {

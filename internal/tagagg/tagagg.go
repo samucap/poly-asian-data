@@ -7,9 +7,15 @@ package tagagg
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/samucap/poly-asian-data/internal/services"
 )
+
+// Catch-all / meta tag IDs that must not act as hierarchy parents or top categories.
+// Gamma tag 100215 "All" is related to the categories root but only has ~1 active event;
+// BFS-related parenting under it previously inflated volume/market attribution.
+const catchAllTagID = "100215"
 
 // Result holds per-tag totals and classified market lists from one scan pass.
 type Result struct {
@@ -28,6 +34,9 @@ type Result struct {
 	CondMarket map[string]*services.PlyMktMarket
 	// UnresolvedMarkets: tradable markets with no top and no usable leaf path.
 	UnresolvedMarkets int
+	// EventCountByTag: unique events that contributed metrics to each tag id this cycle.
+	// Compare to services.PlyMktTag.ActiveEventsCount from Gamma for validation.
+	EventCountByTag map[string]int
 }
 
 // IsTradable reports whether a market is eligible for ranking and category metrics.
@@ -39,12 +48,31 @@ func IsTradable(m *services.PlyMktMarket) bool {
 	return m.EnableOrderBook && m.AcceptingOrders && m.Active && !m.Closed && m.ClosedTime == ""
 }
 
-// IsTopCategory reports whether t is a direct child of the categories root.
-func IsTopCategory(t *services.PlyMktTag, rootID string) bool {
-	return t != nil && t.ID != "" && rootID != "" && t.ParentTagID == rootID
+// IsCatchAllTag reports meta/catch-all tags that are not real category parents.
+// Example: id 100215 slug "all" — Gamma activeEventsCount≈1 but related-tags BFS
+// previously hung most of the tree under it.
+func IsCatchAllTag(t *services.PlyMktTag) bool {
+	if t == nil || t.ID == "" {
+		return false
+	}
+	if t.ID == catchAllTagID {
+		return true
+	}
+	slug := strings.ToLower(strings.TrimSpace(t.Slug))
+	if slug == "all" {
+		return true
+	}
+	return false
 }
 
-// ResolveTopOf walks parent_tag_id links until a top category (parent == rootID).
+// IsTopCategory reports whether t is a direct child of the categories root
+// and is not a catch-all meta tag.
+func IsTopCategory(t *services.PlyMktTag, rootID string) bool {
+	return t != nil && t.ID != "" && rootID != "" && t.ParentTagID == rootID && !IsCatchAllTag(t)
+}
+
+// ResolveTopOf walks parent_tag_id links until a real top category (parent == rootID,
+// not catch-all). Catch-all nodes are skipped so volume does not collapse into "All".
 func ResolveTopOf(t *services.PlyMktTag, byID map[string]*services.PlyMktTag, rootID string) *services.PlyMktTag {
 	if t == nil || byID == nil || rootID == "" {
 		return nil
@@ -53,6 +81,13 @@ func ResolveTopOf(t *services.PlyMktTag, byID map[string]*services.PlyMktTag, ro
 	cur := t
 	for cur != nil && cur.ID != "" && !seen[cur.ID] {
 		seen[cur.ID] = true
+		if IsCatchAllTag(cur) {
+			if cur.ParentTagID == "" || cur.ParentTagID == rootID {
+				return nil
+			}
+			cur = byID[cur.ParentTagID]
+			continue
+		}
 		if cur.ParentTagID == rootID {
 			return cur
 		}
@@ -70,18 +105,20 @@ func ResolveTopOf(t *services.PlyMktTag, byID map[string]*services.PlyMktTag, ro
 // Aggregates are fully recomputed every call (per cycle), not accumulated across cycles.
 //
 // Attribution per tradable market (each tag id at most once):
-//  1. Every top category present on the event (multi-label — see comment in loop).
-//  2. Tops reached only via parent walk from known event tags.
-//  3. One primary non-top leaf (first non-top event tag after discovery).
-//  4. Missing ancestors of that leaf if not already credited.
+//  1. Every real top category on the event / via parent walk (multi-label).
+//  2. Every non-catch-all tag that appears directly on the event.
+//  3. One primary non-top leaf (first non-top, non-catch-all event tag).
+//  4. Ancestors of that leaf up to a real top — catch-all nodes are never credited
+//     and never used as discovery parents (see IsCatchAllTag).
 //
-// Unknown event tags are discovered and parented under the first top when possible.
+// Unknown event tags are discovered and parented under the first real top when possible.
 func Aggregate(events []*services.PlyMktEvent, catalog map[string]*services.PlyMktTag, rootID string) Result {
 	res := Result{
-		Tags:         make(map[string]*services.PlyMktTag),
-		PoolBySlug:   make(map[string]int),
-		CondCategory: make(map[string]string),
-		CondMarket:   make(map[string]*services.PlyMktMarket),
+		Tags:            make(map[string]*services.PlyMktTag),
+		PoolBySlug:      make(map[string]int),
+		CondCategory:    make(map[string]string),
+		CondMarket:      make(map[string]*services.PlyMktMarket),
+		EventCountByTag: make(map[string]int),
 	}
 
 	// Working copies of the seed catalog (zero metrics). Idle tags stay at zero for write-back.
@@ -109,14 +146,17 @@ func Aggregate(events []*services.PlyMktEvent, catalog map[string]*services.PlyM
 		topsByID := map[string]*services.PlyMktTag{}
 		var firstTop *services.PlyMktTag
 
-		// Pass 1: ensure known tags exist; collect tops from known tags / parent walk.
+		// Pass 1: ensure known tags exist; collect real tops from known tags / parent walk.
 		for _, et := range e.Tags {
-			if et == nil || et.ID == "" || et.ID == rootID {
+			if et == nil || et.ID == "" || et.ID == rootID || IsCatchAllTag(et) {
 				continue
 			}
 			w, ok := res.Tags[et.ID]
 			if !ok {
 				continue // discover in pass 2 after firstTop is known
+			}
+			if IsCatchAllTag(w) {
+				continue
 			}
 			if IsTopCategory(w, rootID) {
 				topsByID[w.ID] = w
@@ -133,7 +173,7 @@ func Aggregate(events []*services.PlyMktEvent, catalog map[string]*services.PlyM
 			}
 		}
 
-		// Pass 2: discover missing tags under firstTop (or root if none).
+		// Pass 2: discover missing tags under first real top (never under catch-all).
 		for _, et := range e.Tags {
 			if et == nil || et.ID == "" || et.ID == rootID {
 				continue
@@ -142,8 +182,12 @@ func Aggregate(events []*services.PlyMktEvent, catalog map[string]*services.PlyM
 				continue
 			}
 			parentID := rootID
-			if firstTop != nil {
+			if firstTop != nil && !IsCatchAllTag(firstTop) {
 				parentID = firstTop.ID
+			}
+			// Catch-all on the event: keep as catalog node under root, never as top parent.
+			if IsCatchAllTag(et) {
+				parentID = rootID
 			}
 			discovered := zeroCopy(et)
 			discovered.ParentTagID = parentID
@@ -153,6 +197,9 @@ func Aggregate(events []*services.PlyMktEvent, catalog map[string]*services.PlyM
 			discovered.TotalMarkets = 0
 			res.Tags[discovered.ID] = discovered
 
+			if IsCatchAllTag(discovered) {
+				continue
+			}
 			if IsTopCategory(discovered, rootID) {
 				topsByID[discovered.ID] = discovered
 				if firstTop == nil {
@@ -166,19 +213,22 @@ func Aggregate(events []*services.PlyMktEvent, catalog map[string]*services.PlyM
 			}
 		}
 
-		// Primary leaf: first non-top event tag in event order.
+		// Primary leaf: first non-top, non-catch-all event tag in event order.
 		var primaryLeaf *services.PlyMktTag
 		for _, et := range e.Tags {
-			if et == nil || et.ID == "" || et.ID == rootID {
+			if et == nil || et.ID == "" || et.ID == rootID || IsCatchAllTag(et) {
 				continue
 			}
 			w := res.Tags[et.ID]
-			if w == nil || IsTopCategory(w, rootID) {
+			if w == nil || IsTopCategory(w, rootID) || IsCatchAllTag(w) {
 				continue
 			}
 			primaryLeaf = w
 			break
 		}
+
+		// Tags to credit for this event (union of tops, direct tags, leaf path).
+		eventCreditIDs := map[string]bool{}
 
 		catSlug := ""
 		if firstTop != nil {
@@ -206,8 +256,18 @@ func Aggregate(events []*services.PlyMktEvent, catalog map[string]*services.PlyM
 			}
 
 			if len(topsByID) == 0 && primaryLeaf == nil {
-				res.UnresolvedMarkets++
-				continue
+				// Still try direct non-catch-all tags on the event.
+				hasDirect := false
+				for _, et := range e.Tags {
+					if et != nil && et.ID != "" && et.ID != rootID && !IsCatchAllTag(et) {
+						hasDirect = true
+						break
+					}
+				}
+				if !hasDirect {
+					res.UnresolvedMarkets++
+					continue
+				}
 			}
 
 			credited := map[string]bool{}
@@ -215,7 +275,14 @@ func Aggregate(events []*services.PlyMktEvent, catalog map[string]*services.PlyM
 				if t == nil || t.ID == "" || t.ID == rootID || credited[t.ID] {
 					return
 				}
+				// Never roll metrics into catch-all "All" (100215) via hierarchy.
+				// Direct event membership of catch-all is also ignored for aggregates
+				// (Gamma reports ~1 active event; hierarchy inflation was the bug).
+				if IsCatchAllTag(t) {
+					return
+				}
 				credited[t.ID] = true
+				eventCreditIDs[t.ID] = true
 				w := res.Tags[t.ID]
 				if w == nil {
 					w = zeroCopy(t)
@@ -230,13 +297,29 @@ func Aggregate(events []*services.PlyMktEvent, catalog map[string]*services.PlyM
 			for _, top := range topsByID {
 				credit(top)
 			}
+			// Direct membership: every non-catch-all tag on the event.
+			for _, et := range e.Tags {
+				if et == nil || et.ID == "" || et.ID == rootID {
+					continue
+				}
+				if w := res.Tags[et.ID]; w != nil {
+					credit(w)
+				}
+			}
 			if primaryLeaf != nil {
 				credit(primaryLeaf)
-				// Roll up ancestors not already credited (e.g. top only reachable via leaf).
+				// Roll up ancestors to a real top; skip catch-all nodes.
 				cur := res.Tags[primaryLeaf.ParentTagID]
 				seen := map[string]bool{primaryLeaf.ID: true}
 				for cur != nil && cur.ID != "" && cur.ID != rootID && !seen[cur.ID] {
 					seen[cur.ID] = true
+					if IsCatchAllTag(cur) {
+						if cur.ParentTagID == "" || cur.ParentTagID == rootID {
+							break
+						}
+						cur = res.Tags[cur.ParentTagID]
+						continue
+					}
 					credit(cur)
 					if cur.ParentTagID == rootID || cur.ParentTagID == "" {
 						break
@@ -244,6 +327,11 @@ func Aggregate(events []*services.PlyMktEvent, catalog map[string]*services.PlyM
 					cur = res.Tags[cur.ParentTagID]
 				}
 			}
+		}
+
+		// Unique event attribution (once per tag per event).
+		for tid := range eventCreditIDs {
+			res.EventCountByTag[tid]++
 		}
 	}
 

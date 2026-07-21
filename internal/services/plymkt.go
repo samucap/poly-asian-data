@@ -322,6 +322,9 @@ type PlyMktTag struct {
 	CreatedAtPly time.Time `json:"createdAt"`
 	UpdatedAtPly time.Time `json:"updatedAt"`
 	ForceHide    bool      `json:"forceHide"`
+	// ActiveEventsCount is Gamma's count of active events for this tag (related-tags / tag payloads).
+	// Used to validate our attribution; not a metric we recompute into TotalMarkets.
+	ActiveEventsCount int `json:"activeEventsCount"`
 	// Derived or from API; used by processor/saver for sport link and hierarchy
 	SportSlug    string  `json:"sportSlug"`
 	SportID      string  `json:"-"`

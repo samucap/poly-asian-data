@@ -33,11 +33,23 @@ type Config struct {
 
 	// TopMarketsCfg drives cmd/top-markets refresh filters and interval.
 	TopMarkets TopMarketsConfig
+	// Catalog drives cmd/catalog-markets (full open-universe sync, no enrichment).
+	Catalog CatalogConfig
 }
 
 type WorkerPoolConfig struct {
 	NumWorkers int
 	Qsize      int
+}
+
+// CatalogConfig holds refresh cadence and pagination for cmd/catalog-markets.
+// Full open-universe scan: no rank filters and no OI/trades/prices enrichment.
+type CatalogConfig struct {
+	// RefreshInterval is time between catalog cycle starts (default 10m).
+	// Cycle duration is typically ~1–2m; interval is not cycle length.
+	RefreshInterval time.Duration
+	// PaginateDelay is the wait between paginated HTTP pages (keyset / offset).
+	PaginateDelay time.Duration
 }
 
 // TopMarketsConfig holds market-ranking filter thresholds, keyset scan filters,
@@ -104,6 +116,7 @@ func Load() (*Config, error) {
 			Qsize:      getEnvInt("SAVER_QUEUE_SIZE", 200),
 		},
 		TopMarkets: loadTopMarketsConfig(),
+		Catalog:    loadCatalogConfig(),
 	}
 
 	// Compose PostgresURL if not set
@@ -175,6 +188,14 @@ func getEnvDuration(key string, defaultVal time.Duration) time.Duration {
 		}
 	}
 	return defaultVal
+}
+
+func loadCatalogConfig() CatalogConfig {
+	return CatalogConfig{
+		RefreshInterval: getEnvDuration("CATALOG_REFRESH_INTERVAL", 10*time.Minute),
+		// Fall back to PAGINATE_DELAY when CATALOG_PAGINATE_DELAY unset (shared throttle).
+		PaginateDelay: getEnvDuration("CATALOG_PAGINATE_DELAY", getEnvDuration("PAGINATE_DELAY", 0)),
+	}
 }
 
 func loadTopMarketsConfig() TopMarketsConfig {

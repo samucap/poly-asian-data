@@ -97,7 +97,8 @@ func TestAggregate_MultiTop(t *testing.T) {
 	assert.Equal(t, "sports", res.Markets[0].Category)
 }
 
-func TestAggregate_PrimaryLeafOnlyAmongSubtags(t *testing.T) {
+func TestAggregate_DirectTagsAllCredited(t *testing.T) {
+	// Direct membership on the event credits every non-catch-all tag (Gamma fidelity).
 	cat := sportsCatalog()
 	events := []*services.PlyMktEvent{{
 		ID: "e1",
@@ -111,8 +112,55 @@ func TestAggregate_PrimaryLeafOnlyAmongSubtags(t *testing.T) {
 	res := Aggregate(events, cat, rootID)
 	assert.Equal(t, 100.0, res.Tags["1"].TotalVol)
 	assert.Equal(t, 100.0, res.Tags["nba"].TotalVol)
-	assert.Equal(t, 0.0, res.Tags["nfl"].TotalVol)
-	assert.Equal(t, 0, res.Tags["nfl"].TotalMarkets)
+	assert.Equal(t, 100.0, res.Tags["nfl"].TotalVol)
+	assert.Equal(t, 1, res.Tags["nfl"].TotalMarkets)
+	assert.Equal(t, 1, res.EventCountByTag["nba"])
+	assert.Equal(t, 1, res.EventCountByTag["1"])
+}
+
+func TestAggregate_CatchAllNotInflated(t *testing.T) {
+	// 100215 "All" is related to root but must not absorb sports leaf volume.
+	cat := sportsCatalog()
+	cat["100215"] = &services.PlyMktTag{
+		ID: "100215", Slug: "all", Label: "All", ParentTagID: rootID, ActiveEventsCount: 1,
+	}
+	// Corrupt hierarchy as old BFS did: parent nba under All.
+	cat["nba"].ParentTagID = "100215"
+
+	events := []*services.PlyMktEvent{{
+		ID:      "e1",
+		Tags:    []*services.PlyMktTag{{ID: "nba", Slug: "nba"}},
+		Markets: []*services.PlyMktMarket{tradable("m", "c", 100, 50, 10)},
+	}}
+	res := Aggregate(events, cat, rootID)
+	assert.Equal(t, 100.0, res.Tags["nba"].TotalVol)
+	assert.Equal(t, 1, res.Tags["nba"].TotalMarkets)
+	// Catch-all must stay at zero metrics.
+	assert.Equal(t, 0.0, res.Tags["100215"].TotalVol)
+	assert.Equal(t, 0, res.Tags["100215"].TotalMarkets)
+	assert.Equal(t, 0, res.EventCountByTag["100215"])
+}
+
+func TestIsCatchAllTag(t *testing.T) {
+	assert.True(t, IsCatchAllTag(&services.PlyMktTag{ID: "100215", Slug: "all"}))
+	assert.True(t, IsCatchAllTag(&services.PlyMktTag{ID: "x", Slug: "ALL"}))
+	assert.False(t, IsCatchAllTag(&services.PlyMktTag{ID: "1", Slug: "sports"}))
+}
+
+func TestValidateAgainstActiveEvents_FlagsCatchAll(t *testing.T) {
+	cat := sportsCatalog()
+	cat["100215"] = &services.PlyMktTag{ID: "100215", Slug: "all", ParentTagID: rootID, ActiveEventsCount: 1}
+	// Force credit simulation
+	res := Result{
+		Tags: map[string]*services.PlyMktTag{
+			"100215": {ID: "100215", Slug: "all", ActiveEventsCount: 1, TotalMarkets: 500, TotalVol24hr: 1e9},
+		},
+		EventCountByTag: map[string]int{"100215": 400},
+	}
+	checks := SuspiciousOnly(ValidateAgainstActiveEvents(res, 0))
+	require.NotEmpty(t, checks)
+	assert.Equal(t, "100215", checks[0].TagID)
+	assert.True(t, checks[0].Suspicious)
 }
 
 func TestAggregate_SubtagOnlyResolvesTop(t *testing.T) {
