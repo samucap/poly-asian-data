@@ -638,8 +638,10 @@ CREATE INDEX IF NOT EXISTS idx_edge_board_selected ON edge_board (selected_at DE
 CREATE TABLE IF NOT EXISTS oi_history (
     time         TIMESTAMPTZ      NOT NULL,
     condition_id TEXT             NOT NULL,
-    oi_value     DOUBLE PRECISION NOT NULL
+    oi_value     DOUBLE PRECISION NOT NULL,
+    source       TEXT DEFAULT 'data-api'
 );
+ALTER TABLE oi_history ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'data-api';
 
 SELECT create_hypertable('oi_history', 'time',
     chunk_time_interval => INTERVAL '1 day',

@@ -74,7 +74,7 @@ func TestFlattenAndBuildBoard(t *testing.T) {
 
 	doc, err := BuildArtifact(res.Rows, res.PoolCount, res.Stage1Count, res.DroppedSummary, "success", nil)
 	require.NoError(t, err)
-	assert.Equal(t, "1.0", doc.SchemaVersion)
+	assert.Equal(t, "2.0", doc.SchemaVersion)
 	assert.Equal(t, len(res.Rows), doc.BoardStats.NBoard)
 	_, err = WriteArtifact(doc, t.TempDir())
 	require.NoError(t, err)

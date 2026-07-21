@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	// SchemaVersion is edge_board artifact schema_version.
-	SchemaVersion = "1.0"
+	// SchemaVersion is edge_board artifact schema_version (M3 cost-aware board).
+	SchemaVersion = "2.0"
 	// ArtifactPipeline is artifacts/ subdirectory.
 	ArtifactPipeline = "edge_board"
 	// DefaultStrategy partitions edge_board rows.
@@ -380,37 +380,64 @@ type EdgeBoardV1 struct {
 
 // BoardStats summarizes the board for agents.
 type BoardStats struct {
-	NCandidates   int     `json:"n_candidates"`
-	NStage1       int     `json:"n_stage1"`
-	NBoard        int     `json:"n_board"`
-	MedianScore   float64 `json:"median_score"`
-	TotalCapacity float64 `json:"total_liquidity"` // sum liquidity on board (proxy until M3 capacity)
+	NCandidates      int     `json:"n_candidates"`
+	NStage1          int     `json:"n_stage1"`
+	NBoard           int     `json:"n_board"`
+	MedianScore      float64 `json:"median_score"`
+	MedianEdgeBps    float64 `json:"median_edge_bps,omitempty"`
+	TotalCapacity    float64 `json:"total_capacity_usd"`
+	TotalLiquidity   float64 `json:"total_liquidity"`
+	CycleMS          int64   `json:"cycle_ms,omitempty"`
+	EnrichMS         int64   `json:"enrich_ms,omitempty"`
+	EnrichCoverage   float64 `json:"enrich_coverage,omitempty"`
+	FeatureAgeP95MS  int64   `json:"feature_age_p95_ms,omitempty"`
+	EdgeBpsNullFrac  float64 `json:"edge_bps_null_frac,omitempty"`
 }
 
 // BoardEntry is one self-contained board row for agents / WS.
 type BoardEntry struct {
-	Rank           int      `json:"rank"`
-	ConditionID    string   `json:"condition_id"`
-	MarketID       string   `json:"market_id,omitempty"`
-	QuestionShort  string   `json:"question_short"`
-	Category       string   `json:"category,omitempty"`
-	TokenIDs       []string `json:"token_ids"`
-	Score          float64  `json:"score"`
-	EdgeBps        *float64 `json:"edge_bps"` // null until M3
-	NegRisk        bool     `json:"neg_risk"`
-	NegRiskGroupID string   `json:"neg_risk_group_id,omitempty"`
-	RelatedLegs    []string `json:"related_legs"`
-	Volume24hr     float64  `json:"volume_24hr"`
-	Liquidity      float64  `json:"liquidity"`
-	Spread         float64  `json:"spread"`
+	Rank           int            `json:"rank"`
+	ConditionID    string         `json:"condition_id"`
+	MarketID       string         `json:"market_id,omitempty"`
+	QuestionShort  string         `json:"question_short"`
+	Category       string         `json:"category,omitempty"`
+	TokenIDs       []string       `json:"token_ids"`
+	Score          float64        `json:"score"` // Stage-1 activity diagnostic
+	EdgeBps        *float64       `json:"edge_bps"`
+	CostBps        *float64       `json:"cost_bps,omitempty"`
+	CapacityUSD    *float64       `json:"capacity_usd,omitempty"`
+	Urgency        *float64       `json:"urgency,omitempty"`
+	KeyFeatures    map[string]any `json:"key_features,omitempty"`
+	RiskFlags      []string       `json:"risk_flags,omitempty"`
+	StrategyTags   []string       `json:"strategy_tags,omitempty"`
+	FairValue      *float64       `json:"fair_value,omitempty"`
+	ModelEdgeBps   *float64       `json:"model_edge_bps,omitempty"`
+	FVSource       string         `json:"fv_source,omitempty"`
+	NegRisk        bool           `json:"neg_risk"`
+	NegRiskGroupID string         `json:"neg_risk_group_id,omitempty"`
+	RelatedLegs    []string       `json:"related_legs"`
+	Volume24hr     float64        `json:"volume_24hr"`
+	Liquidity      float64        `json:"liquidity"`
+	Spread         float64        `json:"spread"`
 }
 
-// BuildArtifact builds a validated edge_board_v1 document.
+// BuildArtifact builds a validated edge_board document (schema 2.0).
 func BuildArtifact(rows []db.EdgeBoardRow, poolN, stage1N int, dropped map[string]int, status string, errs []artifacts.ErrorItem) (EdgeBoardV1, error) {
+	return BuildArtifactWithStats(rows, poolN, stage1N, dropped, status, errs, BoardStats{})
+}
+
+// BuildArtifactWithStats allows callers to attach lag / enrich metrics.
+func BuildArtifactWithStats(rows []db.EdgeBoardRow, poolN, stage1N int, dropped map[string]int, status string, errs []artifacts.ErrorItem, extra BoardStats) (EdgeBoardV1, error) {
 	entries := make([]BoardEntry, 0, len(rows))
 	var scores []float64
-	var liqSum float64
+	var edges []float64
+	var liqSum, capSum float64
+	var nullEdge int
 	for _, r := range rows {
+		var kf map[string]any
+		if len(r.KeyFeatures) > 0 {
+			_ = json.Unmarshal(r.KeyFeatures, &kf)
+		}
 		entries = append(entries, BoardEntry{
 			Rank:           r.Rank,
 			ConditionID:    r.ConditionID,
@@ -420,6 +447,15 @@ func BuildArtifact(rows []db.EdgeBoardRow, poolN, stage1N int, dropped map[strin
 			TokenIDs:       r.ClobTokenIDs,
 			Score:          r.Score,
 			EdgeBps:        r.EdgeBps,
+			CostBps:        r.CostBps,
+			CapacityUSD:    r.CapacityUSD,
+			Urgency:        r.Urgency,
+			KeyFeatures:    kf,
+			RiskFlags:      r.RiskFlags,
+			StrategyTags:   r.StrategyTags,
+			FairValue:      r.FairValue,
+			ModelEdgeBps:   r.ModelEdgeBps,
+			FVSource:       r.FVSource,
 			NegRisk:        r.NegRisk,
 			NegRiskGroupID: r.NegRiskGroupID,
 			RelatedLegs:    r.RelatedLegs,
@@ -429,16 +465,19 @@ func BuildArtifact(rows []db.EdgeBoardRow, poolN, stage1N int, dropped map[strin
 		})
 		scores = append(scores, r.Score)
 		liqSum += r.Liquidity
-	}
-	sort.Float64s(scores)
-	med := 0.0
-	if n := len(scores); n > 0 {
-		if n%2 == 1 {
-			med = scores[n/2]
+		if r.CapacityUSD != nil {
+			capSum += *r.CapacityUSD
+		}
+		if r.EdgeBps != nil {
+			edges = append(edges, *r.EdgeBps)
 		} else {
-			med = (scores[n/2-1] + scores[n/2]) / 2
+			nullEdge++
 		}
 	}
+	sort.Float64s(scores)
+	sort.Float64s(edges)
+	med := median(scores)
+	medEdge := median(edges)
 	if dropped == nil {
 		dropped = map[string]int{}
 	}
@@ -463,23 +502,47 @@ func BuildArtifact(rows []db.EdgeBoardRow, poolN, stage1N int, dropped map[strin
 		strategy = rows[0].Strategy
 	}
 
+	nullFrac := 0.0
+	if len(rows) > 0 {
+		nullFrac = float64(nullEdge) / float64(len(rows))
+	}
+	stats := BoardStats{
+		NCandidates:     poolN,
+		NStage1:         stage1N,
+		NBoard:          len(entries),
+		MedianScore:     med,
+		MedianEdgeBps:   medEdge,
+		TotalCapacity:   capSum,
+		TotalLiquidity:  liqSum,
+		CycleMS:         extra.CycleMS,
+		EnrichMS:        extra.EnrichMS,
+		EnrichCoverage:  extra.EnrichCoverage,
+		FeatureAgeP95MS: extra.FeatureAgeP95MS,
+		EdgeBpsNullFrac: nullFrac,
+	}
+
 	doc := EdgeBoardV1{
-		Envelope: env,
-		Strategy: strategy,
-		BoardStats: BoardStats{
-			NCandidates:   poolN,
-			NStage1:       stage1N,
-			NBoard:        len(entries),
-			MedianScore:   med,
-			TotalCapacity: liqSum,
-		},
+		Envelope:       env,
+		Strategy:       strategy,
+		BoardStats:     stats,
 		Board:          entries,
 		DroppedSummary: dropped,
 	}
 	return doc, nil
 }
 
-// ValidateEdgeBoardV1 checks required fields.
+func median(xs []float64) float64 {
+	n := len(xs)
+	if n == 0 {
+		return 0
+	}
+	if n%2 == 1 {
+		return xs[n/2]
+	}
+	return (xs[n/2-1] + xs[n/2]) / 2
+}
+
+// ValidateEdgeBoardV1 checks required fields (schema 1.0 legacy or 2.0 M3).
 func ValidateEdgeBoardV1(doc map[string]any) error {
 	required := []string{
 		"schema_version", "pipeline_version", "run_id", "generated_at",
@@ -488,11 +551,12 @@ func ValidateEdgeBoardV1(doc map[string]any) error {
 	}
 	for _, k := range required {
 		if _, ok := doc[k]; !ok {
-			return fmt.Errorf("edge_board_v1: missing %q", k)
+			return fmt.Errorf("edge_board: missing %q", k)
 		}
 	}
-	if sv, _ := doc["schema_version"].(string); sv != "1.0" {
-		return fmt.Errorf("edge_board_v1: schema_version must be 1.0")
+	sv, _ := doc["schema_version"].(string)
+	if sv != "1.0" && sv != "2.0" {
+		return fmt.Errorf("edge_board: schema_version must be 1.0 or 2.0, got %q", sv)
 	}
 	return nil
 }

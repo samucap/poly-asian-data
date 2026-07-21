@@ -26,6 +26,17 @@ type EdgeBoardRow struct {
 	Spread            float64
 	SelectedAt        time.Time
 	RunID             string
+	// M3 fields
+	CostBps      *float64
+	CapacityUSD  *float64
+	Urgency      *float64
+	KeyFeatures  []byte // JSON
+	RiskFlags    []string
+	StrategyTags []string
+	FeaturesAsOf *time.Time
+	FairValue    *float64
+	ModelEdgeBps *float64
+	FVSource     string
 }
 
 // EnsureEdgeBoardTable creates edge_board if missing (idempotent for existing DBs).
@@ -64,7 +75,7 @@ func EnsureEdgeBoardTable(ctx context.Context, conn DBInterface) error {
 			return err
 		}
 	}
-	return nil
+	return EnsureM3FeatureTables(ctx, conn)
 }
 
 // ReplaceEdgeBoard deletes the strategy's board and inserts the new set in one transaction.
@@ -106,22 +117,40 @@ func ReplaceEdgeBoard(ctx context.Context, conn DBInterface, strategy string, ro
 		if sel.IsZero() {
 			sel = time.Now().UTC()
 		}
+		flags := r.RiskFlags
+		if flags == nil {
+			flags = []string{}
+		}
+		tags := r.StrategyTags
+		if tags == nil {
+			tags = []string{}
+		}
+		var kf any
+		if len(r.KeyFeatures) > 0 {
+			kf = r.KeyFeatures
+		}
 		_, err := tx.Exec(ctx, `
 			INSERT INTO edge_board (
 				strategy, condition_id, market_id, question_short, category,
 				clob_token_ids, rank, score, edge_bps, strategy_version_id,
 				neg_risk, neg_risk_group_id, related_legs,
-				volume_24hr, liquidity, spread, selected_at, run_id
+				volume_24hr, liquidity, spread, selected_at, run_id,
+				cost_bps, capacity_usd, urgency, key_features, risk_flags, strategy_tags,
+				features_asof, fair_value, model_edge_bps, fv_source
 			) VALUES (
 				$1,$2,$3,$4,$5,
 				$6,$7,$8,$9,$10,
 				$11,NULLIF($12,''),$13,
-				$14,$15,$16,$17,$18
+				$14,$15,$16,$17,$18,
+				$19,$20,$21,$22,$23,$24,
+				$25,$26,$27,NULLIF($28,'')
 			)`,
 			st, r.ConditionID, nullStr(r.MarketID), nullStr(r.QuestionShort), nullStr(r.Category),
 			tokens, r.Rank, r.Score, r.EdgeBps, r.StrategyVersionID,
 			r.NegRisk, r.NegRiskGroupID, legs,
 			r.Volume24hr, r.Liquidity, r.Spread, sel, nullStr(r.RunID),
+			r.CostBps, r.CapacityUSD, r.Urgency, kf, flags, tags,
+			r.FeaturesAsOf, r.FairValue, r.ModelEdgeBps, r.FVSource,
 		)
 		if err != nil {
 			return fmt.Errorf("db: edge_board insert %s: %w", r.ConditionID, err)

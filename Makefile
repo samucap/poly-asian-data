@@ -6,7 +6,7 @@ DOCKER_COMPOSE_POSTGRES=docker-compose.postgres.yml
 DOCKER_COMPOSE_APP=docker-compose.app.yml
 MAIN_PATH=cmd/main.go
 
-.PHONY: all build build-catalog build-top-markets clean test coverage lint run run-catalog-once dev audit sec docker-up docker-down db-up db-down app-up app-down
+.PHONY: all build build-catalog build-top-markets build-edge-scan clean test coverage lint run run-catalog-once run-edge-scan-once edge-board-top edge-scan-once-top dev audit sec docker-up docker-down db-up db-down app-up app-down
 
 all: build
 
@@ -38,6 +38,18 @@ run-catalog-reset-tags:
 
 run-edge-scan-once:
 	go run ./cmd/edge-scan --once
+
+# Explain top N markets from artifacts/edge_board/latest.json (no DB required)
+# Usage: make edge-board-top
+#        make edge-board-top N=10
+#        make edge-board-top BOARD=artifacts/edge_board/<run_id>.json
+N ?= 5
+BOARD ?= artifacts/edge_board/latest.json
+edge-board-top:
+	@python3 scripts/edge_board_top.py --path "$(BOARD)" -n $(N)
+
+# One edge-scan cycle then print top board explanation
+edge-scan-once-top: run-edge-scan-once edge-board-top
 
 # Clean build artifacts
 clean:

@@ -1,0 +1,33 @@
+# M3 default strategy weights — cost-aware opportunity screen (not full fair value).
+# Changing these weights must change board order (see internal/edge tests).
+name: default
+
+# Opportunity family mix (relative)
+w_vol: 0.30
+w_oi: 0.15
+w_imbalance: 0.10
+w_ttr: 0.15
+w_neg_risk: 0.15
+w_flow: 0.05
+w_activity: 0.10
+
+# Cost defaults
+default_taker_fee_bps: 0
+impact_cap_bps: 25
+impact_coeff: 50
+probe_size_usd: 100
+model_buffer_bps: 20
+
+# Quality gates
+max_feature_age_sec: 300
+max_book_age_sec: 300
+wide_spread_bps: 300
+min_depth_shares: 10
+drop_missing_book: false
+stale_penalty_bps: 50
+
+# Vol / OI scaling into bps-like units
+vol_scale: 1.0
+vol_cap_bps: 500
+oi_scale: 100
+oi_cap_bps: 200
