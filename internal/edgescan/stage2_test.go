@@ -70,8 +70,10 @@ func TestCollectTokenIDs(t *testing.T) {
 		{Market: tradable("m1", "c1", 1, 1, 0.01)},
 		{Market: tradable("m2", "c2", 1, 1, 0.01)},
 	}
-	ids := CollectTokenIDs(cands)
-	require.Len(t, ids, 4) // yes+no each
+	// Primary token only (YES) — halves /books fan-out.
+	ids := CollectPrimaryTokenIDs(cands)
+	require.Len(t, ids, 2)
+	require.Equal(t, []string{"yes-m1", "yes-m2"}, ids)
 }
 
 func TestBuildEdgeBoard_ZeroBooksNoPublish(t *testing.T) {

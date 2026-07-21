@@ -55,13 +55,7 @@ func SelectStage1(pool []Candidate, opts BuildOptions) Stage1Result {
 	stage1Count := len(ranked)
 	dropped["stage1_filter"] = len(markets) - stage1Count
 
-	// Sticky inject if still pass hard filter
-	stickySet := map[string]bool{}
-	for _, id := range opts.StickyConditionIDs {
-		if id != "" {
-			stickySet[id] = true
-		}
-	}
+	stickySet := stickyMap(opts.StickyConditionIDs)
 	inRanked := map[string]bool{}
 	for _, m := range ranked {
 		if m != nil {
@@ -86,12 +80,8 @@ func SelectStage1(pool []Candidate, opts BuildOptions) Stage1Result {
 		return ranked[i].ComputedScore > ranked[j].ComputedScore
 	})
 	if opts.Filter.MaxN > 0 && len(ranked) > opts.Filter.MaxN {
-		// Prefer sticky when trimming stage-1 budget
 		ranked = selectBoard(ranked, stickySet, opts.Filter.MaxN)
-		dropped["stage1_cap"] = stage1Count - len(ranked)
-		if dropped["stage1_cap"] < 0 {
-			dropped["stage1_cap"] = 0
-		}
+		dropped["stage1_cap"] = max(0, stage1Count-len(ranked))
 	}
 
 	cands := make([]Candidate, 0, len(ranked))
@@ -121,21 +111,15 @@ type OIIndex map[string]float64
 // EdgeBuildOptions controls Stage-2 cost-aware board.
 type EdgeBuildOptions struct {
 	BuildOptions
-	Weights edge.Weights
-	Books   BookIndex
-	OI      OIIndex
-	// Now for feature age.
-	// If PublishRequireBooks and zero books, return empty with error hint.
+	Weights             edge.Weights
+	Books               BookIndex
+	OI                  OIIndex
 	PublishRequireBooks bool
 }
 
 // BuildEdgeBoard ranks Stage-1 candidates by edge_bps and cuts to BoardMaxN.
-// Does not use activity score for final order (score field kept as Stage-1 diagnostic).
 func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult {
-	dropped := map[string]int{}
-	for k, v := range stage1.DroppedSummary {
-		dropped[k] = v
-	}
+	dropped := copyDropped(stage1.DroppedSummary)
 	dropped["missing_book"] = 0
 	dropped["edge_drop"] = 0
 	dropped["board_cap"] = 0
@@ -154,37 +138,10 @@ func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult
 		w = edge.DefaultWeights()
 	}
 
-	// Neg-risk group mids from books
-	groupMids := map[string][]edge.GroupLeg{}
-	for _, c := range stage1.Candidates {
-		if c.Market == nil || !c.NegRisk || c.NegRiskGroupID == "" {
-			continue
-		}
-		toks := parseTokenIDs(c.Market.ClobTokenIds)
-		mid := midFromBooks(toks, opts.Books)
-		if mid > 0 {
-			groupMids[c.NegRiskGroupID] = append(groupMids[c.NegRiskGroupID], edge.GroupLeg{
-				ConditionID: c.Market.ConditionID,
-				Mid:         mid,
-			})
-		}
-	}
-	groupResidual := map[string]float64{}
-	groupIncomplete := map[string]bool{}
-	for g, legs := range groupMids {
-		bps, incomplete := edge.GroupResidual(legs)
-		groupResidual[g] = bps
-		groupIncomplete[g] = incomplete
-	}
+	groupResidual, groupIncomplete := negRiskResiduals(stage1.Candidates, opts.Books)
 
-	type scoredCand struct {
-		c   Candidate
-		res edge.ScoreResult
-		act float64 // stage-1 activity score
-	}
-	var scored []scoredCand
+	scored := make([]scoredCand, 0, len(stage1.Candidates))
 	booksHit := 0
-
 	for _, c := range stage1.Candidates {
 		if c.Market == nil {
 			continue
@@ -193,23 +150,25 @@ func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult
 		if !fv.MissingBook {
 			booksHit++
 		}
-		in := edge.ScoreInput{
+		res := edge.Score(edge.ScoreInput{
 			Features:      fv,
 			TakerFeeBps:   takerFeeBps(c.Market),
 			NegRiskFeeBps: float64(c.NegRiskFeeBips),
-		}
-		res := edge.Score(in, w)
+		}, w)
 		if res.Drop {
 			dropped["edge_drop"]++
 			continue
 		}
-		scored = append(scored, scoredCand{c: c, res: res, act: c.Market.ComputedScore})
+		scored = append(scored, scoredCand{
+			c:   c,
+			act: c.Market.ComputedScore,
+			res: scoreViewFrom(res),
+		})
 	}
 
 	if booksHit == 0 && opts.PublishRequireBooks {
 		dropped["missing_book"] = len(stage1.Candidates)
 		return BoardBuildResult{
-			Rows:           nil,
 			Stage1Count:    stage1.Stage1Count,
 			PoolCount:      stage1.PoolCount,
 			DroppedSummary: dropped,
@@ -224,78 +183,41 @@ func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult
 		return scored[i].res.EdgeBps > scored[j].res.EdgeBps
 	})
 
-	// Sticky preference among edge-scored set
-	stickySet := map[string]bool{}
-	for _, id := range opts.StickyConditionIDs {
-		if id != "" {
-			stickySet[id] = true
-		}
-	}
-	// Partition: sticky first in edge order, then rest
-	var ordered []scoredCand
-	seen := map[string]bool{}
-	for _, s := range scored {
-		id := s.c.Market.ConditionID
-		if stickySet[id] {
-			ordered = append(ordered, s)
-			seen[id] = true
-		}
-	}
-	for _, s := range scored {
-		id := s.c.Market.ConditionID
-		if !seen[id] {
-			ordered = append(ordered, s)
-			seen[id] = true
-		}
-	}
-	// Re-sort by edge within full set but ensure sticky not cut first:
-	// take BoardMaxN with sticky preference like selectBoard
-	if len(ordered) > opts.BoardMaxN {
-		var picked []scoredCand
-		seen2 := map[string]bool{}
-		for _, s := range ordered {
-			id := s.c.Market.ConditionID
-			if stickySet[id] {
-				picked = append(picked, s)
-				seen2[id] = true
-				if len(picked) >= opts.BoardMaxN {
-					break
-				}
-			}
-		}
-		if len(picked) < opts.BoardMaxN {
-			for _, s := range scored { // original edge order
-				id := s.c.Market.ConditionID
-				if seen2[id] {
-					continue
-				}
-				picked = append(picked, s)
-				seen2[id] = true
-				if len(picked) >= opts.BoardMaxN {
-					break
-				}
-			}
-		}
-		dropped["board_cap"] = len(scored) - len(picked)
-		// final order by edge_bps
-		sort.SliceStable(picked, func(i, j int) bool {
-			return picked[i].res.EdgeBps > picked[j].res.EdgeBps
-		})
-		ordered = picked
-	}
+	before := len(scored)
+	scored = selectTopNByEdge(scored, stickyMap(opts.StickyConditionIDs), opts.BoardMaxN)
+	dropped["board_cap"] = max(0, before-len(scored))
 
-	// Related legs
-	groupMembers := map[string][]string{}
-	for cond, c := range stage1.ByCond {
-		if c.NegRiskGroupID == "" {
-			continue
-		}
-		groupMembers[c.NegRiskGroupID] = append(groupMembers[c.NegRiskGroupID], cond)
+	groupMembers := groupMemberIndex(stage1.ByCond)
+	rows := materializeRows(scored, groupMembers, opts)
+	return BoardBuildResult{
+		Rows:           rows,
+		Stage1Count:    stage1.Stage1Count,
+		PoolCount:      stage1.PoolCount,
+		DroppedSummary: dropped,
 	}
-	for g := range groupMembers {
-		sort.Strings(groupMembers[g])
-	}
+}
 
+func scoreViewFrom(res edge.ScoreResult) edgeScoreView {
+	return edgeScoreView{
+		EdgeBps:        res.EdgeBps,
+		OpportunityBps: res.OpportunityBps,
+		CostTotalBps:   res.Cost.TotalCostBps,
+		CapacityUSD:    res.Cost.CapacityUSD,
+		Urgency:        res.Urgency,
+		RiskFlags:      res.RiskFlags,
+		StrategyTags:   res.StrategyTags,
+		KeyFeatures:    res.KeyFeatures,
+		FairValue:      res.FairValue,
+		ModelEdgeBps:   res.ModelEdgeBps,
+		FVSource:       res.FVSource,
+		HasBook:        res.Cost.HasBook,
+		HalfSpreadBps:  res.Cost.HalfSpreadBps,
+		Mid:            res.Cost.Mid,
+		Drop:           res.Drop,
+	}
+}
+
+func materializeRows(ordered []scoredCand, groupMembers map[string][]string, opts EdgeBuildOptions) []db.EdgeBoardRow {
 	rows := make([]db.EdgeBoardRow, 0, len(ordered))
 	for i, s := range ordered {
 		m := s.c.Market
@@ -307,8 +229,8 @@ func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult
 			vol24 = m.Volume24hrClob
 		}
 		eb := s.res.EdgeBps
-		cost := s.res.Cost.TotalCostBps
-		cap := s.res.Cost.CapacityUSD
+		cost := s.res.CostTotalBps
+		cap := s.res.CapacityUSD
 		urg := s.res.Urgency
 		kf, _ := json.Marshal(s.res.KeyFeatures)
 		flags := s.res.RiskFlags
@@ -319,11 +241,7 @@ func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult
 		if tags == nil {
 			tags = []string{}
 		}
-		var featuresAsOf *time.Time
-		if s.res.KeyFeatures != nil {
-			t := opts.Now
-			featuresAsOf = &t
-		}
+		t := opts.Now
 		row := db.EdgeBoardRow{
 			Strategy:       opts.Strategy,
 			ConditionID:    m.ConditionID,
@@ -340,7 +258,7 @@ func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult
 			KeyFeatures:    kf,
 			RiskFlags:      flags,
 			StrategyTags:   tags,
-			FeaturesAsOf:   featuresAsOf,
+			FeaturesAsOf:   &t,
 			FairValue:      s.res.FairValue,
 			ModelEdgeBps:   s.res.ModelEdgeBps,
 			FVSource:       s.res.FVSource,
@@ -353,20 +271,51 @@ func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult
 			SelectedAt:     opts.Now,
 			RunID:          opts.RunID,
 		}
-		// Prefer live book mid spread if present
-		if s.res.Cost.HasBook && s.res.Cost.Mid > 0 {
-			// approximate full spread from half
-			row.Spread = (s.res.Cost.HalfSpreadBps * 2 / 10_000) * s.res.Cost.Mid
+		if s.res.HasBook && s.res.Mid > 0 {
+			row.Spread = (s.res.HalfSpreadBps * 2 / 10_000) * s.res.Mid
 		}
 		rows = append(rows, row)
 	}
+	return rows
+}
 
-	return BoardBuildResult{
-		Rows:           rows,
-		Stage1Count:    stage1.Stage1Count,
-		PoolCount:      stage1.PoolCount,
-		DroppedSummary: dropped,
+func negRiskResiduals(cands []Candidate, books BookIndex) (residual map[string]float64, incomplete map[string]bool) {
+	groupMids := map[string][]edge.GroupLeg{}
+	for _, c := range cands {
+		if c.Market == nil || !c.NegRisk || c.NegRiskGroupID == "" {
+			continue
+		}
+		toks := parseTokenIDs(c.Market.ClobTokenIds)
+		mid := midFromBooks(toks, books)
+		if mid > 0 {
+			groupMids[c.NegRiskGroupID] = append(groupMids[c.NegRiskGroupID], edge.GroupLeg{
+				ConditionID: c.Market.ConditionID,
+				Mid:         mid,
+			})
+		}
 	}
+	residual = map[string]float64{}
+	incomplete = map[string]bool{}
+	for g, legs := range groupMids {
+		bps, inc := edge.GroupResidual(legs)
+		residual[g] = bps
+		incomplete[g] = inc
+	}
+	return residual, incomplete
+}
+
+func groupMemberIndex(byCond map[string]Candidate) map[string][]string {
+	groupMembers := map[string][]string{}
+	for cond, c := range byCond {
+		if c.NegRiskGroupID == "" {
+			continue
+		}
+		groupMembers[c.NegRiskGroupID] = append(groupMembers[c.NegRiskGroupID], cond)
+	}
+	for g := range groupMembers {
+		sort.Strings(groupMembers[g])
+	}
+	return groupMembers
 }
 
 func featureFromCandidate(
@@ -408,15 +357,25 @@ func featureFromCandidate(
 		fv.NegRiskIncomplete = groupIncomplete[c.NegRiskGroupID]
 	}
 
+	// Primary token only (first CLOB id = YES on binary markets).
 	toks := parseTokenIDs(m.ClobTokenIds)
-	// Prefer first token (YES) book for binary markets
 	var snap *enrich.BookSnapshot
-	for _, tid := range toks {
-		if b, ok := books[tid]; ok {
+	if len(toks) > 0 {
+		if b, ok := books[toks[0]]; ok {
 			bb := b
 			snap = &bb
-			fv.TokenID = tid
-			break
+			fv.TokenID = toks[0]
+		}
+	}
+	if snap == nil {
+		// Fallback: any token in index (legacy enrich of both legs).
+		for _, tid := range toks {
+			if b, ok := books[tid]; ok {
+				bb := b
+				snap = &bb
+				fv.TokenID = tid
+				break
+			}
 		}
 	}
 	if snap == nil {
@@ -454,30 +413,39 @@ func takerFeeBps(m *services.PlyMktMarket) float64 {
 	if m == nil {
 		return 0
 	}
-	// TakerBaseFee on Gamma is often in raw fee units; treat as bps if small.
-	if m.TakerBaseFee > 0 && m.TakerBaseFee < 10_000 {
+	// Prefer strategy default (0 here); only use market meta when clearly bps-scale.
+	if m.TakerBaseFee > 0 && m.TakerBaseFee <= 500 {
 		return float64(m.TakerBaseFee)
 	}
 	return 0
 }
 
-// CollectTokenIDs returns unique CLOB token IDs for Stage-1 candidates (YES+NO).
-func CollectTokenIDs(cands []Candidate) []string {
+// CollectPrimaryTokenIDs returns the first CLOB token per market (YES leg for binaries).
+// This halves /books fan-out vs collecting both outcomes.
+func CollectPrimaryTokenIDs(cands []Candidate) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, c := range cands {
 		if c.Market == nil {
 			continue
 		}
-		for _, tid := range parseTokenIDs(c.Market.ClobTokenIds) {
-			if tid == "" || seen[tid] {
-				continue
-			}
-			seen[tid] = true
-			out = append(out, tid)
+		toks := parseTokenIDs(c.Market.ClobTokenIds)
+		if len(toks) == 0 {
+			continue
 		}
+		tid := toks[0]
+		if tid == "" || seen[tid] {
+			continue
+		}
+		seen[tid] = true
+		out = append(out, tid)
 	}
 	return out
+}
+
+// CollectTokenIDs is an alias for CollectPrimaryTokenIDs (prefer primary-token enrich).
+func CollectTokenIDs(cands []Candidate) []string {
+	return CollectPrimaryTokenIDs(cands)
 }
 
 // CollectConditionIDs returns unique condition IDs.
@@ -490,6 +458,24 @@ func CollectConditionIDs(cands []Candidate) []string {
 		}
 		seen[c.Market.ConditionID] = true
 		out = append(out, c.Market.ConditionID)
+	}
+	return out
+}
+
+func stickyMap(ids []string) map[string]bool {
+	m := map[string]bool{}
+	for _, id := range ids {
+		if id != "" {
+			m[id] = true
+		}
+	}
+	return m
+}
+
+func copyDropped(in map[string]int) map[string]int {
+	out := map[string]int{}
+	for k, v := range in {
+		out[k] = v
 	}
 	return out
 }

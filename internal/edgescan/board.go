@@ -106,14 +106,9 @@ func firstCategorySlug(e *services.PlyMktEvent) string {
 	return ""
 }
 
-// BuildBoard runs Stage-1 rank then final board cut with sticky + related legs.
+// BuildBoard materializes Stage-1 activity rows without edge scoring (tests / diagnostics).
+// Production uses SelectStage1 + BuildEdgeBoard (or RunCycle). Prefer those.
 func BuildBoard(pool []Candidate, opts BuildOptions) BoardBuildResult {
-	dropped := map[string]int{
-		"not_tradable_or_empty_pool": 0,
-		"stage1_filter":              0,
-		"stage1_cap":                 0,
-		"board_cap":                  0,
-	}
 	if opts.Strategy == "" {
 		opts.Strategy = DefaultStrategy
 	}
@@ -126,89 +121,19 @@ func BuildBoard(pool []Candidate, opts BuildOptions) BoardBuildResult {
 	if opts.Filter.MaxN <= 0 {
 		opts.Filter.MaxN = 200
 	}
-
-	poolCount := len(pool)
-	if poolCount == 0 {
-		dropped["not_tradable_or_empty_pool"] = 1
-		return BoardBuildResult{DroppedSummary: dropped, PoolCount: 0}
+	// Cap Stage-1 to BoardMaxN for the diagnostic path so tests stay small.
+	if opts.Filter.MaxN > opts.BoardMaxN {
+		opts.Filter.MaxN = opts.BoardMaxN
 	}
 
-	// Index by condition for sticky + related legs.
-	byCond := map[string]Candidate{}
-	markets := make([]*services.PlyMktMarket, 0, len(pool))
-	for _, c := range pool {
-		if c.Market == nil || c.Market.ConditionID == "" {
+	stage1 := SelectStage1(pool, opts)
+	groupMembers := groupMemberIndex(stage1.ByCond)
+	rows := make([]db.EdgeBoardRow, 0, len(stage1.Candidates))
+	for i, c := range stage1.Candidates {
+		if c.Market == nil {
 			continue
 		}
-		byCond[c.Market.ConditionID] = c
-		markets = append(markets, c.Market)
-	}
-
-	// Activity score Stage-1 (parity bridge). Uses Weights without env if tests set UseEnvWeights false via filter path — DefaultScoreWeights uses env.
-	ranked := marketranking.RankMarkets(markets, opts.Filter)
-	stage1Count := len(ranked)
-	dropped["stage1_filter"] = len(markets) - stage1Count
-	if opts.Filter.MaxN > 0 && len(markets) > opts.Filter.MaxN && stage1Count == opts.Filter.MaxN {
-		// Cap applied inside RankMarkets — approximate filtered-out-by-cap.
-		dropped["stage1_cap"] = 0 // unknown exact; leave 0
-	}
-
-	// Sticky: ensure prior board conditions that still pass Stage-1 filter (in ranked set or still in pool and pass hard gates).
-	stickySet := map[string]bool{}
-	for _, id := range opts.StickyConditionIDs {
-		if id != "" {
-			stickySet[id] = true
-		}
-	}
-	inRanked := map[string]bool{}
-	for _, m := range ranked {
-		if m != nil {
-			inRanked[m.ConditionID] = true
-		}
-	}
-	// Append sticky markets that passed pool+filter but missed MaxN cut: re-rank not needed; append if still in byCond and would pass filter.
-	for id := range stickySet {
-		if inRanked[id] {
-			continue
-		}
-		c, ok := byCond[id]
-		if !ok || c.Market == nil {
-			continue
-		}
-		if passesHardFilter(c.Market, opts.Filter) {
-			// Boost slightly so sticky survives board cut preference.
-			c.Market.ComputedScore += 1e-6
-			ranked = append(ranked, c.Market)
-			inRanked[id] = true
-		}
-	}
-	// Re-sort after sticky inject
-	sort.SliceStable(ranked, func(i, j int) bool {
-		return ranked[i].ComputedScore > ranked[j].ComputedScore
-	})
-
-	// Prefer sticky when trimming: stable partition sticky first among equal scores already sorted — take BoardMaxN with sticky preference.
-	boardMkts := selectBoard(ranked, stickySet, opts.BoardMaxN)
-	dropped["board_cap"] = max(0, len(ranked)-len(boardMkts))
-
-	// Related legs within full pool by neg_risk_group.
-	groupMembers := map[string][]string{}
-	for cond, c := range byCond {
-		if c.NegRiskGroupID == "" {
-			continue
-		}
-		groupMembers[c.NegRiskGroupID] = append(groupMembers[c.NegRiskGroupID], cond)
-	}
-	for g := range groupMembers {
-		sort.Strings(groupMembers[g])
-	}
-
-	rows := make([]db.EdgeBoardRow, 0, len(boardMkts))
-	for i, m := range boardMkts {
-		if m == nil {
-			continue
-		}
-		c := byCond[m.ConditionID]
+		m := c.Market
 		tokens := parseTokenIDs(m.ClobTokenIds)
 		legs := relatedLegs(m.ConditionID, c.NegRiskGroupID, groupMembers)
 		liq := marketLiquidity(m)
@@ -225,7 +150,7 @@ func BuildBoard(pool []Candidate, opts BuildOptions) BoardBuildResult {
 			ClobTokenIDs:   tokens,
 			Rank:           i + 1,
 			Score:          m.ComputedScore,
-			EdgeBps:        nil, // M3
+			EdgeBps:        nil,
 			NegRisk:        c.NegRisk,
 			NegRiskGroupID: c.NegRiskGroupID,
 			RelatedLegs:    legs,
@@ -236,11 +161,12 @@ func BuildBoard(pool []Candidate, opts BuildOptions) BoardBuildResult {
 			RunID:          opts.RunID,
 		})
 	}
-
+	dropped := copyDropped(stage1.DroppedSummary)
+	dropped["board_cap"] = 0
 	return BoardBuildResult{
 		Rows:           rows,
-		Stage1Count:    stage1Count,
-		PoolCount:      poolCount,
+		Stage1Count:    stage1.Stage1Count,
+		PoolCount:      stage1.PoolCount,
 		DroppedSummary: dropped,
 	}
 }

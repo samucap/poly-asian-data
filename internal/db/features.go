@@ -61,7 +61,7 @@ func EnsureM3FeatureTables(ctx context.Context, conn DBInterface) error {
 	return nil
 }
 
-// InsertOIHistory appends OI samples.
+// InsertOIHistory appends OI samples (batched).
 func InsertOIHistory(ctx context.Context, conn DBInterface, rows []OIHistoryRow) error {
 	if conn == nil {
 		return ErrNilDB
@@ -69,6 +69,7 @@ func InsertOIHistory(ctx context.Context, conn DBInterface, rows []OIHistoryRow)
 	if len(rows) == 0 {
 		return nil
 	}
+	args := make([][]any, 0, len(rows))
 	for _, r := range rows {
 		if r.ConditionID == "" {
 			continue
@@ -81,17 +82,17 @@ func InsertOIHistory(ctx context.Context, conn DBInterface, rows []OIHistoryRow)
 		if ts.IsZero() {
 			ts = time.Now().UTC()
 		}
-		if _, err := conn.Exec(ctx, `
-			INSERT INTO oi_history (time, condition_id, oi_value, source)
-			VALUES ($1, $2, $3, $4)
-		`, ts, r.ConditionID, r.OIValue, src); err != nil {
-			return fmt.Errorf("db: insert oi_history: %w", err)
-		}
+		args = append(args, []any{ts, r.ConditionID, r.OIValue, src})
+	}
+	const sql = `INSERT INTO oi_history (time, condition_id, oi_value, source) VALUES ($1, $2, $3, $4)`
+	if err := BatchExec(ctx, conn, sql, args); err != nil {
+		return fmt.Errorf("db: insert oi_history: %w", err)
 	}
 	return nil
 }
 
-// InsertOrderbookSnapshots writes orderbook_snapshots rows.
+// InsertOrderbookSnapshots writes orderbook_snapshots rows (batched).
+// Requires unique (time, market_id, token_id) for upsert; plain insert if no conflict target.
 func InsertOrderbookSnapshots(ctx context.Context, conn DBInterface, rows []OrderbookSnapshotRow) error {
 	if conn == nil {
 		return ErrNilDB
@@ -99,6 +100,7 @@ func InsertOrderbookSnapshots(ctx context.Context, conn DBInterface, rows []Orde
 	if len(rows) == 0 {
 		return nil
 	}
+	args := make([][]any, 0, len(rows))
 	for _, r := range rows {
 		if r.TokenID == "" {
 			continue
@@ -107,31 +109,33 @@ func InsertOrderbookSnapshots(ctx context.Context, conn DBInterface, rows []Orde
 		if ts.IsZero() {
 			ts = time.Now().UTC()
 		}
-		if _, err := conn.Exec(ctx, `
+		args = append(args, []any{
+			ts, r.MarketID, r.TokenID, r.BestBid, r.BestAsk,
+			r.Imbalance, r.TotalBidDepth, r.TotalAskDepth, r.DepthJSON, r.RawJSON,
+		})
+	}
+	const upsertSQL = `
+		INSERT INTO orderbook_snapshots (
+			time, market_id, token_id, best_bid, best_ask,
+			imbalance, total_bid_depth, total_ask_depth, depth_json, raw_response_json
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		ON CONFLICT (time, market_id, token_id) DO UPDATE SET
+			best_bid = EXCLUDED.best_bid,
+			best_ask = EXCLUDED.best_ask,
+			imbalance = EXCLUDED.imbalance,
+			total_bid_depth = EXCLUDED.total_bid_depth,
+			total_ask_depth = EXCLUDED.total_ask_depth,
+			depth_json = EXCLUDED.depth_json,
+			raw_response_json = EXCLUDED.raw_response_json`
+	if err := BatchExec(ctx, conn, upsertSQL, args); err != nil {
+		// Schema without unique constraint: fall back to plain insert batch.
+		const insertSQL = `
 			INSERT INTO orderbook_snapshots (
 				time, market_id, token_id, best_bid, best_ask,
 				imbalance, total_bid_depth, total_ask_depth, depth_json, raw_response_json
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-			ON CONFLICT (time, market_id, token_id) DO UPDATE SET
-				best_bid = EXCLUDED.best_bid,
-				best_ask = EXCLUDED.best_ask,
-				imbalance = EXCLUDED.imbalance,
-				total_bid_depth = EXCLUDED.total_bid_depth,
-				total_ask_depth = EXCLUDED.total_ask_depth,
-				depth_json = EXCLUDED.depth_json,
-				raw_response_json = EXCLUDED.raw_response_json
-		`, ts, r.MarketID, r.TokenID, r.BestBid, r.BestAsk,
-			r.Imbalance, r.TotalBidDepth, r.TotalAskDepth, r.DepthJSON, r.RawJSON); err != nil {
-			// Fallback without ON CONFLICT if unique constraint missing.
-			if _, err2 := conn.Exec(ctx, `
-				INSERT INTO orderbook_snapshots (
-					time, market_id, token_id, best_bid, best_ask,
-					imbalance, total_bid_depth, total_ask_depth, depth_json, raw_response_json
-				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-			`, ts, r.MarketID, r.TokenID, r.BestBid, r.BestAsk,
-				r.Imbalance, r.TotalBidDepth, r.TotalAskDepth, r.DepthJSON, r.RawJSON); err2 != nil {
-				return fmt.Errorf("db: insert orderbook_snapshots: %w", err2)
-			}
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`
+		if err2 := BatchExec(ctx, conn, insertSQL, args); err2 != nil {
+			return fmt.Errorf("db: insert orderbook_snapshots: %w", err)
 		}
 	}
 	return nil
