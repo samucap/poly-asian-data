@@ -73,6 +73,11 @@ def explain_row(r: dict[str, Any]) -> list[str]:
 
     if residual >= 50:
         reasons.append(f"neg-risk residual ≈{_fmt(residual)} bps")
+    if r.get("fair_value") is not None:
+        reasons.append(
+            f"FV={_fmt(r.get('fair_value'), 3)} via {r.get('fv_source') or '?'} "
+            f"(model_edge={_fmt(r.get('model_edge_bps'))})"
+        )
 
     if abs(imb - 0.5) >= 0.25:
         side = "bid-heavy" if imb > 0.5 else "ask-heavy"
@@ -147,6 +152,7 @@ def main() -> int:
         f"pool={stats.get('n_candidates')}  stage1={stats.get('n_stage1')}  "
         f"board={stats.get('n_board')}  "
         f"enrich_coverage={stats.get('enrich_coverage')}  "
+        f"fv_coverage={stats.get('fv_coverage')}  fv_hits={stats.get('fv_hits')}  "
         f"cycle_ms={stats.get('cycle_ms')}  enrich_ms={stats.get('enrich_ms')}"
     )
     print(
@@ -175,6 +181,21 @@ def main() -> int:
             f"capacity_usd={_fmt(r.get('capacity_usd'), 0)}"
         )
         print(q)
+        if r.get("fair_value") is not None:
+            print(
+                f"  FV path: fair_value={_fmt(r.get('fair_value'), 3)}  "
+                f"model_edge_bps={_fmt(r.get('model_edge_bps'))}  "
+                f"fv_source={r.get('fv_source') or '—'}"
+            )
+            # identity check
+            mid = _num(kf.get("mid"))
+            cost = _num(r.get("cost_bps"))
+            fv = _num(r.get("fair_value"))
+            me = r.get("model_edge_bps")
+            if mid > 0 and me is not None:
+                expected = (fv - mid) * 10000 - cost  # buffer already in stored model_edge
+                # model_edge includes buffer; recompute raw - cost only as soft check vs edge_bps
+                print(f"  recompute raw_edge_bps={_fmt((fv - mid) * 10000)}  mid={_fmt(mid, 3)}")
         print(
             f"  category={r.get('category') or '—'}  "
             f"neg_risk={r.get('neg_risk')}  "

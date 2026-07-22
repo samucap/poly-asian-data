@@ -56,7 +56,8 @@ type FeatureVector struct {
 // KeyFeatures returns a compact map for board embed (agent budget).
 func (f FeatureVector) KeyFeatures() map[string]any {
 	return map[string]any{
-		"mid":                   round1(f.Mid),
+		// mid kept high-precision so M3.5 identity checks (model_edge recompute) work
+		"mid":                   round5(f.Mid),
 		"spread_bps":            round1(f.SpreadBps),
 		"imbalance":             round3(f.Imbalance),
 		"abs_ret_5m":            round5(f.AbsRet5m),

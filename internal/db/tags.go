@@ -146,6 +146,12 @@ func fetchTagsWhere(ctx context.Context, conn DBInterface, query string, arg str
 // UpdateTags upserts tag definitions, hierarchy, and cycle aggregates in one write.
 // Empty parent_tag_id is stored as NULL. Metrics are fully replaced for each row
 // (idle tags should be passed with zeros so stale totals do not linger).
+//
+// Parent FK safety:
+//  1. Self-parent nulled.
+//  2. Parents not in this batch and not already in DB → parent_tag_id cleared
+//     (no silent empty stubs that poison hierarchy).
+//  3. Upsert batch runs in one transaction so DEFERRABLE parent FK checks at COMMIT.
 func UpdateTags(ctx context.Context, conn DBInterface, tags []*services.PlyMktTag) error {
 	if len(tags) == 0 {
 		return nil
@@ -153,6 +159,8 @@ func UpdateTags(ctx context.Context, conn DBInterface, tags []*services.PlyMktTa
 	if conn == nil {
 		return ErrNilDB
 	}
+
+	tags, _ = sanitizeTagParents(ctx, conn, tags)
 
 	// parent_tag_id: writer is authoritative when non-empty (catalog-markets overlays
 	// sports hierarchy as Gamma parent tag ids before calling this). Never use
@@ -188,28 +196,99 @@ func UpdateTags(ctx context.Context, conn DBInterface, tags []*services.PlyMktTa
 			updated_at = NOW()
 	`
 
-	rows := make([][]any, 0, len(tags))
+	var roots, rest [][]any
 	for _, t := range tags {
 		if t == nil || t.ID == "" {
 			continue
 		}
-		rows = append(rows, []any{
+		parent := t.ParentTagID
+		if parent == t.ID {
+			parent = ""
+		}
+		row := []any{
 			t.ID,
 			t.Label,
 			t.Slug,
 			t.ForceShow,
 			t.ForceHide,
-			t.ParentTagID,
+			parent,
 			t.TotalVol,
 			t.TotalVol24hr,
 			t.TotalLiq,
 			t.TotalMarkets,
-		})
+		}
+		if parent == "" {
+			roots = append(roots, row)
+		} else {
+			rest = append(rest, row)
+		}
 	}
+	rows := append(roots, rest...)
 	if len(rows) == 0 {
 		return nil
 	}
-	return BatchExec(ctx, conn, sql, rows)
+	return BatchExecTx(ctx, conn, sql, rows)
+}
+
+// sanitizeTagParents nulls illegal/missing parents instead of inserting empty stubs.
+// A parent is kept if it appears in this batch or already exists in the DB.
+func sanitizeTagParents(ctx context.Context, conn DBInterface, tags []*services.PlyMktTag) ([]*services.PlyMktTag, []string) {
+	if len(tags) == 0 {
+		return tags, nil
+	}
+	byID := make(map[string]*services.PlyMktTag, len(tags))
+	out := make([]*services.PlyMktTag, 0, len(tags))
+	for _, t := range tags {
+		if t == nil || t.ID == "" {
+			continue
+		}
+		if t.ParentTagID == t.ID {
+			t.ParentTagID = ""
+		}
+		if _, ok := byID[t.ID]; ok {
+			continue
+		}
+		byID[t.ID] = t
+		out = append(out, t)
+	}
+
+	needCheck := make([]string, 0)
+	seenNeed := map[string]bool{}
+	for _, t := range out {
+		p := t.ParentTagID
+		if p == "" || byID[p] != nil {
+			continue
+		}
+		if !seenNeed[p] {
+			seenNeed[p] = true
+			needCheck = append(needCheck, p)
+		}
+	}
+
+	existing := map[string]bool{}
+	if len(needCheck) > 0 && conn != nil {
+		rows, err := conn.Query(ctx, `SELECT id FROM tags WHERE id = ANY($1)`, needCheck)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var id string
+				if rows.Scan(&id) == nil && id != "" {
+					existing[id] = true
+				}
+			}
+		}
+	}
+
+	var cleared []string
+	for _, t := range out {
+		p := t.ParentTagID
+		if p == "" || byID[p] != nil || existing[p] {
+			continue
+		}
+		t.ParentTagID = ""
+		cleared = append(cleared, p)
+	}
+	return out, cleared
 }
 
 // UpdateTagAggregates writes volume/liquidity rollups onto tags by id (metrics only).

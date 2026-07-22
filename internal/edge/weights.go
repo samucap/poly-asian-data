@@ -36,6 +36,15 @@ type Weights struct {
 	VolCapBps float64 `yaml:"vol_cap_bps" json:"vol_cap_bps"`
 	OIScale   float64 `yaml:"oi_scale" json:"oi_scale"`
 	OICapBps  float64 `yaml:"oi_cap_bps" json:"oi_cap_bps"`
+
+	// M3.5 fair value
+	FVEnabled         bool    `yaml:"fv_enabled" json:"fv_enabled"`
+	FVMinConfidence   float64 `yaml:"fv_min_confidence" json:"fv_min_confidence"`
+	FVMinOtherLegs    int     `yaml:"fv_min_other_legs" json:"fv_min_other_legs"`
+	DropExtremePrice  bool    `yaml:"drop_extreme_price" json:"drop_extreme_price"`
+	ExtremeLo         float64 `yaml:"extreme_lo" json:"extreme_lo"`
+	ExtremeHi         float64 `yaml:"extreme_hi" json:"extreme_hi"`
+	GroupExpandCap    int     `yaml:"group_expand_cap" json:"group_expand_cap"`
 }
 
 // DefaultWeights is the M3 baseline screen (cost-aware opportunity, not FV).
@@ -60,10 +69,17 @@ func DefaultWeights() Weights {
 		MinDepthShares:     10,
 		DropMissingBook:    false,
 		StalePenaltyBps:    50,
-		VolScale:           1.0,
-		VolCapBps:          500,
-		OIScale:            100,
-		OICapBps:           200,
+		VolScale:          1.0,
+		VolCapBps:         500,
+		OIScale:           100,
+		OICapBps:          200,
+		FVEnabled:         true,
+		FVMinConfidence:   0.4,
+		FVMinOtherLegs:    1,
+		DropExtremePrice:  true,
+		ExtremeLo:         0.05,
+		ExtremeHi:         0.95,
+		GroupExpandCap:    100,
 	}
 }
 

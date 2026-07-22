@@ -55,6 +55,9 @@ type BoardBuildResult struct {
 	Stage1Count    int
 	PoolCount      int
 	DroppedSummary map[string]int
+	// M3.5 diagnostics
+	FVHits     int     // Stage-1 candidates that received an FV quote
+	FVCoverage float64 // fraction of final board with non-null fair_value
 }
 
 // FlattenCandidates extracts tradable markets from events with neg-risk context.
@@ -318,6 +321,9 @@ type BoardStats struct {
 	EnrichCoverage   float64 `json:"enrich_coverage,omitempty"`
 	FeatureAgeP95MS  int64   `json:"feature_age_p95_ms,omitempty"`
 	EdgeBpsNullFrac  float64 `json:"edge_bps_null_frac,omitempty"`
+	FVCoverage       float64 `json:"fv_coverage,omitempty"`
+	FVHits           int     `json:"fv_hits,omitempty"`
+	TokensExpanded   int     `json:"tokens_expanded,omitempty"`
 }
 
 // BoardEntry is one self-contained board row for agents / WS.
@@ -445,6 +451,9 @@ func BuildArtifactWithStats(rows []db.EdgeBoardRow, poolN, stage1N int, dropped 
 		EnrichCoverage:  extra.EnrichCoverage,
 		FeatureAgeP95MS: extra.FeatureAgeP95MS,
 		EdgeBpsNullFrac: nullFrac,
+		FVCoverage:      extra.FVCoverage,
+		FVHits:          extra.FVHits,
+		TokensExpanded:  extra.TokensExpanded,
 	}
 
 	doc := EdgeBoardV1{

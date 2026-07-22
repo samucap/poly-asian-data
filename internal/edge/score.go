@@ -96,6 +96,8 @@ func Score(in ScoreInput, w Weights) ScoreResult {
 		return res
 	}
 
+	// Extreme mid is a board eligibility policy (edgescan), not applied here.
+
 	if in.FairValue != nil {
 		fv := *in.FairValue
 		modelEdge := (fv - cost.Mid) * 10_000
@@ -106,6 +108,7 @@ func Score(in ScoreInput, w Weights) ScoreResult {
 		net := modelEdge - cost.TotalCostBps - buf
 		res.ModelEdgeBps = &net
 		res.EdgeBps = net
+		// OpportunityBps on FV path = raw model edge only (no multi-family mix).
 		res.OpportunityBps = modelEdge
 		res.Path = "fair_value"
 	} else {
@@ -141,9 +144,10 @@ func opportunityBps(f FeatureVector, w Weights) float64 {
 	oi := oiFamily(f, w)
 	imb := imbalanceFamily(f)
 	ttr := ttrFamily(f)
-	nr := math.Min(w.OICapBps, math.Abs(f.NegRiskResidualBps))
-	if f.NegRiskIncomplete {
-		nr *= 0.25
+	// Incomplete groups: do not invent residual opportunity (flag only via RiskFlags).
+	nr := 0.0
+	if !f.NegRiskIncomplete {
+		nr = math.Min(w.OICapBps, math.Abs(f.NegRiskResidualBps))
 	}
 	flow := flowFamily(f)
 	act := activityFamily(f)

@@ -31,3 +31,12 @@ vol_scale: 1.0
 vol_cap_bps: 500
 oi_scale: 100
 oi_cap_bps: 200
+
+# M3.5 fair value
+fv_enabled: true
+fv_min_confidence: 0.4
+fv_min_other_legs: 1
+drop_extreme_price: true
+extreme_lo: 0.05
+extreme_hi: 0.95
+group_expand_cap: 100

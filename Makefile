@@ -6,9 +6,17 @@ DOCKER_COMPOSE_POSTGRES=docker-compose.postgres.yml
 DOCKER_COMPOSE_APP=docker-compose.app.yml
 MAIN_PATH=cmd/main.go
 
-.PHONY: all build build-catalog build-top-markets build-edge-scan clean test coverage lint run run-catalog-once run-edge-scan-once edge-board-top edge-scan-once-top dev audit sec docker-up docker-down db-up db-down app-up app-down
+.PHONY: all build build-catalog build-top-markets build-edge-scan clean test coverage lint run run-catalog-markets run-catalog-markets-once run-edge-scan run-edge-scan-once edge-board-top edge-board-verify edge-scan-once-top edge-scan-top edge-scan-verify dev audit sec docker-up docker-down db-up db-down app-up app-down
 
 all: build
+
+# Pass-through to the Go binary — same flags as `go run ./cmd/... --once`.
+# Make steals bare `--once`, so put CLI flags in ARGS:
+#   make run-edge-scan ARGS='--once'
+#   make run-edge-scan ARGS='--once --weights configs/strategies/default.yaml'
+#   make run-catalog-markets ARGS='--once'
+# Default ARGS empty = continuous (no --once).
+ARGS ?=
 
 # Build the binary
 build:
@@ -20,24 +28,27 @@ build-catalog:
 	@echo "Building catalog-markets..."
 	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/catalog-markets ./cmd/catalog-markets
 
-build-top-markets:
-	@echo "Building top-markets..."
-	CGO_ENABLED=0 go build -ldflags="-w -s" -o bin/top-markets ./cmd/top-markets
-
 build-edge-scan:
 	@echo "Building edge-scan..."
 	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/edge-scan ./cmd/edge-scan
 
-# One catalog cycle then exit (needs Postgres + network)
-run-catalog-once:
-	go run ./cmd/catalog-markets --once
+# Catalog run (default continuous)
+run-catalog-markets:
+	go run ./cmd/catalog-markets $(ARGS)
 
-# Wipe tags (FK-safe) + sports-sync + force API catalog rebuild
-run-catalog-reset-tags:
-	go run ./cmd/catalog-markets --reset-tags --once
+run-catalog-markets-once:
+	go run ./cmd/catalog-markets --once $(ARGS)
+
+# Wipe tags (FK-safe) + sports-sync + force API catalog rebuild (always one-shot)
+run-catalog-markets-reset-tags:
+	go run ./cmd/catalog-markets --reset-tags --once $(ARGS)
+
+# Edge-scan run (default continuous)
+run-edge-scan:
+	go run ./cmd/edge-scan $(ARGS)
 
 run-edge-scan-once:
-	go run ./cmd/edge-scan --once
+	go run ./cmd/edge-scan --once $(ARGS)
 
 # Explain top N markets from artifacts/edge_board/latest.json (no DB required)
 # Usage: make edge-board-top
@@ -45,11 +56,37 @@ run-edge-scan-once:
 #        make edge-board-top BOARD=artifacts/edge_board/<run_id>.json
 N ?= 5
 BOARD ?= artifacts/edge_board/latest.json
+# VERIFY_ARGS e.g. --require-fv --strict-extreme --buffer 20
+VERIFY_ARGS ?=
 edge-board-top:
 	@python3 scripts/edge_board_top.py --path "$(BOARD)" -n $(N)
 
+# M3.5 accuracy/optimality gates on latest artifact (no network)
+# Usage: make edge-board-verify
+#        make edge-board-verify BOARD=artifacts/edge_board/latest.json VERIFY_ARGS='--require-fv'
+edge-board-verify:
+	@python3 scripts/edge_board_verify.py --path "$(BOARD)" $(VERIFY_ARGS)
+
+# Run edge-scan with ARGS then print top board
+edge-scan-top: run-edge-scan edge-board-top
+
 # One edge-scan cycle then print top board explanation
-edge-scan-once-top: run-edge-scan-once edge-board-top
+edge-scan-once-top:
+	go run ./cmd/edge-scan --once $(ARGS)
+	@$(MAKE) edge-board-top N=$(N) BOARD="$(BOARD)"
+
+# Full M3.5 sign-off: unit tests → one scan → verify → top explain
+# Usage: make edge-scan-verify
+#        make edge-scan-verify VERIFY_ARGS='--require-fv'
+edge-scan-verify:
+	@echo "== unit tests (edge + edgescan) =="
+	go test ./internal/edge/ ./internal/edgescan/ -count=1
+	@echo "== edge-scan --once =="
+	go run ./cmd/edge-scan --once $(ARGS)
+	@echo "== artifact verify =="
+	@python3 scripts/edge_board_verify.py --path "$(BOARD)" $(VERIFY_ARGS)
+	@echo "== top board =="
+	@python3 scripts/edge_board_top.py --path "$(BOARD)" -n $(N)
 
 # Clean build artifacts
 clean:

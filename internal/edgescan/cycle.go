@@ -156,12 +156,22 @@ func RunCycle(ctx context.Context, deps CycleDeps) CycleResult {
 		return res
 	}
 
-	// 3. Parallel enrich: books ∥ OI
+	// 3. Expand in-pool neg-risk siblings (bounded), then parallel enrich
 	stage = time.Now()
-	tokenIDs := CollectPrimaryTokenIDs(stage1.Candidates)
+	expandCap := deps.Weights.GroupExpandCap
+	if expandCap <= 0 {
+		expandCap = 100
+	}
+	// Books: Stage-1 + expanded siblings (needed for group FV mids).
+	// OI: Stage-1 only — expanded legs are not ranked; skip wasted GETs.
+	enrichCands, tokensExpanded := ExpandGroupCandidates(stage1, expandCap)
+	tokenIDs := CollectPrimaryTokenIDs(enrichCands)
 	condIDs := CollectConditionIDs(stage1.Candidates)
 	if len(condIDs) > oiMax {
 		condIDs = condIDs[:oiMax]
+	}
+	if tokensExpanded > 0 {
+		log.Info("group expand", "added_candidates", tokensExpanded, "enrich_cands", len(enrichCands), "primary_tokens", len(tokenIDs))
 	}
 
 	bookIdx := BookIndex{}
@@ -171,36 +181,22 @@ func RunCycle(ctx context.Context, deps CycleDeps) CycleResult {
 	var oiPts []enrich.OIPoint
 
 	// Parallel books ∥ OI (independent I/O).
-	type pair struct {
-		snaps []enrich.BookSnapshot
-		oi    []enrich.OIPoint
-		bErr  error
-		oErr  error
+	var wg sync.WaitGroup
+	if deps.EnrichBooks && len(tokenIDs) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			snaps, booksErr = enrich.FetchBooks(ctx, deps.HTTP, tokenIDs, bookBatch)
+		}()
 	}
-	ch := make(chan pair, 1)
-	go func() {
-		var p pair
-		var wg sync.WaitGroup
-		if deps.EnrichBooks && len(tokenIDs) > 0 {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				p.snaps, p.bErr = enrich.FetchBooks(ctx, deps.HTTP, tokenIDs, bookBatch)
-			}()
-		}
-		if deps.EnrichOI && len(condIDs) > 0 {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				p.oi, p.oErr = enrich.FetchOI(ctx, deps.HTTP, condIDs, oiConc)
-			}()
-		}
-		wg.Wait()
-		ch <- p
-	}()
-	p := <-ch
-	snaps, oiPts = p.snaps, p.oi
-	booksErr, oiErr = p.bErr, p.oErr
+	if deps.EnrichOI && len(condIDs) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			oiPts, oiErr = enrich.FetchOI(ctx, deps.HTTP, condIDs, oiConc)
+		}()
+	}
+	wg.Wait()
 
 	if booksErr != nil {
 		log.Warn("enrich books failed", "error", booksErr)
@@ -292,11 +288,14 @@ func RunCycle(ctx context.Context, deps CycleDeps) CycleResult {
 		Books:               bookIdx,
 		OI:                  oiIdx,
 		PublishRequireBooks: !deps.PublishOnEnrichFail,
+		EnrichCandidates:    enrichCands,
 	})
 	log.Info("stage complete",
 		"stage", "edge_rank",
 		"duration", logging.FormatDuration(time.Since(stage)),
 		"board", logging.FormatCount(int64(len(build.Rows))),
+		"fv_coverage", build.FVCoverage,
+		"fv_hits", build.FVHits,
 	)
 
 	if len(build.Rows) == 0 {
@@ -316,6 +315,9 @@ func RunCycle(ctx context.Context, deps CycleDeps) CycleResult {
 		CycleMS:        time.Since(start).Milliseconds(),
 		EnrichMS:       res.EnrichMS,
 		EnrichCoverage: res.EnrichCoverage,
+		FVCoverage:     build.FVCoverage,
+		FVHits:         build.FVHits,
+		TokensExpanded: tokensExpanded,
 	}
 	doc, err := BuildArtifactWithStats(build.Rows, build.PoolCount, build.Stage1Count, build.DroppedSummary, res.Status, res.Errors, extra)
 	if err != nil {

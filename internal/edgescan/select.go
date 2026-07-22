@@ -1,31 +1,16 @@
 package edgescan
 
-import "sort"
+import (
+	"sort"
+
+	"github.com/samucap/poly-asian-data/internal/edge"
+)
 
 // scoredCand is a Stage-1 candidate with edge score (package-internal).
 type scoredCand struct {
 	c   Candidate
-	res edgeScoreView
+	res edge.ScoreResult
 	act float64 // stage-1 activity score
-}
-
-// edgeScoreView is the subset of edge.ScoreResult needed for ranking/materialize.
-type edgeScoreView struct {
-	EdgeBps        float64
-	OpportunityBps float64
-	CostTotalBps   float64
-	CapacityUSD    float64
-	Urgency        float64
-	RiskFlags      []string
-	StrategyTags   []string
-	KeyFeatures    map[string]any
-	FairValue      *float64
-	ModelEdgeBps   *float64
-	FVSource       string
-	HasBook        bool
-	HalfSpreadBps  float64
-	Mid            float64
-	Drop           bool
 }
 
 // selectTopNByEdge keeps sticky members when cutting to maxN, then reorders by edge desc.

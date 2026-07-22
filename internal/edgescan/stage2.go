@@ -115,7 +115,14 @@ type EdgeBuildOptions struct {
 	Books               BookIndex
 	OI                  OIIndex
 	PublishRequireBooks bool
+	// FV chain; zero value → DefaultFVChain from weights.
+	FV edge.FVChain
+	// EnrichCandidates optional expanded set for group mids (defaults to Stage-1).
+	EnrichCandidates []Candidate
 }
+
+// BoardBuildResult extended with FV coverage diagnostics.
+// (fields added on existing struct via this package — see BoardBuildResult in board.go)
 
 // BuildEdgeBoard ranks Stage-1 candidates by edge_bps and cuts to BoardMaxN.
 func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult {
@@ -123,6 +130,7 @@ func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult
 	dropped["missing_book"] = 0
 	dropped["edge_drop"] = 0
 	dropped["board_cap"] = 0
+	dropped["extreme_price"] = 0
 
 	if opts.Strategy == "" {
 		opts.Strategy = DefaultStrategy
@@ -138,23 +146,65 @@ func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult
 		w = edge.DefaultWeights()
 	}
 
-	groupResidual, groupIncomplete := negRiskResiduals(stage1.Candidates, opts.Books)
+	// Enrich set for group mids (Stage-1 + expanded siblings).
+	enrichSet := opts.EnrichCandidates
+	if len(enrichSet) == 0 {
+		enrichSet = stage1.Candidates
+	}
+	groupMidsByGroup := BuildGroupMidIndex(enrichSet, opts.Books)
+	groupResidual, groupIncomplete := negRiskResiduals(enrichSet, opts.Books)
+
+	fvChain := opts.FV
+	if len(fvChain.Providers) == 0 {
+		fvChain = edge.DefaultFVChainFromWeights(w)
+	}
 
 	scored := make([]scoredCand, 0, len(stage1.Candidates))
 	booksHit := 0
+	fvHits := 0
 	for _, c := range stage1.Candidates {
 		if c.Market == nil {
 			continue
 		}
-		fv := featureFromCandidate(c, opts.Books, opts.OI, groupResidual, groupIncomplete, opts.Now, w)
-		if !fv.MissingBook {
+		feat := featureFromCandidate(c, opts.Books, opts.OI, groupResidual, groupIncomplete, opts.Now, w)
+		if !feat.MissingBook {
 			booksHit++
 		}
-		res := edge.Score(edge.ScoreInput{
-			Features:      fv,
+
+		// Board policy: extreme mid (not inside Score pure math).
+		if w.DropExtremePrice && !feat.MissingBook && edge.IsExtremeMid(feat.Mid, w.ExtremeLo, w.ExtremeHi) {
+			dropped["extreme_price"]++
+			dropped["edge_drop"]++
+			continue
+		}
+
+		scoreIn := edge.ScoreInput{
+			Features:      feat,
 			TakerFeeBps:   takerFeeBps(c.Market),
 			NegRiskFeeBps: float64(c.NegRiskFeeBips),
-		}, w)
+		}
+		if w.FVEnabled {
+			gMids := GroupMidsFor(c, groupMidsByGroup)
+			known := GroupKnownSize(c, stage1.ByCond)
+			if gMids != nil && len(gMids) > known {
+				known = len(gMids)
+			}
+			q := fvChain.Resolve(edge.FairValueInput{
+				ConditionID:    c.Market.ConditionID,
+				Features:       feat,
+				GroupMids:      gMids,
+				KnownGroupSize: known,
+				NegRiskFeeBips: float64(c.NegRiskFeeBips),
+			})
+			if q != nil {
+				fv := q.FairValue
+				scoreIn.FairValue = &fv
+				scoreIn.FVSource = q.Source
+				fvHits++
+			}
+		}
+
+		res := edge.Score(scoreIn, w)
 		if res.Drop {
 			dropped["edge_drop"]++
 			continue
@@ -162,7 +212,7 @@ func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult
 		scored = append(scored, scoredCand{
 			c:   c,
 			act: c.Market.ComputedScore,
-			res: scoreViewFrom(res),
+			res: res,
 		})
 	}
 
@@ -172,6 +222,8 @@ func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult
 			Stage1Count:    stage1.Stage1Count,
 			PoolCount:      stage1.PoolCount,
 			DroppedSummary: dropped,
+			FVHits:         fvHits,
+			FVCoverage:     0,
 		}
 	}
 	dropped["missing_book"] = max(0, len(stage1.Candidates)-booksHit)
@@ -187,6 +239,18 @@ func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult
 	scored = selectTopNByEdge(scored, stickyMap(opts.StickyConditionIDs), opts.BoardMaxN)
 	dropped["board_cap"] = max(0, before-len(scored))
 
+	// FV coverage on final board
+	boardFV := 0
+	for _, s := range scored {
+		if s.res.FairValue != nil {
+			boardFV++
+		}
+	}
+	fvCov := 0.0
+	if len(scored) > 0 {
+		fvCov = float64(boardFV) / float64(len(scored))
+	}
+
 	groupMembers := groupMemberIndex(stage1.ByCond)
 	rows := materializeRows(scored, groupMembers, opts)
 	return BoardBuildResult{
@@ -194,26 +258,8 @@ func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult
 		Stage1Count:    stage1.Stage1Count,
 		PoolCount:      stage1.PoolCount,
 		DroppedSummary: dropped,
-	}
-}
-
-func scoreViewFrom(res edge.ScoreResult) edgeScoreView {
-	return edgeScoreView{
-		EdgeBps:        res.EdgeBps,
-		OpportunityBps: res.OpportunityBps,
-		CostTotalBps:   res.Cost.TotalCostBps,
-		CapacityUSD:    res.Cost.CapacityUSD,
-		Urgency:        res.Urgency,
-		RiskFlags:      res.RiskFlags,
-		StrategyTags:   res.StrategyTags,
-		KeyFeatures:    res.KeyFeatures,
-		FairValue:      res.FairValue,
-		ModelEdgeBps:   res.ModelEdgeBps,
-		FVSource:       res.FVSource,
-		HasBook:        res.Cost.HasBook,
-		HalfSpreadBps:  res.Cost.HalfSpreadBps,
-		Mid:            res.Cost.Mid,
-		Drop:           res.Drop,
+		FVHits:         fvHits,
+		FVCoverage:     fvCov,
 	}
 }
 
@@ -229,13 +275,17 @@ func materializeRows(ordered []scoredCand, groupMembers map[string][]string, opt
 			vol24 = m.Volume24hrClob
 		}
 		eb := s.res.EdgeBps
-		cost := s.res.CostTotalBps
-		cap := s.res.CapacityUSD
+		cost := s.res.Cost.TotalCostBps
+		cap := s.res.Cost.CapacityUSD
 		urg := s.res.Urgency
 		kf, _ := json.Marshal(s.res.KeyFeatures)
 		flags := s.res.RiskFlags
 		if flags == nil {
 			flags = []string{}
+		}
+		// Annotate residual-homogeneous complement on board for agents.
+		if s.res.Path == "fair_value" && s.res.FVSource == "neg_risk_complement" {
+			flags = append(flags, "fv_group_residual")
 		}
 		tags := s.res.StrategyTags
 		if tags == nil {
@@ -271,8 +321,8 @@ func materializeRows(ordered []scoredCand, groupMembers map[string][]string, opt
 			SelectedAt:     opts.Now,
 			RunID:          opts.RunID,
 		}
-		if s.res.HasBook && s.res.Mid > 0 {
-			row.Spread = (s.res.HalfSpreadBps * 2 / 10_000) * s.res.Mid
+		if s.res.Cost.HasBook && s.res.Cost.Mid > 0 {
+			row.Spread = (s.res.Cost.HalfSpreadBps * 2 / 10_000) * s.res.Cost.Mid
 		}
 		rows = append(rows, row)
 	}
