@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "signal_eval_surface_v1",
+  "title": "SignalEvalSurface",
+  "description": "M8 paper risk + fill scorecard for external AO. Not M4 promote_eligible. No OMS.",
+  "type": "object",
+  "required": ["schema_version", "run_id", "ok", "metrics", "risk", "config_hash"],
+  "properties": {
+    "schema_version": { "type": "string", "const": "signal_eval_surface_v1" },
+    "run_id": { "type": "string" },
+    "ok": { "type": "boolean" },
+    "purpose": { "type": "string" },
+    "config_hash": { "type": "string" },
+    "risk": { "type": "object" },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "n_signals": { "type": "integer" },
+        "n_accepted": { "type": "integer" },
+        "n_rejected_risk": { "type": "integer" },
+        "hit_rate": { "type": "number" },
+        "total_pnl_usd": { "type": "number" },
+        "sharpe": { "type": "number" },
+        "max_drawdown_bps": { "type": "number" },
+        "max_daily_drawdown_bps": { "type": "number" }
+      }
+    },
+    "gates_passed": { "type": "array", "items": { "type": "string" } },
+    "gates_failed": { "type": "array", "items": { "type": "string" } }
+  }
+}

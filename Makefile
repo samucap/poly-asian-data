@@ -6,7 +6,7 @@ DOCKER_COMPOSE_POSTGRES=docker-compose.postgres.yml
 DOCKER_COMPOSE_APP=docker-compose.app.yml
 MAIN_PATH=cmd/main.go
 
-.PHONY: all build build-catalog build-top-markets build-edge-scan build-edge-eval build-strategy build-ws-listener clean test coverage lint run run-catalog-markets run-catalog-markets-once run-edge-scan run-edge-scan-once run-edge-eval run-strategy run-strategy-register run-strategy-list run-strategy-active run-strategy-show run-strategy-promote run-strategy-rollback run-strategy-candidate run-ws-listener test-eval test-strategy test-ws edge-board-top edge-board-verify edge-scan-once-top edge-scan-top edge-scan-verify dev audit sec docker-up docker-down db-up db-down app-up app-down
+.PHONY: all build build-catalog build-top-markets build-edge-scan build-edge-eval build-strategy build-ws-listener build-signal-eval clean test coverage lint run run-catalog-markets run-catalog-markets-once run-edge-scan run-edge-scan-once run-edge-eval run-strategy run-strategy-register run-strategy-list run-strategy-active run-strategy-show run-strategy-promote run-strategy-rollback run-strategy-candidate run-ws-listener run-signal-eval test-eval test-strategy test-ws test-signal-eval edge-board-top edge-board-verify edge-scan-once-top edge-scan-top edge-scan-verify dev audit sec docker-up docker-down db-up db-down app-up app-down
 
 all: build
 
@@ -130,6 +130,23 @@ run-ws-listener:
 
 test-ws:
 	go test ./internal/ws/market/ ./internal/signals/ ./internal/db/ -count=1 -run 'Cap|Parse|Diff|TakeDirty|Evaluate|BuildFactors|Clean|PriceChange|Book|Subscribe'
+
+# =============================================================================
+# M8 signal-eval (paper risk manager + fill metrics for external AO; no OMS)
+#   make build-signal-eval
+#   make run-signal-eval ARGS='--synthetic'
+#   make run-signal-eval ARGS='--lookback 168h --risk configs/risk/default.yaml'
+#   make test-signal-eval
+# =============================================================================
+build-signal-eval:
+	@echo "Building signal-eval (M8)..."
+	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/signal-eval ./cmd/signal-eval
+
+run-signal-eval:
+	go run ./cmd/signal-eval $(ARGS)
+
+test-signal-eval:
+	go test ./internal/risk/ ./internal/signaleval/ -count=1
 
 # Explain top N markets from artifacts/edge_board/latest.json (no DB required)
 # Usage: make edge-board-top

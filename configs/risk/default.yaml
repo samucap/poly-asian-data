@@ -1,0 +1,21 @@
+# M8 paper portfolio risk policy — AO-mutable knobs.
+# Hard constraints first; opportunity ranking allocates scarce budget.
+
+starting_equity_usd: 10000
+sizing_mode: frac_kelly          # frac_kelly | vol_target | signal_size
+kelly_fraction: 0.25             # never full Kelly
+kelly_p: 0.55
+kelly_b: 1.0
+vol_target_ann: 0.15
+vol_lookback_periods: 24
+max_position_usd: 500
+max_gross_usd: 5000
+max_positions: 20
+capacity_frac: 0.1
+max_daily_drawdown_bps: 300      # halt new ENTER for UTC day
+max_drawdown_bps: 1000           # flatten + halt
+daily_halt_policy: reject_new
+min_size_usd: 1
+opportunity_edge_weight: 1.0
+opportunity_conviction_weight: 1.0
+batch_window_ms: 0               # >0 ranks simultaneous signals by opportunity

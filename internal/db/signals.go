@@ -257,3 +257,101 @@ func nullInt(n int) any {
 	}
 	return n
 }
+
+// SignalFilter selects paper signals for M8 eval.
+type SignalFilter struct {
+	Strategy          string
+	Mode              string // default paper
+	From              time.Time
+	To                time.Time
+	StrategyVersionID *int64
+	Limit             int
+}
+
+// LoadSignals loads signal rows matching filter ordered by time ASC.
+func LoadSignals(ctx context.Context, conn DBInterface, f SignalFilter) ([]SignalRow, error) {
+	if conn == nil {
+		return nil, ErrNilDB
+	}
+	strategy := f.Strategy
+	if strategy == "" {
+		strategy = "default"
+	}
+	mode := f.Mode
+	if mode == "" {
+		mode = "paper"
+	}
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 50_000
+	}
+	from := f.From
+	to := f.To
+	if to.IsZero() {
+		to = time.Now().UTC()
+	}
+	if from.IsZero() {
+		from = to.Add(-30 * 24 * time.Hour)
+	}
+
+	q := `
+		SELECT time, signal_id::text, COALESCE(event,'open'), COALESCE(supersedes_id::text,''),
+			strategy, strategy_version_id, COALESCE(board_run_id,''), COALESCE(board_rank,0), COALESCE(mode,'paper'),
+			condition_id, COALESCE(market_id,''), token_id, COALESCE(outcome,'YES'),
+			COALESCE(neg_risk,false), COALESCE(neg_risk_group_id,''),
+			side, COALESCE(action,'ENTER'), COALESCE(time_in_force,''),
+			COALESCE(edge_bps,0), COALESCE(opportunity_bps,0), model_edge_bps, COALESCE(cost_bps,0),
+			COALESCE(fair_value,0), COALESCE(fv_source,''), COALESCE(score_path,''),
+			COALESCE(conviction,0), COALESCE(horizon_sec,0), COALESCE(half_life_sec,0), COALESCE(urgency,0),
+			COALESCE(size_usd,0), COALESCE(size_shares,0), COALESCE(capacity_usd,0), kelly_frac,
+			COALESCE(mid,0), COALESCE(best_bid,0), COALESCE(best_ask,0), COALESCE(spread_bps,0),
+			COALESCE(imbalance,0), COALESCE(bid_depth,0), COALESCE(ask_depth,0), COALESCE(last_trade_price,0)
+		FROM signals
+		WHERE strategy = $1 AND mode = $2 AND time >= $3 AND time <= $4`
+	args := []any{strategy, mode, from.UTC(), to.UTC()}
+	if f.StrategyVersionID != nil {
+		q += ` AND strategy_version_id = $5`
+		args = append(args, *f.StrategyVersionID)
+		q += fmt.Sprintf(` ORDER BY time ASC LIMIT $%d`, len(args)+1)
+		args = append(args, limit)
+	} else {
+		q += ` ORDER BY time ASC LIMIT $5`
+		args = append(args, limit)
+	}
+
+	rows, err := conn.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: load signals: %w", err)
+	}
+	defer rows.Close()
+
+	var out []SignalRow
+	for rows.Next() {
+		var r SignalRow
+		var modelEdge, kelly *float64
+		var fv float64
+		if err := rows.Scan(
+			&r.Time, &r.SignalID, &r.Event, &r.SupersedesID,
+			&r.Strategy, &r.StrategyVersionID, &r.BoardRunID, &r.BoardRank, &r.Mode,
+			&r.ConditionID, &r.MarketID, &r.TokenID, &r.Outcome,
+			&r.NegRisk, &r.NegRiskGroupID,
+			&r.Side, &r.Action, &r.TimeInForce,
+			&r.EdgeBps, &r.OpportunityBps, &modelEdge, &r.CostBps,
+			&fv, &r.FVSource, &r.ScorePath,
+			&r.Conviction, &r.HorizonSec, &r.HalfLifeSec, &r.Urgency,
+			&r.SizeUSD, &r.SizeShares, &r.CapacityUSD, &kelly,
+			&r.Mid, &r.BestBid, &r.BestAsk, &r.SpreadBps,
+			&r.Imbalance, &r.BidDepth, &r.AskDepth, &r.LastTradePrice,
+		); err != nil {
+			return nil, err
+		}
+		r.ModelEdgeBps = modelEdge
+		r.KellyFrac = kelly
+		if fv != 0 {
+			r.FairValue = &fv
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
