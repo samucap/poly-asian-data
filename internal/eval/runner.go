@@ -27,6 +27,11 @@ type RunnerOpts struct {
 	UseBooks         *bool
 	WeightsPath      string // for lineage hash
 	WeightsYAML      []byte // optional raw bytes for hash if path empty
+	// StrategyVersionID stamps eval_surface.strategy_version_id (M5).
+	StrategyVersionID *int64
+	// WeightsHash if non-empty is used as lineage hash (e.g. from strategy_versions).
+	// Else hash WeightsPath or WeightsYAML.
+	WeightsHash string
 }
 
 // RunResult is the outcome of one edge-eval pass.
@@ -275,7 +280,10 @@ func RunDBOnly(ctx context.Context, opts RunnerOpts) (*RunResult, error) {
 	s.LabelProtocol.NoFutureInFeatures = true
 	s.LabelProtocol.PointInTime = true
 	s.WeightsPath = opts.WeightsPath
-	if opts.WeightsPath != "" {
+	s.StrategyVersionID = opts.StrategyVersionID
+	if opts.WeightsHash != "" {
+		s.WeightsHash = opts.WeightsHash
+	} else if opts.WeightsPath != "" {
 		if h, err := WeightsHashFile(opts.WeightsPath); err == nil {
 			s.WeightsHash = h
 		}

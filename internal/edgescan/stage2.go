@@ -112,8 +112,10 @@ type OIIndex map[string]float64
 type EdgeBuildOptions struct {
 	BuildOptions
 	Weights             edge.Weights
-	Books               BookIndex
-	OI                  OIIndex
+	// StrategyVersionID stamps edge_board.strategy_version_id (M5 lineage).
+	StrategyVersionID *int64
+	Books             BookIndex
+	OI                OIIndex
 	PublishRequireBooks bool
 	// FV chain; zero value → DefaultFVChain from weights.
 	FV edge.FVChain
@@ -282,33 +284,34 @@ func materializeRows(ordered []scoredCand, groupMembers map[string][]string, opt
 		}
 		t := opts.Now
 		row := db.EdgeBoardRow{
-			Strategy:       opts.Strategy,
-			ConditionID:    m.ConditionID,
-			MarketID:       m.ID,
-			QuestionShort:  shortQuestion(m.Question, 120),
-			Category:       s.c.Category,
-			ClobTokenIDs:   tokens,
-			Rank:           i + 1,
-			Score:          s.act,
-			EdgeBps:        &eb,
-			CostBps:        &cost,
-			CapacityUSD:    &cap,
-			Urgency:        &urg,
-			KeyFeatures:    kf,
-			RiskFlags:      flags,
-			StrategyTags:   tags,
-			FeaturesAsOf:   &t,
-			FairValue:      s.res.FairValue,
-			ModelEdgeBps:   s.res.ModelEdgeBps,
-			FVSource:       s.res.FVSource,
-			NegRisk:        s.c.NegRisk,
-			NegRiskGroupID: s.c.NegRiskGroupID,
-			RelatedLegs:    legs,
-			Volume24hr:     vol24,
-			Liquidity:      liq,
-			Spread:         m.Spread,
-			SelectedAt:     opts.Now,
-			RunID:          opts.RunID,
+			Strategy:          opts.Strategy,
+			ConditionID:       m.ConditionID,
+			MarketID:          m.ID,
+			QuestionShort:     shortQuestion(m.Question, 120),
+			Category:          s.c.Category,
+			ClobTokenIDs:      tokens,
+			Rank:              i + 1,
+			Score:             s.act,
+			EdgeBps:           &eb,
+			StrategyVersionID: opts.StrategyVersionID,
+			CostBps:           &cost,
+			CapacityUSD:       &cap,
+			Urgency:           &urg,
+			KeyFeatures:       kf,
+			RiskFlags:         flags,
+			StrategyTags:      tags,
+			FeaturesAsOf:      &t,
+			FairValue:         s.res.FairValue,
+			ModelEdgeBps:      s.res.ModelEdgeBps,
+			FVSource:          s.res.FVSource,
+			NegRisk:           s.c.NegRisk,
+			NegRiskGroupID:    s.c.NegRiskGroupID,
+			RelatedLegs:       legs,
+			Volume24hr:        vol24,
+			Liquidity:         liq,
+			Spread:            m.Spread,
+			SelectedAt:        opts.Now,
+			RunID:             opts.RunID,
 		}
 		if s.res.Cost.HasBook && s.res.Cost.Mid > 0 {
 			row.Spread = (s.res.Cost.HalfSpreadBps * 2 / 10_000) * s.res.Cost.Mid

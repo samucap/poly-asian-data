@@ -25,8 +25,10 @@ type CycleDeps struct {
 	Logger        *slog.Logger
 	Strategy      string
 	Weights       edge.Weights
-	ArtifactsRoot string
-	EdgeScan      config.EdgeScanConfig
+	// StrategyVersionID from strategy_active (M5); nil when file/dev override.
+	StrategyVersionID *int64
+	ArtifactsRoot     string
+	EdgeScan          config.EdgeScanConfig
 
 	EnrichBooks         bool
 	EnrichOI            bool
@@ -303,6 +305,7 @@ func RunCycle(ctx context.Context, deps CycleDeps) CycleResult {
 			Now:                now,
 		},
 		Weights:             deps.Weights,
+		StrategyVersionID:   deps.StrategyVersionID,
 		Books:               bookIdx,
 		OI:                  oiIdx,
 		PublishRequireBooks: !deps.PublishOnEnrichFail,

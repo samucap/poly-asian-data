@@ -6,7 +6,7 @@ DOCKER_COMPOSE_POSTGRES=docker-compose.postgres.yml
 DOCKER_COMPOSE_APP=docker-compose.app.yml
 MAIN_PATH=cmd/main.go
 
-.PHONY: all build build-catalog build-top-markets build-edge-scan build-edge-eval clean test coverage lint run run-catalog-markets run-catalog-markets-once run-edge-scan run-edge-scan-once run-edge-eval edge-board-top edge-board-verify edge-scan-once-top edge-scan-top edge-scan-verify test-eval dev audit sec docker-up docker-down db-up db-down app-up app-down
+.PHONY: all build build-catalog build-top-markets build-edge-scan build-edge-eval build-strategy clean test coverage lint run run-catalog-markets run-catalog-markets-once run-edge-scan run-edge-scan-once run-edge-eval run-strategy run-strategy-register run-strategy-list run-strategy-active run-strategy-show run-strategy-promote run-strategy-rollback run-strategy-candidate test-eval test-strategy edge-board-top edge-board-verify edge-scan-once-top edge-scan-top edge-scan-verify dev audit sec docker-up docker-down db-up db-down app-up app-down
 
 all: build
 
@@ -36,6 +36,10 @@ build-edge-eval:
 	@echo "Building edge-eval..."
 	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/edge-eval ./cmd/edge-eval
 
+build-strategy:
+	@echo "Building strategy (M5)..."
+	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/strategy ./cmd/strategy
+
 # Catalog run (default continuous)
 run-catalog-markets:
 	go run ./cmd/catalog-markets $(ARGS)
@@ -58,8 +62,57 @@ run-edge-scan-once:
 #   make run-edge-eval
 #   make run-edge-eval ARGS='--lookback 168h --persist-labels'
 #   make run-edge-eval ARGS='--backfill-prices --lookback 720h'
+#   make run-edge-eval ARGS='--version-id 1'
 run-edge-eval:
 	go run ./cmd/edge-eval $(ARGS)
+
+# =============================================================================
+# M5 strategy versions (register / promote / rollback)
+# Make steals bare flags — put them in ARGS / named vars:
+#   make run-strategy CMD=list
+#   make run-strategy-register
+#   make run-strategy-register WEIGHTS=configs/strategies/default.yaml ARGS='--note baseline'
+#   make run-strategy-promote ID=1 SURFACE=artifacts/eval_surface/latest.json
+#   make run-strategy-active
+#   make run-strategy-rollback STRATEGY=default
+#   make test-strategy
+# =============================================================================
+CMD ?=
+WEIGHTS ?= configs/strategies/default.yaml
+ID ?=
+SURFACE ?= artifacts/eval_surface/latest.json
+STRATEGY ?= default
+
+run-strategy:
+	@if [ -z "$(CMD)" ]; then echo "usage: make run-strategy CMD=<register|list|active|show|promote|rollback|candidate> ARGS='...'"; exit 1; fi
+	go run ./cmd/strategy $(CMD) $(ARGS)
+
+run-strategy-register:
+	go run ./cmd/strategy register --weights $(WEIGHTS) $(ARGS)
+
+run-strategy-list:
+	go run ./cmd/strategy list --strategy $(STRATEGY) $(ARGS)
+
+run-strategy-active:
+	go run ./cmd/strategy active --strategy $(STRATEGY) $(ARGS)
+
+run-strategy-show:
+	@if [ -z "$(ID)" ]; then echo "usage: make run-strategy-show ID=<version_id>"; exit 1; fi
+	go run ./cmd/strategy show --id $(ID) $(ARGS)
+
+run-strategy-promote:
+	@if [ -z "$(ID)" ]; then echo "usage: make run-strategy-promote ID=<version_id> SURFACE=$(SURFACE)"; exit 1; fi
+	go run ./cmd/strategy promote --id $(ID) --surface $(SURFACE) $(ARGS)
+
+run-strategy-rollback:
+	go run ./cmd/strategy rollback --strategy $(STRATEGY) $(ARGS)
+
+run-strategy-candidate:
+	@if [ -z "$(ID)" ]; then echo "usage: make run-strategy-candidate ID=<version_id>"; exit 1; fi
+	go run ./cmd/strategy candidate --id $(ID) $(ARGS)
+
+test-strategy:
+	go test ./internal/strategyreg/ ./internal/db/ -count=1 -run 'Strategy|Promote|Resolve|CheckPromote|Params|Gate'
 
 # Explain top N markets from artifacts/edge_board/latest.json (no DB required)
 # Usage: make edge-board-top

@@ -31,6 +31,7 @@ import (
 	"github.com/samucap/poly-asian-data/internal/fetcher"
 	"github.com/samucap/poly-asian-data/internal/logging"
 	"github.com/samucap/poly-asian-data/internal/pipeline"
+	"github.com/samucap/poly-asian-data/internal/strategyreg"
 )
 
 func main() {
@@ -47,6 +48,7 @@ func main() {
 	priceTokenCap := flag.Int("price-tokens", 300, "token cap for --backfill-prices")
 	seed := flag.Int64("seed", 42, "RNG seed for random_board baseline")
 	weightsFlag := flag.String("weights", "", "strategy weights YAML (default configs/strategies/default.yaml)")
+	versionIDFlag := flag.Int64("version-id", 0, "load board-policy weights from strategy_versions.id (M5)")
 	noBooks := flag.Bool("no-books", false, "prices-only costs (skip orderbook_snapshots load)")
 	flag.Parse()
 
@@ -85,6 +87,9 @@ func main() {
 	if err := db.EnsureLabelRowsTable(ctx, dbPool); err != nil {
 		logger.Warn("ensure label_rows", "error", err)
 	}
+	if err := db.EnsureStrategyTables(ctx, dbPool); err != nil {
+		logger.Warn("ensure strategy tables", "error", err)
+	}
 
 	if *backfillPrices {
 		logger.Info("backfill-prices starting", "cap", *priceTokenCap)
@@ -122,12 +127,35 @@ func main() {
 	if weightsPath == "" {
 		weightsPath = filepath.Join("configs", "strategies", "default.yaml")
 	}
-	weights, err := edge.LoadWeightsFile(weightsPath)
-	if err != nil {
-		logger.Warn("weights not loaded; using defaults", "path", weightsPath, "error", err)
-		weights = edge.DefaultWeights()
+	var weights edge.Weights
+	var strategyVersionID *int64
+	var weightsHash string
+	if *versionIDFlag > 0 {
+		w, v, err := strategyreg.LoadVersion(ctx, dbPool, *versionIDFlag)
+		if err != nil {
+			logger.Error("load strategy version", "id", *versionIDFlag, "error", err)
+			os.Exit(1)
+		}
+		weights = w
+		id := v.ID
+		strategyVersionID = &id
+		weightsHash = v.WeightsHash
+		weightsPath = v.SourcePath
+		logger.Info("loaded strategy version",
+			"id", v.ID,
+			"strategy", v.Strategy,
+			"weights_hash", v.WeightsHash,
+			"name", weights.Name,
+		)
 	} else {
-		logger.Info("loaded strategy weights", "path", weightsPath, "name", weights.Name)
+		var err error
+		weights, err = edge.LoadWeightsFile(weightsPath)
+		if err != nil {
+			logger.Warn("weights not loaded; using defaults", "path", weightsPath, "error", err)
+			weights = edge.DefaultWeights()
+		} else {
+			logger.Info("loaded strategy weights", "path", weightsPath, "name", weights.Name)
+		}
 	}
 
 	bc := eval.DefaultBacktestConfig()
@@ -148,19 +176,22 @@ func main() {
 		"primary_horizon", evalCfg.PrimaryHorizon,
 		"policy", eval.PolicyIDSelectBoardV1,
 		"weights", weights.Name,
+		"strategy_version_id", strategyVersionID,
 		"use_books", useBooks,
 	)
 
 	res, err := eval.RunDBOnly(ctx, eval.RunnerOpts{
-		DB:            dbPool,
-		Logger:        logger,
-		Cfg:           evalCfg,
-		Backtest:      bc,
-		ArtifactsRoot: *artifactsRoot,
-		Strategy:      *strategy,
-		PersistLabels: *persistLabels,
-		UseBooks:      &useBooks,
-		WeightsPath:   weightsPath,
+		DB:                dbPool,
+		Logger:            logger,
+		Cfg:               evalCfg,
+		Backtest:          bc,
+		ArtifactsRoot:     *artifactsRoot,
+		Strategy:          *strategy,
+		PersistLabels:     *persistLabels,
+		UseBooks:          &useBooks,
+		WeightsPath:       weightsPath,
+		StrategyVersionID: strategyVersionID,
+		WeightsHash:       weightsHash,
 	})
 	if err != nil {
 		logger.Error("edge-eval failed", "error", err)
@@ -179,6 +210,7 @@ func main() {
 		"fv_coverage", s.FVCoverage,
 		"book_coverage", s.BookCoverage,
 		"weights_hash", s.WeightsHash,
+		"strategy_version_id", s.StrategyVersionID,
 		"gates_failed", s.GatesFailed,
 		"snaps", res.NSnaps,
 		"tokens", res.NTokens,
