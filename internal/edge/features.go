@@ -35,6 +35,9 @@ type FeatureVector struct {
 
 	// Activity
 	Volume24hr float64 `json:"volume_24hr"`
+	// VolumeProxy is an optional PIT activity surrogate (e.g. series path density).
+	// activityFamily uses Volume24hr when >0, else VolumeProxy (scaled similarly).
+	VolumeProxy float64 `json:"volume_proxy,omitempty"`
 
 	// Trade flow (optional)
 	BuyRatio5m float64 `json:"buy_ratio_5m"`

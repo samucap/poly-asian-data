@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://poly-asian.local/schemas/eval_surface_v1.json",
+  "title": "eval_surface_v1",
+  "description": "Bias-aware promote/hold/kill eval surface. ok=true only if required gates pass (not vanity win-rate).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "generated_at",
+    "status",
+    "ok",
+    "gates_passed",
+    "gates_failed",
+    "selection_set",
+    "horizons",
+    "label_protocol",
+    "fill_model",
+    "metrics"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string" },
+    "status": { "type": "string", "enum": ["success", "partial", "failed"] },
+    "ok": {
+      "type": "boolean",
+      "description": "True only if all promote-eligible gates pass"
+    },
+    "gates_passed": { "type": "array", "items": { "type": "string" } },
+    "gates_failed": { "type": "array", "items": { "type": "string" } },
+    "gate_details": { "type": "object", "additionalProperties": { "type": "string" } },
+    "selection_set": {
+      "type": "string",
+      "enum": ["board_at_t", "stage1_at_t", "pool_at_t"],
+      "description": "Population metrics were computed on (selection bias explicit)"
+    },
+    "horizons": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" }
+    },
+    "label_protocol": {
+      "type": "object",
+      "required": ["point_in_time", "as_of_field", "no_future_in_features"],
+      "properties": {
+        "point_in_time": { "type": "boolean", "const": true },
+        "as_of_field": { "type": "string", "minLength": 1 },
+        "no_future_in_features": { "type": "boolean", "const": true },
+        "horizons": { "type": "array", "items": { "type": "string" } },
+        "resolved_handling": { "type": "string" }
+      }
+    },
+    "fill_model": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "entry": { "type": "string" },
+        "fee_bps": { "type": "number" },
+        "slip_bps": { "type": "number" },
+        "include_half_spread": { "type": "boolean" },
+        "notes": { "type": "string" }
+      }
+    },
+    "feature_names": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Must not include edge_bps, rank, ComputedScore, stage1 score, etc."
+    },
+    "metrics": {
+      "type": "object",
+      "required": ["n", "overall", "primary_horizon"],
+      "properties": {
+        "n": { "type": "integer", "minimum": 0 },
+        "primary_horizon": { "type": "string" },
+        "overall": {
+          "type": "object",
+          "required": ["n", "hit_rate", "after_cost_return_bps"],
+          "properties": {
+            "n": { "type": "integer" },
+            "hit_rate": { "type": "number" },
+            "win_rate": { "type": "number" },
+            "after_cost_return_bps": { "type": "number" },
+            "after_cost_return_med_bps": { "type": "number" },
+            "max_drawdown_bps": { "type": "number" }
+          }
+        },
+        "by_stratum": {
+          "type": "object",
+          "additionalProperties": { "type": "object" }
+        },
+        "baselines": {
+          "type": "object",
+          "description": "Must include volume_top_n, activity_stage1, random_board for promote",
+          "additionalProperties": { "type": "object" }
+        },
+        "delta_vs_baselines": {
+          "type": "object",
+          "additionalProperties": { "type": "number" }
+        }
+      }
+    },
+    "strategy_version_id": { "type": ["integer", "null"] },
+    "strategy_name": { "type": "string" },
+    "errors": { "type": "array" }
+  },
+  "additionalProperties": true
+}

@@ -110,6 +110,13 @@ func main() {
 		OIMaxConditions:     80,
 		OIConcurrency:       16,
 		BookBatchSize:       50,
+		// M4: post-board prices_history (board ∪ top volume); never blocks board publish.
+		EnrichPrices:     envBool("EDGE_ENRICH_PRICES", true),
+		PriceTokenCap:    300,
+		PriceFidelityMin: 60,
+		PriceLookback:    cfg.TopMarkets.PriceLookback,
+		PriceWarmMaxAge:  30 * time.Minute,
+		ForceColdPrices:  envBool("EDGE_PRICES_FORCE_COLD", false),
 	}
 
 	runOnce := func() bool {

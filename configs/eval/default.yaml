@@ -1,0 +1,56 @@
+# M4 evaluation protocol — bias-aware, not vanity win-rate.
+# edge-eval and eval_surface must satisfy these gates before promote (M5).
+
+schema_version: "1.0"
+primary_horizon: "1h"
+horizons:
+  - "5m"
+  - "1h"
+  - "1d"
+
+# Population metrics are computed on (document in eval_surface.selection_set)
+default_selection_set: board_at_t
+# Optional secondary reports: stage1_at_t
+
+label_protocol:
+  point_in_time: true
+  as_of_field: features_asof   # or selected_at when features missing
+  no_future_in_features: true
+  resolved_handling: drop_if_resolved_before_horizon
+
+fill_model:
+  name: mid_fee_slip
+  entry: mid
+  fee_bps: 10
+  slip_bps: 5
+  include_half_spread: true
+  notes: "Simple honest fill; VWAP/partials later"
+
+# Promote-eligible gates (see internal/eval)
+gates:
+  min_sample: 50
+  require_beats_volume_baseline: true
+  require_beats_activity_baseline: true
+  min_delta_vs_baseline_bps: 0
+
+required_baselines:
+  - volume_top_n
+  - activity_stage1
+  - random_board
+
+required_strata:
+  - overall
+  - by_category
+  - by_neg_risk
+  - by_fv_source
+  - by_ttr_bucket
+
+# Never use these as strategy/model input features (selection circularity)
+forbidden_features:
+  - edge_bps
+  - model_edge_bps
+  - opportunity_bps
+  - computed_score
+  - stage1_score
+  - score
+  - rank

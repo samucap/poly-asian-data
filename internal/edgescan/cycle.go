@@ -37,6 +37,20 @@ type CycleDeps struct {
 	OIConcurrency int
 	// BookBatchSize for CLOB /books (default 50).
 	BookBatchSize int
+
+	// M4 warm stage: batch prices_history for board ∪ top-volume tokens.
+	// Default true when unset via cmd; set false to disable.
+	EnrichPrices bool
+	// PriceTokenCap hard cap on tokens for EnsurePrices (default 300).
+	PriceTokenCap int
+	// PriceFidelityMin CLOB fidelity minutes (default 60).
+	PriceFidelityMin int
+	// PriceLookback cold lookback (default 30d).
+	PriceLookback time.Duration
+	// PriceWarmMaxAge skip incremental fetch if last point fresher (default 30m).
+	PriceWarmMaxAge time.Duration
+	// ForceColdPrices force full lookback even when series exist.
+	ForceColdPrices bool
 }
 
 // CycleResult is the outcome of one edge-scan cycle.
@@ -52,6 +66,10 @@ type CycleResult struct {
 	CycleMS        int64
 	RunID          string
 	Errors         []artifacts.ErrorItem
+	// M4 warm prices stage (best-effort; does not fail board).
+	PricesMS     int64
+	PricesPoints int
+	PricesTokens int
 }
 
 // RunCycle executes: keyset → Stage-1 budget → parallel enrich → edge rank → persist board.
@@ -388,6 +406,35 @@ func RunCycle(ctx context.Context, deps CycleDeps) CycleResult {
 		)
 	}
 
+	// 6. WARM: prices_history for board ∪ top-volume (M4 labels path).
+	// Best-effort: never flips board status to failed.
+	if deps.EnrichPrices && deps.DB != nil {
+		stage = time.Now()
+		priceRes := ensureBoardPrices(ctx, deps, build.Rows)
+		res.PricesMS = time.Since(stage).Milliseconds()
+		res.PricesPoints = priceRes.PointsWritten
+		res.PricesTokens = priceRes.TokensWritten
+		if len(priceRes.Errors) > 0 {
+			for _, e := range priceRes.Errors {
+				res.Errors = append(res.Errors, artifacts.ErrorItem{
+					Code: "ensure_prices_partial", Message: e, Component: "enrich",
+				})
+			}
+			if res.Status == artifacts.StatusSuccess {
+				res.Status = artifacts.StatusPartial
+			}
+		}
+		log.Info("stage complete",
+			"stage", "ensure_prices",
+			"duration", logging.FormatDuration(time.Since(stage)),
+			"points", priceRes.PointsWritten,
+			"tokens_written", priceRes.TokensWritten,
+			"cold", priceRes.ColdTokens,
+			"warm", priceRes.WarmTokens,
+			"skipped_fresh", priceRes.SkippedFresh,
+		)
+	}
+
 	res.CycleMS = time.Since(start).Milliseconds()
 	res.OK = res.Status != artifacts.StatusFailed
 	log.Info("cycle complete",
@@ -398,9 +445,73 @@ func RunCycle(ctx context.Context, deps CycleDeps) CycleResult {
 		"stage1", logging.FormatCount(int64(build.Stage1Count)),
 		"board", logging.FormatCount(int64(len(build.Rows))),
 		"enrich_coverage", res.EnrichCoverage,
+		"prices_points", res.PricesPoints,
 		"strategy", strategy,
 	)
 	return res
+}
+
+// ensureBoardPrices builds the token set (board ∪ top volume) and calls enrich.EnsurePrices.
+func ensureBoardPrices(ctx context.Context, deps CycleDeps, board []db.EdgeBoardRow) enrich.EnsurePricesResult {
+	log := deps.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+	capN := deps.PriceTokenCap
+	if capN <= 0 {
+		capN = enrich.DefaultPriceTokenCap
+	}
+	// Board tokens from published rows
+	boardMeta := make([]db.EvalMarketMeta, 0, len(board))
+	for _, r := range board {
+		tok := ""
+		if len(r.ClobTokenIDs) > 0 {
+			tok = r.ClobTokenIDs[0]
+		}
+		if tok == "" {
+			continue
+		}
+		boardMeta = append(boardMeta, db.EvalMarketMeta{
+			ConditionID: r.ConditionID,
+			MarketID:    r.MarketID,
+			TokenID:     tok,
+			Category:    r.Category,
+			NegRisk:     r.NegRisk,
+			Volume24hr:  r.Volume24hr,
+			Spread:      r.Spread,
+		})
+	}
+	// Top volume fill-up
+	var top []db.EvalMarketMeta
+	if deps.DB != nil {
+		var err error
+		top, err = db.LoadTopVolumeMarkets(ctx, deps.DB, capN)
+		if err != nil {
+			log.Warn("load top volume for prices failed", "error", err)
+		}
+	}
+	tokens := enrich.SelectPriceTokens(boardMeta, top, capN)
+	tm := map[string]string{}
+	for _, t := range tokens {
+		if t.MarketID != "" {
+			tm[t.TokenID] = t.MarketID
+		}
+	}
+	lookback := deps.PriceLookback
+	if lookback <= 0 && deps.Cfg != nil && deps.Cfg.TopMarkets.PriceLookback > 0 {
+		lookback = deps.Cfg.TopMarkets.PriceLookback
+	}
+	if lookback <= 0 {
+		lookback = enrich.DefaultPriceLookback
+	}
+	return enrich.EnsurePrices(ctx, deps.DB, deps.HTTP, tokens, enrich.EnsurePricesConfig{
+		Lookback:    lookback,
+		FidelityMin: deps.PriceFidelityMin,
+		WarmMaxAge:  deps.PriceWarmMaxAge,
+		ForceCold:   deps.ForceColdPrices,
+		Logger:      log,
+		TokenMarket: tm,
+	})
 }
 
 func writeFailArtifact(

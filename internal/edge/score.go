@@ -234,10 +234,22 @@ func flowFamily(f FeatureVector) float64 {
 }
 
 func activityFamily(f FeatureVector) float64 {
-	if f.Volume24hr <= 0 {
+	v := f.Volume24hr
+	if v <= 0 {
+		v = f.VolumeProxy
+	}
+	if v <= 0 {
 		return 0
 	}
-	return math.Min(100, math.Log1p(f.Volume24hr)/math.Log1p(1e6)*100)
+	return math.Min(100, math.Log1p(v)/math.Log1p(1e6)*100)
+}
+
+// SeriesActivityProxy maps PIT series density + path movement into a volume-like
+// scale for activityFamily (so offline weights remain meaningful).
+// pointCount ≈ samples in window; pathAct = sum|Δmid| in window.
+func SeriesActivityProxy(pointCount int, pathAct float64) float64 {
+	// ~1k notional units per sample + path moves scaled to 1e5 (0.01 move → 1k).
+	return float64(pointCount)*1000 + pathAct*100_000
 }
 
 func urgency(f FeatureVector) float64 {

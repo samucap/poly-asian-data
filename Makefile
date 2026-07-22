@@ -6,7 +6,7 @@ DOCKER_COMPOSE_POSTGRES=docker-compose.postgres.yml
 DOCKER_COMPOSE_APP=docker-compose.app.yml
 MAIN_PATH=cmd/main.go
 
-.PHONY: all build build-catalog build-top-markets build-edge-scan clean test coverage lint run run-catalog-markets run-catalog-markets-once run-edge-scan run-edge-scan-once edge-board-top edge-board-verify edge-scan-once-top edge-scan-top edge-scan-verify dev audit sec docker-up docker-down db-up db-down app-up app-down
+.PHONY: all build build-catalog build-top-markets build-edge-scan build-edge-eval clean test coverage lint run run-catalog-markets run-catalog-markets-once run-edge-scan run-edge-scan-once run-edge-eval edge-board-top edge-board-verify edge-scan-once-top edge-scan-top edge-scan-verify test-eval dev audit sec docker-up docker-down db-up db-down app-up app-down
 
 all: build
 
@@ -32,6 +32,10 @@ build-edge-scan:
 	@echo "Building edge-scan..."
 	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/edge-scan ./cmd/edge-scan
 
+build-edge-eval:
+	@echo "Building edge-eval..."
+	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/edge-eval ./cmd/edge-eval
+
 # Catalog run (default continuous)
 run-catalog-markets:
 	go run ./cmd/catalog-markets $(ARGS)
@@ -49,6 +53,13 @@ run-edge-scan:
 
 run-edge-scan-once:
 	go run ./cmd/edge-scan --once $(ARGS)
+
+# M4 edge-eval (DB-only by default; optional --backfill-prices)
+#   make run-edge-eval
+#   make run-edge-eval ARGS='--lookback 168h --persist-labels'
+#   make run-edge-eval ARGS='--backfill-prices --lookback 720h'
+run-edge-eval:
+	go run ./cmd/edge-eval $(ARGS)
 
 # Explain top N markets from artifacts/edge_board/latest.json (no DB required)
 # Usage: make edge-board-top
@@ -87,6 +98,10 @@ edge-scan-verify:
 	@python3 scripts/edge_board_verify.py --path "$(BOARD)" $(VERIFY_ARGS)
 	@echo "== top board =="
 	@python3 scripts/edge_board_top.py --path "$(BOARD)" -n $(N)
+
+# M4.0 + M4 eval package unit tests (vanity win-rate must fail gates)
+test-eval:
+	go test ./internal/eval/ ./internal/enrich/ ./internal/db/ -count=1 -run 'Eval|Fill|Backtest|Price|Label|SelectPrice|Normalize'
 
 # Clean build artifacts
 clean:
