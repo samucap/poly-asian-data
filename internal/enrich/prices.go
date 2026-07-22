@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/samucap/poly-asian-data/internal/config"
 	"github.com/samucap/poly-asian-data/internal/db"
+	"golang.org/x/sync/errgroup"
 )
 
 // Default price backfill parameters (M4).
@@ -24,6 +26,8 @@ const (
 	DefaultPriceLookback    = 30 * 24 * time.Hour
 	DefaultPriceWarmMaxAge  = 30 * time.Minute // skip incremental if last point fresher
 	DefaultPriceOverlap     = time.Hour         // re-fetch overlap before HWM
+	// DefaultPriceConcurrency is parallel batch POSTs (L8). Bound fan-out to CLOB.
+	DefaultPriceConcurrency = 4
 
 	// MaxStartEndSpan is the longest start_ts↔end_ts window CLOB accepts when both
 	// bounds are set (~15d; 16d returns 400 "interval is too long"). Prefer start_ts
@@ -89,6 +93,7 @@ type BatchPricesParams struct {
 }
 
 // FetchBatchPricesHistory POSTs to CLOB /batch-prices-history (max 20 markets/req).
+// Batches run with bounded concurrency (DefaultPriceConcurrency) for WARM path throughput.
 func FetchBatchPricesHistory(
 	ctx context.Context,
 	client *http.Client,
@@ -96,16 +101,30 @@ func FetchBatchPricesHistory(
 	params BatchPricesParams,
 	batchSize int,
 ) (map[string][]PriceHistPoint, error) {
+	return FetchBatchPricesHistoryN(ctx, client, tokenIDs, params, batchSize, DefaultPriceConcurrency)
+}
+
+// FetchBatchPricesHistoryN is FetchBatchPricesHistory with explicit concurrency.
+func FetchBatchPricesHistoryN(
+	ctx context.Context,
+	client *http.Client,
+	tokenIDs []string,
+	params BatchPricesParams,
+	batchSize int,
+	concurrency int,
+) (map[string][]PriceHistPoint, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
 	if batchSize <= 0 || batchSize > DefaultPriceBatchSize {
 		batchSize = DefaultPriceBatchSize
 	}
+	if concurrency <= 0 {
+		concurrency = DefaultPriceConcurrency
+	}
 	if params.Fidelity <= 0 {
 		params.Fidelity = DefaultPriceFidelityMin
 	}
-	// Guard: both bounds set and span too long → clamp end or drop end_ts.
 	params = normalizeBatchParams(params)
 
 	clob, _ := config.DefaultEndpoints["clob"].(string)
@@ -113,76 +132,87 @@ func FetchBatchPricesHistory(
 		clob = "https://clob.polymarket.com"
 	}
 	url := strings.TrimRight(clob, "/") + "/batch-prices-history"
-	out := map[string][]PriceHistPoint{}
 
+	type chunk []string
+	var chunks []chunk
 	for i := 0; i < len(tokenIDs); i += batchSize {
 		end := i + batchSize
 		if end > len(tokenIDs) {
 			end = len(tokenIDs)
 		}
-		chunk := tokenIDs[i:end]
 		var markets []string
-		for _, t := range chunk {
+		for _, t := range tokenIDs[i:end] {
 			if t != "" {
 				markets = append(markets, t)
 			}
 		}
-		if len(markets) == 0 {
-			continue
+		if len(markets) > 0 {
+			chunks = append(chunks, markets)
 		}
-		bodyMap := map[string]any{
-			"markets":  markets,
-			"fidelity": params.Fidelity,
-		}
-		if params.StartTS > 0 {
-			bodyMap["start_ts"] = params.StartTS
-		}
-		if params.EndTS > 0 {
-			bodyMap["end_ts"] = params.EndTS
-		}
-		if params.Interval != "" {
-			bodyMap["interval"] = params.Interval
-		}
-		// CLOB requires a time component: interval and/or start_ts.
-		if params.StartTS <= 0 && params.Interval == "" {
-			bodyMap["interval"] = "max"
-		}
-		payload, err := json.Marshal(bodyMap)
-		if err != nil {
-			return out, err
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-		if err != nil {
-			return out, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
-		if err != nil {
-			return out, fmt.Errorf("enrich prices batch: %w", err)
-		}
-		data, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return out, err
-		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return out, fmt.Errorf("enrich prices batch: status %d: %s", resp.StatusCode, truncate(string(data), 200))
-		}
-		part, err := parseBatchPrices(data)
-		if err != nil {
-			return out, err
-		}
-		for tok, pts := range part {
-			out[tok] = append(out[tok], pts...)
-		}
-		// small pause between chunks to be nice to the API
-		if end < len(tokenIDs) {
-			select {
-			case <-ctx.Done():
-				return out, ctx.Err()
-			case <-time.After(100 * time.Millisecond):
+	}
+	if len(chunks) == 0 {
+		return map[string][]PriceHistPoint{}, nil
+	}
+
+	out := map[string][]PriceHistPoint{}
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(concurrency)
+
+	for _, markets := range chunks {
+		markets := markets
+		g.Go(func() error {
+			bodyMap := map[string]any{
+				"markets":  markets,
+				"fidelity": params.Fidelity,
 			}
-		}
+			if params.StartTS > 0 {
+				bodyMap["start_ts"] = params.StartTS
+			}
+			if params.EndTS > 0 {
+				bodyMap["end_ts"] = params.EndTS
+			}
+			if params.Interval != "" {
+				bodyMap["interval"] = params.Interval
+			}
+			if params.StartTS <= 0 && params.Interval == "" {
+				bodyMap["interval"] = "max"
+			}
+			payload, err := json.Marshal(bodyMap)
+			if err != nil {
+				return err
+			}
+			req, err := http.NewRequestWithContext(gctx, http.MethodPost, url, bytes.NewReader(payload))
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			if err != nil {
+				return fmt.Errorf("enrich prices batch: %w", err)
+			}
+			data, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				return err
+			}
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				return fmt.Errorf("enrich prices batch: status %d: %s", resp.StatusCode, truncate(string(data), 200))
+			}
+			part, err := parseBatchPrices(data)
+			if err != nil {
+				return err
+			}
+			mu.Lock()
+			for tok, pts := range part {
+				out[tok] = append(out[tok], pts...)
+			}
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return out, err
 	}
 	return out, nil
 }

@@ -43,6 +43,8 @@ type BacktestConfig struct {
 	Seed        int64
 	End         time.Time
 	Weights     edge.Weights
+	// ActionModel overrides Cfg.ActionModel when non-empty.
+	ActionModel string
 }
 
 // DefaultBacktestConfig returns sensible M4 defaults.
@@ -146,6 +148,13 @@ func RunBacktest(snaps []SnapshotAtT, prices map[string]PriceSeries, bc Backtest
 	if len(horizons) == 0 {
 		horizons = DefaultHorizons
 	}
+	actionModel := bc.ActionModel
+	if actionModel == "" {
+		actionModel = bc.Cfg.ActionModel
+	}
+	if actionModel == "" {
+		actionModel = ActionSignFromEdge
+	}
 
 	for _, snap := range snaps {
 		universe := snap.Markets
@@ -227,7 +236,13 @@ func RunBacktest(snaps []SnapshotAtT, prices map[string]PriceSeries, bc Backtest
 					if !ok || midH <= 0 {
 						continue
 					}
-					ac := AfterCostReturnBps(midT, midH, fp)
+					// Candidate uses action_model; baselines stay long_yes for fair dumb-screen deltas.
+					var ac float64
+					if pol.name == "candidate" {
+						ac = AfterCostReturnBpsAction(midT, midH, fp, actionModel, m.EdgeBpsAtT)
+					} else {
+						ac = AfterCostReturnBps(midT, midH, fp)
+					}
 					if math.IsNaN(ac) {
 						continue
 					}

@@ -14,12 +14,14 @@ type Config struct {
 	PrimaryHorizon      string        `yaml:"primary_horizon"`
 	Horizons            []string      `yaml:"horizons"`
 	DefaultSelectionSet string        `yaml:"default_selection_set"`
-	LabelProtocol       LabelYAML     `yaml:"label_protocol"`
-	FillModel           FillModelYAML `yaml:"fill_model"`
-	Gates               GatesYAML     `yaml:"gates"`
-	RequiredBaselines   []string      `yaml:"required_baselines"`
-	RequiredStrata      []string      `yaml:"required_strata"`
-	ForbiddenFeatures   []string      `yaml:"forbidden_features"`
+	// ActionModel: long_yes | sign_from_edge (default sign_from_edge for board economic claim).
+	ActionModel       string        `yaml:"action_model"`
+	LabelProtocol     LabelYAML     `yaml:"label_protocol"`
+	FillModel         FillModelYAML `yaml:"fill_model"`
+	Gates             GatesYAML     `yaml:"gates"`
+	RequiredBaselines []string      `yaml:"required_baselines"`
+	RequiredStrata    []string      `yaml:"required_strata"`
+	ForbiddenFeatures []string      `yaml:"forbidden_features"`
 }
 
 // LabelYAML is the YAML form of LabelProtocol.
@@ -55,6 +57,7 @@ func DefaultConfig() Config {
 		PrimaryHorizon:      "1h",
 		Horizons:            append([]string{}, DefaultHorizons...),
 		DefaultSelectionSet: SelectionBoard,
+		ActionModel:         ActionSignFromEdge,
 		LabelProtocol: LabelYAML{
 			PointInTime:        true,
 			AsOfField:          "features_asof",
@@ -102,6 +105,9 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.DefaultSelectionSet == "" {
 		cfg.DefaultSelectionSet = SelectionBoard
+	}
+	if cfg.ActionModel == "" {
+		cfg.ActionModel = ActionSignFromEdge
 	}
 	if cfg.Gates.MinSample <= 0 {
 		cfg.Gates.MinSample = DefaultMinSample

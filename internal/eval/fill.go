@@ -72,11 +72,38 @@ func RawMoveBps(midT, midH float64) float64 {
 	return (midH - midT) * 10_000
 }
 
+// Action model constants (eval measurement; not live signals).
+const (
+	ActionLongYes      = "long_yes"
+	ActionSignFromEdge = "sign_from_edge"
+)
+
 // AfterCostReturnBps applies fill costs to a long-YES mid→horizon move.
 func AfterCostReturnBps(midT, midH float64, p FillParams) float64 {
 	raw := RawMoveBps(midT, midH)
 	if math.IsNaN(raw) {
 		return raw
+	}
+	return raw - p.TotalCostBps()
+}
+
+// AfterCostReturnBpsAction applies action_model:
+//   - long_yes: long YES mid move − costs
+//   - sign_from_edge: long YES if edgeBpsAtT ≥ 0, else long NO (flip raw move) − costs
+func AfterCostReturnBpsAction(midT, midH float64, p FillParams, actionModel string, edgeBpsAtT float64) float64 {
+	raw := RawMoveBps(midT, midH)
+	if math.IsNaN(raw) {
+		return raw
+	}
+	switch actionModel {
+	case ActionSignFromEdge:
+		if edgeBpsAtT < 0 {
+			raw = -raw
+		}
+	case ActionLongYes, "":
+		// long YES
+	default:
+		// unknown → long YES
 	}
 	return raw - p.TotalCostBps()
 }

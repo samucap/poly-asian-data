@@ -46,6 +46,8 @@ type EvalSurface struct {
 	FillModel     FillModel     `json:"fill_model"`
 	// Metrics
 	Metrics EvalMetrics `json:"metrics"`
+	// ActionModel: long_yes | sign_from_edge (how candidate labels were built).
+	ActionModel string `json:"action_model,omitempty"`
 	// Feature list used by the strategy under test (for forbidden-feature gate)
 	FeatureNames []string `json:"feature_names,omitempty"`
 	// BaselineNotes documents PIT proxies for volume/activity baselines.
@@ -86,6 +88,8 @@ type EvalMetrics struct {
 	N                int                       `json:"n"`
 	Overall          HorizonMetrics            `json:"overall"`
 	ByStratum        map[string]HorizonMetrics `json:"by_stratum,omitempty"`         // key: "category=sports" etc.
+	ByHorizon        map[string]HorizonMetrics `json:"by_horizon,omitempty"`         // 5m / 1h / 1d
+	Portfolio        *PortfolioMetrics         `json:"portfolio,omitempty"`          // equity-curve Sharpe / max DD
 	Baselines        map[string]HorizonMetrics `json:"baselines,omitempty"`          // volume_top_n, ...
 	DeltaVsBaselines map[string]float64        `json:"delta_vs_baselines,omitempty"` // primary horizon after_cost_return_bps
 	PrimaryHorizon   string                    `json:"primary_horizon"`

@@ -363,6 +363,17 @@ func RunCycle(ctx context.Context, deps CycleDeps) CycleResult {
 			res.Status = artifacts.StatusFailed
 			doc.Status = res.Status
 			doc.Errors = res.Errors
+		} else if err := db.InsertEdgeBoardSnapshots(ctx, deps.DB, db.SnapshotRowsFromBoard(build.Rows)); err != nil {
+			// PIT history is best-effort: board publish still succeeds.
+			log.Warn("edge_board_snapshots write failed", "error", err)
+			res.Errors = append(res.Errors, artifacts.ErrorItem{
+				Code: "edge_board_snapshots_failed", Message: err.Error(), Component: "db",
+			})
+			if res.Status == artifacts.StatusSuccess {
+				res.Status = artifacts.StatusPartial
+				doc.Status = res.Status
+				doc.Errors = res.Errors
+			}
 		}
 	}
 	log.Info("stage complete", "stage", "save_board", "duration", logging.FormatDuration(time.Since(stage)))

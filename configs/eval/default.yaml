@@ -12,6 +12,10 @@ horizons:
 default_selection_set: board_at_t
 # Optional secondary reports: stage1_at_t
 
+# long_yes = always buy YES; sign_from_edge = side from EdgeBpsAtT (board economic claim).
+# Baselines stay long_yes so deltas answer "signed board vs dumb long-YES screens".
+action_model: sign_from_edge
+
 label_protocol:
   point_in_time: true
   as_of_field: features_asof   # or selected_at when features missing

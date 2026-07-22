@@ -63,6 +63,10 @@
         "notes": { "type": "string" }
       }
     },
+    "action_model": {
+      "type": "string",
+      "description": "long_yes | sign_from_edge — how candidate labels were measured"
+    },
     "feature_names": {
       "type": "array",
       "items": { "type": "string" },
@@ -83,7 +87,22 @@
             "win_rate": { "type": "number" },
             "after_cost_return_bps": { "type": "number" },
             "after_cost_return_med_bps": { "type": "number" },
-            "max_drawdown_bps": { "type": "number" }
+            "max_drawdown_bps": { "type": "number", "description": "From portfolio equity curve when present" }
+          }
+        },
+        "by_horizon": {
+          "type": "object",
+          "additionalProperties": { "type": "object" }
+        },
+        "portfolio": {
+          "type": "object",
+          "description": "Equal-weight board basket period returns: sharpe, max_drawdown_bps, n_periods",
+          "properties": {
+            "horizon": { "type": "string" },
+            "n_periods": { "type": "integer" },
+            "sharpe": { "type": "number" },
+            "max_drawdown_bps": { "type": "number" },
+            "total_return_bps": { "type": "number" }
           }
         },
         "by_stratum": {

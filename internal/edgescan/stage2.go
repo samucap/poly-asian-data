@@ -124,7 +124,11 @@ type EdgeBuildOptions struct {
 // BoardBuildResult extended with FV coverage diagnostics.
 // (fields added on existing struct via this package — see BoardBuildResult in board.go)
 
-// BuildEdgeBoard ranks Stage-1 candidates by edge_bps and cuts to BoardMaxN.
+// BuildEdgeBoard ranks Stage-1 candidates via edge.SelectBoard (same pure policy as edge-eval),
+// then applies live-only sticky retention when cutting to BoardMaxN.
+//
+// policy_parity=scan_board_v1: scoring/rank keys come from SelectBoard; sticky is operational
+// retention only and is not part of offline promote eval.
 func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult {
 	dropped := copyDropped(stage1.DroppedSummary)
 	dropped["missing_book"] = 0
@@ -154,14 +158,9 @@ func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult
 	groupMidsByGroup := BuildGroupMidIndex(enrichSet, opts.Books)
 	groupResidual, groupIncomplete := negRiskResiduals(enrichSet, opts.Books)
 
-	fvChain := opts.FV
-	if len(fvChain.Providers) == 0 {
-		fvChain = edge.DefaultFVChainFromWeights(w)
-	}
-
-	scored := make([]scoredCand, 0, len(stage1.Candidates))
+	boardCands := make([]edge.BoardCandidate, 0, len(stage1.Candidates))
+	byCondFeat := make(map[string]Candidate, len(stage1.Candidates))
 	booksHit := 0
-	fvHits := 0
 	for _, c := range stage1.Candidates {
 		if c.Market == nil {
 			continue
@@ -170,50 +169,28 @@ func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult
 		if !feat.MissingBook {
 			booksHit++
 		}
-
-		// Board policy: extreme mid (not inside Score pure math).
+		// Pre-count extremes for diagnostics (SelectBoard also drops them).
 		if w.DropExtremePrice && !feat.MissingBook && edge.IsExtremeMid(feat.Mid, w.ExtremeLo, w.ExtremeHi) {
 			dropped["extreme_price"]++
-			dropped["edge_drop"]++
-			continue
 		}
-
-		scoreIn := edge.ScoreInput{
-			Features:      feat,
-			TakerFeeBps:   takerFeeBps(c.Market),
-			NegRiskFeeBps: float64(c.NegRiskFeeBips),
+		gMids := GroupMidsFor(c, groupMidsByGroup)
+		known := GroupKnownSize(c, stage1.ByCond)
+		if gMids != nil && len(gMids) > known {
+			known = len(gMids)
 		}
-		if w.FVEnabled {
-			gMids := GroupMidsFor(c, groupMidsByGroup)
-			known := GroupKnownSize(c, stage1.ByCond)
-			if gMids != nil && len(gMids) > known {
-				known = len(gMids)
-			}
-			q := fvChain.Resolve(edge.FairValueInput{
-				ConditionID:    c.Market.ConditionID,
-				Features:       feat,
-				GroupMids:      gMids,
-				KnownGroupSize: known,
-				NegRiskFeeBips: float64(c.NegRiskFeeBips),
-			})
-			if q != nil {
-				fv := q.FairValue
-				scoreIn.FairValue = &fv
-				scoreIn.FVSource = q.Source
-				fvHits++
-			}
+		act := 0.0
+		if c.Market != nil {
+			act = c.Market.ComputedScore
 		}
-
-		res := edge.Score(scoreIn, w)
-		if res.Drop {
-			dropped["edge_drop"]++
-			continue
-		}
-		scored = append(scored, scoredCand{
-			c:   c,
-			act: c.Market.ComputedScore,
-			res: res,
+		boardCands = append(boardCands, edge.BoardCandidate{
+			Features:       feat,
+			GroupMids:      gMids,
+			KnownGroupSize: known,
+			NegRiskFeeBips: float64(c.NegRiskFeeBips),
+			TakerFeeBps:    takerFeeBps(c.Market),
+			TieBreak:       act,
 		})
+		byCondFeat[c.Market.ConditionID] = c
 	}
 
 	if booksHit == 0 && opts.PublishRequireBooks {
@@ -222,24 +199,36 @@ func BuildEdgeBoard(stage1 Stage1Result, opts EdgeBuildOptions) BoardBuildResult
 			Stage1Count:    stage1.Stage1Count,
 			PoolCount:      stage1.PoolCount,
 			DroppedSummary: dropped,
-			FVHits:         fvHits,
+			FVHits:         0,
 			FVCoverage:     0,
 		}
 	}
 	dropped["missing_book"] = max(0, len(stage1.Candidates)-booksHit)
 
-	sort.SliceStable(scored, func(i, j int) bool {
-		if scored[i].res.EdgeBps == scored[j].res.EdgeBps {
-			return scored[i].act > scored[j].act
+	// Score/rank all survivors via shared policy (n = full set; sticky cut next).
+	ranked := edge.SelectBoard(boardCands, w, len(boardCands))
+	// Candidates not returned = extreme drop and/or Score.Drop.
+	dropped["edge_drop"] = max(0, len(boardCands)-len(ranked))
+
+	scored := make([]scoredCand, 0, len(ranked))
+	fvHits := 0
+	for _, r := range ranked {
+		id := r.Candidate.Features.ConditionID
+		c, ok := byCondFeat[id]
+		if !ok {
+			continue
 		}
-		return scored[i].res.EdgeBps > scored[j].res.EdgeBps
-	})
+		if r.Result.FairValue != nil {
+			fvHits++
+		}
+		act := r.Candidate.TieBreak
+		scored = append(scored, scoredCand{c: c, act: act, res: r.Result})
+	}
 
 	before := len(scored)
 	scored = selectTopNByEdge(scored, stickyMap(opts.StickyConditionIDs), opts.BoardMaxN)
 	dropped["board_cap"] = max(0, before-len(scored))
 
-	// FV coverage on final board
 	boardFV := 0
 	for _, s := range scored {
 		if s.res.FairValue != nil {

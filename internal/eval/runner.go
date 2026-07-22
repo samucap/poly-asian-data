@@ -149,6 +149,21 @@ func RunDBOnly(ctx context.Context, opts RunnerOpts) (*RunResult, error) {
 		}
 	}
 
+	// Bulk-load board snapshots once (L2/L3/L4/L7) — no per-T SQL.
+	strategyName := opts.Strategy
+	if strategyName == "" {
+		strategyName = "default"
+	}
+	snapRows, snapErr := db.LoadEdgeBoardSnapshots(ctx, opts.DB, strategyName, from, to)
+	if snapErr != nil {
+		log.Warn("load edge_board_snapshots failed; series-only PIT meta", "error", snapErr)
+		snapRows = nil
+	}
+	snapIdx := BuildSnapIndex(snapRows)
+	snapTimes, snapN := snapIdx.Stats()
+	snapHit := 0
+	snapMiss := 0
+
 	snaps := make([]SnapshotAtT, 0, len(ts))
 	for _, t := range ts {
 		var pts []MarketPoint
@@ -161,6 +176,23 @@ func RunDBOnly(ctx context.Context, opts RunnerOpts) (*RunResult, error) {
 				continue
 			}
 			meta := metaByCond[m.ConditionID]
+			// Overlay snapshot meta when available (category, neg_risk, legs, volume).
+			sm := snapIdx.LookupCond(t, m.ConditionID)
+			if sm.Found {
+				snapHit++
+				if sm.Category != "" {
+					meta.Category = sm.Category
+				}
+				meta.NegRisk = sm.NegRisk
+				if sm.NegRiskGroupID != "" {
+					meta.NegRiskGroupID = sm.NegRiskGroupID
+				}
+				if len(sm.RelatedLegs) > 0 {
+					meta.RelatedLegs = sm.RelatedLegs
+				}
+			} else {
+				snapMiss++
+			}
 			var bookPtr *BookPoint
 			if bs, ok := booksByTok[m.TokenID]; ok {
 				if bp, ok := bs.AsOf(t, bookAge); ok {
@@ -179,17 +211,21 @@ func RunDBOnly(ctx context.Context, opts RunnerOpts) (*RunResult, error) {
 				costApprox = hs <= 0
 			}
 			gMids := GroupMidsAtT(t, meta, metaByCond, prices)
+			volProxy := VolumeProxy24h(ps, t)
+			if sm.Found && sm.HasVolume && sm.Volume24hr > 0 {
+				volProxy = sm.Volume24hr
+			}
 			mp := MarketPoint{
 				ConditionID:    m.ConditionID,
 				TokenID:        m.TokenID,
-				Category:       m.Category,
-				NegRisk:        m.NegRisk,
-				NegRiskGroupID: m.NegRiskGroupID,
-				RelatedLegs:    m.RelatedLegs,
+				Category:       meta.Category,
+				NegRisk:        meta.NegRisk,
+				NegRiskGroupID: meta.NegRiskGroupID,
+				RelatedLegs:    meta.RelatedLegs,
 				Mid:            mid,
 				HalfSpreadBps:  hs,
 				CostApprox:     costApprox,
-				VolumeProxy:    VolumeProxy24h(ps, t),
+				VolumeProxy:    volProxy,
 				ActivityProxy:  ActivityProxy24h(ps, t),
 				EndTime:        m.EndDate,
 				Features:       feat,
@@ -205,6 +241,9 @@ func RunDBOnly(ctx context.Context, opts RunnerOpts) (*RunResult, error) {
 		}
 	}
 
+	if bc.ActionModel == "" {
+		bc.ActionModel = cfg.ActionModel
+	}
 	labels, selStats := RunBacktest(snaps, prices, bc)
 	metrics := BuildMetrics(labels, cfg.PrimaryHorizon)
 
@@ -219,8 +258,19 @@ func RunDBOnly(ctx context.Context, opts RunnerOpts) (*RunResult, error) {
 	}
 	s.PolicyID = PolicyIDSelectBoardV1
 	s.PolicyParity = PolicyParityScanBoard
-	s.UniverseNote = "universe=current board∪top_volume with mid@T (membership non-PIT; features/labels PIT)"
-	s.BaselineNotes = "volume_top_n=series point-count 24h; activity_stage1=series sum|Δmid| 24h; label costs=edge.ComputeCost/Score TotalCostBps"
+	s.ActionModel = bc.ActionModel
+	if s.ActionModel == "" {
+		s.ActionModel = ActionSignFromEdge
+	}
+	hitRate := 0.0
+	if snapHit+snapMiss > 0 {
+		hitRate = float64(snapHit) / float64(snapHit+snapMiss)
+	}
+	s.UniverseNote = fmt.Sprintf(
+		"membership=series_mid@T; snapshots=%d times/%d rows; snap_meta_hit_rate=%.3f; sticky=live_only; features/labels=PIT",
+		snapTimes, snapN, hitRate,
+	)
+	s.BaselineNotes = "volume_top_n=snapshot_volume|series_proxy; activity_stage1=series sum|Δmid| 24h; label costs=edge.ComputeCost/Score TotalCostBps; candidate action_model=" + s.ActionModel + "; baselines=long_yes"
 	s.LabelProtocol.AsOfField = "features_asof"
 	s.LabelProtocol.NoFutureInFeatures = true
 	s.LabelProtocol.PointInTime = true

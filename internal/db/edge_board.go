@@ -75,7 +75,10 @@ func EnsureEdgeBoardTable(ctx context.Context, conn DBInterface) error {
 			return err
 		}
 	}
-	return EnsureM3FeatureTables(ctx, conn)
+	if err := EnsureM3FeatureTables(ctx, conn); err != nil {
+		return err
+	}
+	return EnsureEdgeBoardSnapshotsTable(ctx, conn)
 }
 
 // ReplaceEdgeBoard deletes the strategy's board and inserts the new set in one transaction.

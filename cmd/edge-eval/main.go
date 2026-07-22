@@ -7,7 +7,7 @@
 //	go run ./cmd/edge-eval --once --lookback 720h --stride 2 --board-n 50
 //	go run ./cmd/edge-eval --once --persist-labels
 //
-// Optional one-shot price backfill (same helper as edge-scan warm stage):
+// Optional one-shot price backfill (ops escape only — prefer edge-scan WARM for series):
 //
 //	go run ./cmd/edge-eval --backfill-prices --once
 package main
@@ -43,7 +43,7 @@ func main() {
 	universeCap := flag.Int("universe-cap", 500, "max markets per decision time")
 	strategy := flag.String("strategy", "default", "edge_board strategy for token hints")
 	persistLabels := flag.Bool("persist-labels", false, "upsert label_rows")
-	backfillPrices := flag.Bool("backfill-prices", false, "one-shot EnsurePrices before eval (HTTP); prefer edge-scan")
+	backfillPrices := flag.Bool("backfill-prices", false, "ops escape: one-shot HTTP price backfill before eval; default is DB-only (prefer edge-scan WARM)")
 	priceTokenCap := flag.Int("price-tokens", 300, "token cap for --backfill-prices")
 	seed := flag.Int64("seed", 42, "RNG seed for random_board baseline")
 	weightsFlag := flag.String("weights", "", "strategy weights YAML (default configs/strategies/default.yaml)")

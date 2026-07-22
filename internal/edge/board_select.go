@@ -21,15 +21,15 @@ type BoardSelectResult struct {
 	Result    ScoreResult
 }
 
-// SelectBoard applies production board policy:
+// SelectBoard applies production board policy (shared live edge-scan + offline eval):
 //  1. drop extreme mid when DropExtremePrice
 //  2. optional FV chain (neg-risk complement, …)
 //  3. edge.Score
 //  4. drop Score.Drop
 //  5. sort by EdgeBps desc, TieBreak desc
-//  6. cut to n
+//  6. cut to n (if n <= 0, default 50; pass len(cands) to keep all survivors)
 //
-// Used by offline eval; edge-scan should converge on this helper over time.
+// Live sticky retention is applied by edgescan after this helper (not part of promote eval).
 func SelectBoard(cands []BoardCandidate, w Weights, n int) []BoardSelectResult {
 	if w.Name == "" {
 		w = DefaultWeights()
