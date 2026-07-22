@@ -6,7 +6,7 @@ DOCKER_COMPOSE_POSTGRES=docker-compose.postgres.yml
 DOCKER_COMPOSE_APP=docker-compose.app.yml
 MAIN_PATH=cmd/main.go
 
-.PHONY: all build build-catalog build-top-markets build-edge-scan build-edge-eval build-strategy clean test coverage lint run run-catalog-markets run-catalog-markets-once run-edge-scan run-edge-scan-once run-edge-eval run-strategy run-strategy-register run-strategy-list run-strategy-active run-strategy-show run-strategy-promote run-strategy-rollback run-strategy-candidate test-eval test-strategy edge-board-top edge-board-verify edge-scan-once-top edge-scan-top edge-scan-verify dev audit sec docker-up docker-down db-up db-down app-up app-down
+.PHONY: all build build-catalog build-top-markets build-edge-scan build-edge-eval build-strategy build-ws-listener clean test coverage lint run run-catalog-markets run-catalog-markets-once run-edge-scan run-edge-scan-once run-edge-eval run-strategy run-strategy-register run-strategy-list run-strategy-active run-strategy-show run-strategy-promote run-strategy-rollback run-strategy-candidate run-ws-listener test-eval test-strategy test-ws edge-board-top edge-board-verify edge-scan-once-top edge-scan-top edge-scan-verify dev audit sec docker-up docker-down db-up db-down app-up app-down
 
 all: build
 
@@ -113,6 +113,23 @@ run-strategy-candidate:
 
 test-strategy:
 	go test ./internal/strategyreg/ ./internal/db/ -count=1 -run 'Strategy|Promote|Resolve|CheckPromote|Params|Gate'
+
+# =============================================================================
+# M6 ws-listener (board-only market WS + paper signals; no OMS)
+#   make build-ws-listener
+#   make run-ws-listener
+#   make run-ws-listener ARGS='--once --no-snapshots'
+#   make test-ws
+# =============================================================================
+build-ws-listener:
+	@echo "Building ws-listener (M6)..."
+	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/ws-listener ./cmd/ws-listener
+
+run-ws-listener:
+	go run ./cmd/ws-listener $(ARGS)
+
+test-ws:
+	go test ./internal/ws/market/ ./internal/signals/ ./internal/db/ -count=1 -run 'Cap|Parse|Diff|TakeDirty|Evaluate|BuildFactors|Clean|PriceChange|Book|Subscribe'
 
 # Explain top N markets from artifacts/edge_board/latest.json (no DB required)
 # Usage: make edge-board-top
