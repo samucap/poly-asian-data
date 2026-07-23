@@ -90,3 +90,43 @@ func TestParseLastTrade(t *testing.T) {
 func TestCapAssets(t *testing.T) {
 	require.Equal(t, []string{"a", "b"}, CapAssets([]string{"a", "b", "c"}, 2))
 }
+
+func TestParseMarketResolved(t *testing.T) {
+	raw := []byte(`{
+		"event_type": "market_resolved",
+		"id": "1031769",
+		"market": "0xabc",
+		"winning_asset_id": "tokYES",
+		"winning_outcome": "Yes",
+		"assets_ids": ["tokYES", "tokNO"],
+		"timestamp": "1766790415550"
+	}`)
+	evs, err := ParseMessage(raw)
+	require.NoError(t, err)
+	require.Len(t, evs, 1)
+	require.Equal(t, EventMarketResolved, evs[0].Type)
+	require.Equal(t, "0xabc", evs[0].MarketID)
+	require.Equal(t, "tokYES", evs[0].WinningAssetID)
+	require.Equal(t, "Yes", evs[0].WinningOutcome)
+	require.Equal(t, []string{"tokYES", "tokNO"}, evs[0].ResolvedAssetIDs)
+}
+
+func TestResolveQueueDedupeAndTake(t *testing.T) {
+	q := NewResolveQueue()
+	q.Enqueue(MarketResolution{ConditionID: "c1", WinningOutcome: "Yes"})
+	q.Enqueue(MarketResolution{ConditionID: "c1", WinningOutcome: "No"}) // overwrite
+	q.Enqueue(MarketResolution{ConditionID: "c2", WinningOutcome: "Yes"})
+	require.Equal(t, 2, q.Len())
+	all := q.TakeAll()
+	require.Len(t, all, 2)
+	require.Equal(t, 0, q.Len())
+}
+
+func TestRuntimeStatsObserve(t *testing.T) {
+	s := NewRuntimeStats()
+	s.ObserveMsg(EventBook)
+	s.ObserveMsg(EventPriceChange)
+	s.AddSignals(3)
+	require.Contains(t, s.CompactTypes(), "book=1")
+	require.Contains(t, s.Line(StatusInput{Sub: 1, Mem: 1}), "signals=3")
+}

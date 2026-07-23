@@ -67,6 +67,12 @@ func parseOne(data []byte) ([]ParsedEvent, error) {
 		Price   string `json:"price"`
 		Size    string `json:"size"`
 		Side    string `json:"side"`
+		// market_resolved / new_market
+		ID              string   `json:"id"`
+		WinningAssetID  string   `json:"winning_asset_id"`
+		WinningOutcome  string   `json:"winning_outcome"`
+		AssetsIDs       []string `json:"assets_ids"`
+		ClobTokenIDs    []string `json:"clob_token_ids"`
 	}
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		return nil, err
@@ -140,8 +146,23 @@ func parseOne(data []byte) ([]ParsedEvent, error) {
 		base.Side = strings.ToUpper(envelope.Side)
 		return []ParsedEvent{base}, nil
 
+	case EventMarketResolved:
+		base.MarketGammaID = envelope.ID
+		base.WinningAssetID = envelope.WinningAssetID
+		base.WinningOutcome = envelope.WinningOutcome
+		if base.MarketID == "" {
+			base.MarketID = envelope.Market
+		}
+		// Prefer assets_ids; fall back to clob_token_ids
+		ids := envelope.AssetsIDs
+		if len(ids) == 0 {
+			ids = envelope.ClobTokenIDs
+		}
+		base.ResolvedAssetIDs = append([]string(nil), ids...)
+		return []ParsedEvent{base}, nil
+
 	default:
-		// tick_size_change, new_market, market_resolved — ignore for book path
+		// tick_size_change, new_market — counted by caller; no book apply
 		return []ParsedEvent{base}, nil
 	}
 }

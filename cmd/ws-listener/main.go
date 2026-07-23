@@ -1,15 +1,16 @@
 // Command ws-listener streams Polymarket market WS for the edge board only (M6).
 // Maintains books in memory, flushes features_latest (and optional snapshots) with
 // write-minimized dirty batches, and emits multi-dimensional paper signals.
+// market_resolved is queued in memory and batch-written to plymkt_markets every few minutes.
 // No live order placement.
 package main
 
 import (
 	"context"
 	"flag"
-	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -36,6 +37,10 @@ func main() {
 	minEdgeBps := flag.Float64("min-edge-bps", 0, "min |net edge| to emit paper signal")
 	maxSpreadBps := flag.Float64("max-spread-bps", 500, "reject books wider than this")
 	probeSize := flag.Float64("probe-size-usd", 25, "advisory size probe")
+	statusInterval := flag.Duration("status-interval", 2*time.Second, "TTY status rewrite interval")
+	statusLogEvery := flag.Duration("status-log-every", 30*time.Second, "structured status log when not a TTY")
+	noStatusLine := flag.Bool("no-status-line", false, "disable in-place TTY status line")
+	resolveFlush := flag.Duration("resolve-flush", 7*time.Minute, "batch market_resolved → plymkt_markets (lean WS path)")
 	flag.Parse()
 
 	logging.Init(os.Getenv("ENV"))
@@ -76,8 +81,19 @@ func main() {
 	if err := db.EnsureEdgeBoardTable(ctx, pool); err != nil {
 		logger.Warn("ensure edge_board", "error", err)
 	}
+	if err := db.EnsureMarketResolutionColumns(ctx, pool); err != nil {
+		logger.Warn("ensure market resolution columns", "error", err)
+	}
 
 	store := market.NewBookStore()
+	stats := market.NewRuntimeStats()
+	resolveQ := market.NewResolveQueue()
+
+	// resolvedConds: skip paper signals; exclude from board subscribe when possible
+	var resolvedMu sync.RWMutex
+	resolvedConds := map[string]struct{}{}
+	resolvedAssets := map[string]struct{}{}
+
 	gate := signals.DefaultGateConfig()
 	gate.MinEdgeBps = *minEdgeBps
 	gate.MaxSpreadBps = *maxSpreadBps
@@ -86,32 +102,107 @@ func main() {
 	emitter := signals.NewEmitter(gate)
 
 	var boardMeta *db.BoardSubscribeSet
+	var boardMu sync.RWMutex
 
 	client := market.NewClient(*wsURL, logger)
+	client.OnReconnect = func() { stats.IncReconnect() }
 	client.OnEvent = func(ev market.ParsedEvent) {
-		store.Apply(ev)
+		stats.ObserveMsg(ev.Type)
+		switch ev.Type {
+		case market.EventMarketResolved:
+			// Hot path: memory only — unsub + queue for batch DB
+			r := market.MarketResolution{
+				GammaID:        ev.MarketGammaID,
+				ConditionID:    ev.MarketID,
+				WinningAssetID: ev.WinningAssetID,
+				WinningOutcome: ev.WinningOutcome,
+				ResolvedAt:     ev.Timestamp,
+				AssetIDs:       append([]string(nil), ev.ResolvedAssetIDs...),
+			}
+			resolveQ.Enqueue(r)
+			stats.AddResolveQueued(1)
+
+			resolvedMu.Lock()
+			if r.ConditionID != "" {
+				resolvedConds[r.ConditionID] = struct{}{}
+			}
+			for _, a := range r.AssetIDs {
+				if a != "" {
+					resolvedAssets[a] = struct{}{}
+				}
+			}
+			resolvedMu.Unlock()
+
+			if len(r.AssetIDs) > 0 {
+				store.RemoveTokens(r.AssetIDs)
+				_ = client.RemoveAssets(ctx, r.AssetIDs)
+			}
+			// Rare high-value line (not per signal spam)
+			logger.Info("market_resolved queued",
+				"condition_id", r.ConditionID,
+				"gamma_id", r.GammaID,
+				"winning_outcome", r.WinningOutcome,
+				"assets", len(r.AssetIDs),
+				"queue", resolveQ.Len(),
+			)
+			return
+		case market.EventNewMarket, market.EventTickSizeChange:
+			// Count only — no universe expand, no DB
+			return
+		default:
+			store.Apply(ev)
+		}
 	}
 
-	// Board poll loop
+	// Board poll
 	go func() {
 		t := time.NewTicker(*boardPoll)
 		defer t.Stop()
+		var lastN int
 		refresh := func() {
 			set, err := db.LoadBoardSubscribeSet(ctx, pool, *strategyFlag, *maxAssets)
 			if err != nil {
 				logger.Warn("load board assets", "error", err)
 				return
 			}
+			// Filter resolved assets out of subscribe set
+			resolvedMu.RLock()
+			filtered := make([]string, 0, len(set.TokenIDs))
+			for _, tid := range set.TokenIDs {
+				if _, bad := resolvedAssets[tid]; bad {
+					continue
+				}
+				filtered = append(filtered, tid)
+			}
+			// Also drop primaries whose condition resolved
+			var primaries []db.BoardAssetMeta
+			for _, p := range set.Primaries {
+				if _, bad := resolvedConds[p.ConditionID]; bad {
+					continue
+				}
+				primaries = append(primaries, p)
+			}
+			resolvedMu.RUnlock()
+
+			set.TokenIDs = filtered
+			set.Primaries = primaries
+			boardMu.Lock()
 			boardMeta = set
+			boardMu.Unlock()
+
 			if err := client.SetDesired(ctx, set.TokenIDs); err != nil {
 				logger.Warn("set desired assets", "error", err)
 			}
-			logger.Info("board assets",
-				"strategy", *strategyFlag,
-				"tokens", len(set.TokenIDs),
-				"primaries", len(set.Primaries),
-				"subscribed", len(client.Subscribed()),
-			)
+			// Log only when subscription size changes (not every poll)
+			if n := len(set.TokenIDs); n != lastN {
+				logger.Info("board subscribe set",
+					"strategy", *strategyFlag,
+					"tokens", n,
+					"primaries", len(set.Primaries),
+					"subscribed", len(client.Subscribed()),
+				)
+				lastN = n
+			}
 		}
 		refresh()
 		for {
@@ -124,7 +215,7 @@ func main() {
 		}
 	}()
 
-	// Features flush (dirty only)
+	// Features flush
 	go func() {
 		if *featuresFlush <= 0 {
 			return
@@ -142,43 +233,37 @@ func main() {
 				}
 				rows := make([]db.FeaturesLatestRow, 0, len(dirty))
 				now := time.Now().UTC()
+				boardMu.RLock()
+				bm := boardMeta
+				boardMu.RUnlock()
 				for _, b := range dirty {
 					cond, mkt := "", b.MarketID
-					if boardMeta != nil {
-						if m, ok := boardMeta.ByToken[b.TokenID]; ok {
+					if bm != nil {
+						if m, ok := bm.ByToken[b.TokenID]; ok {
 							cond = m.ConditionID
 							if mkt == "" {
 								mkt = m.MarketID
 							}
 						}
 					}
-					mid := b.Mid()
 					rows = append(rows, db.FeaturesLatestRow{
-						TokenID:        b.TokenID,
-						ConditionID:    cond,
-						MarketID:       mkt,
-						BestBid:        b.BestBid,
-						BestAsk:        b.BestAsk,
-						Mid:            mid,
-						LastTradePrice: b.LastTradePrice,
-						Spread:         b.Spread(),
-						Imbalance:      b.Imbalance,
-						BidDepth:       b.BidDepth,
-						AskDepth:       b.AskDepth,
-						UpdatedAt:      pickTime(b.UpdatedAt, now),
+						TokenID: b.TokenID, ConditionID: cond, MarketID: mkt,
+						BestBid: b.BestBid, BestAsk: b.BestAsk, Mid: b.Mid(),
+						LastTradePrice: b.LastTradePrice, Spread: b.Spread(),
+						Imbalance: b.Imbalance, BidDepth: b.BidDepth, AskDepth: b.AskDepth,
+						UpdatedAt: pickTime(b.UpdatedAt, now),
 					})
 				}
 				if err := db.UpsertFeaturesLatest(ctx, pool, rows); err != nil {
 					logger.Warn("flush features_latest", "error", err, "n", len(rows))
-					// re-dirty would require re-mark; accept loss until next change
 					continue
 				}
-				logger.Debug("flushed features_latest", "n", len(rows), "dirty_left", store.DirtyCount())
+				stats.AddFeatFlush(len(rows))
 			}
 		}
 	}()
 
-	// Snapshot flush (optional, slower)
+	// Snapshot flush
 	if !*noSnapshots && *snapshotFlush > 0 {
 		go func() {
 			t := time.NewTicker(*snapshotFlush)
@@ -188,7 +273,6 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					// Independent of features Dirty — only mid/BBA change since last snap.
 					changed := store.TakeChangedForSnapshot(100)
 					if len(changed) == 0 {
 						continue
@@ -204,15 +288,9 @@ func main() {
 							mkt = "unknown"
 						}
 						rows = append(rows, db.OrderbookSnapshotRow{
-							Time:          pickTime(b.UpdatedAt, now),
-							MarketID:      mkt,
-							TokenID:       b.TokenID,
-							BestBid:       b.BestBid,
-							BestAsk:       b.BestAsk,
-							Imbalance:     b.Imbalance,
-							TotalBidDepth: b.BidDepth,
-							TotalAskDepth: b.AskDepth,
-							// no DepthJSON / RawJSON — minimize write size
+							Time: pickTime(b.UpdatedAt, now), MarketID: mkt, TokenID: b.TokenID,
+							BestBid: b.BestBid, BestAsk: b.BestAsk, Imbalance: b.Imbalance,
+							TotalBidDepth: b.BidDepth, TotalAskDepth: b.AskDepth,
 						})
 					}
 					if len(rows) == 0 {
@@ -222,11 +300,55 @@ func main() {
 						logger.Warn("flush snapshots", "error", err, "n", len(rows))
 						continue
 					}
-					logger.Debug("flushed snapshots", "n", len(rows))
+					stats.AddSnapFlush(len(rows))
 				}
 			}
 		}()
 	}
+
+	// Batch market_resolved → DB (5–10m; default 7m) — lean hot path
+	go func() {
+		interval := *resolveFlush
+		if interval <= 0 {
+			interval = 7 * time.Minute
+		}
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		flush := func() {
+			pending := resolveQ.TakeAll()
+			if len(pending) == 0 {
+				return
+			}
+			rows := make([]db.MarketResolutionRow, 0, len(pending))
+			for _, r := range pending {
+				rows = append(rows, db.MarketResolutionRow{
+					GammaID: r.GammaID, ConditionID: r.ConditionID,
+					WinningAssetID: r.WinningAssetID, WinningOutcome: r.WinningOutcome,
+					ResolvedAt: r.ResolvedAt,
+				})
+			}
+			n, err := db.ApplyMarketResolutions(ctx, pool, rows)
+			if err != nil {
+				logger.Warn("batch market_resolved", "error", err, "queued", len(rows))
+				// re-queue on failure so we don't lose backtest labels
+				for _, r := range pending {
+					resolveQ.Enqueue(r)
+				}
+				return
+			}
+			stats.AddResolveFlushed(len(rows))
+			logger.Info("batch market_resolved applied", "batch", len(rows), "rows_updated", n)
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				flush() // final drain
+				return
+			case <-t.C:
+				flush()
+			}
+		}
+	}()
 
 	// Paper signals from memory
 	go func() {
@@ -240,36 +362,33 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if boardMeta == nil {
+				boardMu.RLock()
+				bm := boardMeta
+				boardMu.RUnlock()
+				if bm == nil {
 					continue
 				}
 				now := time.Now().UTC()
 				var out []db.SignalRow
-				for _, p := range boardMeta.Primaries {
+				for _, p := range bm.Primaries {
+					resolvedMu.RLock()
+					_, dead := resolvedConds[p.ConditionID]
+					resolvedMu.RUnlock()
+					if dead {
+						continue
+					}
 					bk, ok := store.Snapshot(p.PrimaryTokenID)
 					if !ok || !bk.ValidBook() {
 						continue
 					}
 					board := signals.BoardSnap{
-						ConditionID:       p.ConditionID,
-						MarketID:          p.MarketID,
-						TokenID:           p.PrimaryTokenID,
-						Rank:              p.Rank,
-						Score:             p.Score,
-						EdgeBps:           p.EdgeBps,
-						CostBps:           p.CostBps,
-						CapacityUSD:       p.CapacityUSD,
-						Urgency:           p.Urgency,
-						FairValue:         p.FairValue,
-						ModelEdgeBps:      p.ModelEdgeBps,
-						FVSource:          p.FVSource,
-						NegRisk:           p.NegRisk,
-						NegRiskGroupID:    p.NegRiskGroupID,
-						StrategyTags:      p.StrategyTags,
-						RiskFlags:         p.RiskFlags,
-						KeyFeatures:       p.KeyFeatures,
-						StrategyVersionID: p.StrategyVersionID,
-						RunID:             p.RunID,
+						ConditionID: p.ConditionID, MarketID: p.MarketID, TokenID: p.PrimaryTokenID,
+						Rank: p.Rank, Score: p.Score, EdgeBps: p.EdgeBps, CostBps: p.CostBps,
+						CapacityUSD: p.CapacityUSD, Urgency: p.Urgency, FairValue: p.FairValue,
+						ModelEdgeBps: p.ModelEdgeBps, FVSource: p.FVSource, NegRisk: p.NegRisk,
+						NegRiskGroupID: p.NegRiskGroupID, StrategyTags: p.StrategyTags,
+						RiskFlags: p.RiskFlags, KeyFeatures: p.KeyFeatures,
+						StrategyVersionID: p.StrategyVersionID, RunID: p.RunID,
 					}
 					book := signals.BookSnap{
 						BestBid: bk.BestBid, BestAsk: bk.BestAsk, Mid: bk.Mid(),
@@ -289,25 +408,44 @@ func main() {
 					logger.Warn("insert signals", "error", err, "n", len(out))
 					continue
 				}
-				logger.Info("paper signals", "n", len(out))
+				stats.AddSignals(len(out))
+				// No per-batch Info spam — status line carries aggregates
 			}
 		}
 	}()
 
-	// Metrics ticker
+	// Status: TTY in-place or periodic structured log
+	useTTY := !*noStatusLine && market.IsTTY(os.Stderr)
 	go func() {
-		t := time.NewTicker(30 * time.Second)
+		interval := *statusInterval
+		if !useTTY {
+			interval = *statusLogEvery
+			if interval <= 0 {
+				interval = 30 * time.Second
+			}
+		} else if interval <= 0 {
+			interval = 2 * time.Second
+		}
+		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
+				if useTTY {
+					market.FinishStatusLine()
+				}
 				return
 			case <-t.C:
-				logger.Info("ws-listener stats",
-					"books", store.Len(),
-					"dirty", store.DirtyCount(),
-					"subscribed", len(client.Subscribed()),
-				)
+				in := market.StatusInput{
+					Sub:     len(client.Subscribed()),
+					Mem:     store.Len(),
+					Pending: store.DirtyCount(),
+				}
+				if useTTY {
+					market.WriteStatusLine(stats.Line(in))
+				} else {
+					logger.Info("ws_status", stats.Attrs(in)...)
+				}
 			}
 		}
 	}()
@@ -327,12 +465,19 @@ func main() {
 		"features_flush", *featuresFlush,
 		"snapshot_flush", *snapshotFlush,
 		"no_snapshots", *noSnapshots,
+		"resolve_flush", *resolveFlush,
+		"status_tty", useTTY,
 	)
 	if err := client.Run(runCtx); err != nil && runCtx.Err() == nil {
 		logger.Error("ws client exited", "error", err)
 		os.Exit(1)
 	}
-	logger.Info("ws-listener stopped", slog.Any("books", store.Len()))
+	if useTTY {
+		market.FinishStatusLine()
+	}
+	logger.Info("ws-listener stopped", stats.Attrs(market.StatusInput{
+		Sub: len(client.Subscribed()), Mem: store.Len(), Pending: store.DirtyCount(),
+	})...)
 }
 
 func pickTime(a, fallback time.Time) time.Time {

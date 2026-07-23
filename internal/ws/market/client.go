@@ -18,6 +18,7 @@ type Client struct {
 	PingEvery      time.Duration
 	Logger         *slog.Logger
 	OnEvent        func(ParsedEvent)
+	OnReconnect    func()
 	ReconnectMin   time.Duration
 	ReconnectMax   time.Duration
 	CustomFeatures bool
@@ -75,6 +76,46 @@ func (c *Client) Subscribed() []string {
 	return append([]string(nil), c.subscribed...)
 }
 
+// RemoveAssets drops assets from desired set and unsubscribes if connected (lean resolve path).
+func (c *Client) RemoveAssets(ctx context.Context, assets []string) error {
+	if c == nil || len(assets) == 0 {
+		return nil
+	}
+	drop := make(map[string]struct{}, len(assets))
+	for _, a := range assets {
+		if a != "" {
+			drop[a] = struct{}{}
+		}
+	}
+	c.mu.Lock()
+	var next []string
+	for _, a := range c.desired {
+		if _, bad := drop[a]; !bad {
+			next = append(next, a)
+		}
+	}
+	c.desired = next
+	conn := c.conn
+	cur := append([]string(nil), c.subscribed...)
+	c.mu.Unlock()
+
+	if conn == nil {
+		c.mu.Lock()
+		// also trim subscribed snapshot for gauges
+		var sub []string
+		for _, a := range cur {
+			if _, bad := drop[a]; !bad {
+				sub = append(sub, a)
+			}
+		}
+		c.subscribed = sub
+		c.mu.Unlock()
+		return nil
+	}
+	// Apply full desired diff
+	return c.SetDesired(ctx, next)
+}
+
 // Run dials, subscribes, reads until ctx cancel. Reconnects with backoff.
 func (c *Client) Run(ctx context.Context) error {
 	backoff := c.ReconnectMin
@@ -95,6 +136,10 @@ func (c *Client) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 		c.Logger.Warn("ws session ended; reconnecting", "error", err, "backoff", backoff)
+		// Caller may attach reconnect counter via Logger only; optional hook:
+		if c.OnReconnect != nil {
+			c.OnReconnect()
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

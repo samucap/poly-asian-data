@@ -293,6 +293,18 @@ func (s *BookStore) Len() int {
 	return len(s.books)
 }
 
+// RemoveTokens drops in-memory books for the given token IDs (e.g. after market_resolved).
+func (s *BookStore) RemoveTokens(tokenIDs []string) {
+	if s == nil || len(tokenIDs) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range tokenIDs {
+		delete(s.books, id)
+	}
+}
+
 func recomputeTop(b *BookState) {
 	b.BestBid = 0
 	b.BestAsk = 0

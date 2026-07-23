@@ -74,7 +74,7 @@ func (b *BookState) ValidBook() bool {
 type ParsedEvent struct {
 	Type      string
 	AssetID   string
-	MarketID  string
+	MarketID  string // condition id (0x…) for market channel
 	Timestamp time.Time
 	// book
 	Bids []Level
@@ -89,7 +89,12 @@ type ParsedEvent struct {
 	LastTradePrice float64
 	// price_change may carry multiple legs
 	PriceChanges []PriceChangeLeg
-	Raw          []byte
+	// market_resolved
+	MarketGammaID   string // gamma market id when present
+	WinningAssetID  string
+	WinningOutcome  string
+	ResolvedAssetIDs []string // tokens to unsubscribe
+	Raw             []byte
 }
 
 // PriceChangeLeg is one asset update inside price_change.
