@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/samucap/poly-asian-data/internal/artifacts"
+	"github.com/samucap/poly-asian-data/internal/datagap"
 	"github.com/samucap/poly-asian-data/internal/db"
 	"github.com/samucap/poly-asian-data/internal/edge"
 )
@@ -32,6 +34,14 @@ type RunnerOpts struct {
 	// WeightsHash if non-empty is used as lineage hash (e.g. from strategy_versions).
 	// Else hash WeightsPath or WeightsYAML.
 	WeightsHash string
+	// SynthFill enables development gap-fill (interp/hold prices + synth books). Labeled on surface.
+	SynthFill bool
+	// Synth is options for gap fill; zero value uses datagap.DefaultOpts when SynthFill.
+	Synth datagap.Opts
+	// SynthPromoteMaxShare: synth share above this blocks promote (default 0.05).
+	SynthPromoteMaxShare float64
+	// SynthSignificantShare: share at/above this is a loud alert and forces ok=false (default 0.20).
+	SynthSignificantShare float64
 }
 
 // RunResult is the outcome of one edge-eval pass.
@@ -137,6 +147,51 @@ func RunDBOnly(ctx context.Context, opts RunnerOpts) (*RunResult, error) {
 	ts := DecisionTimes(bc, maxH)
 	if len(ts) == 0 {
 		return emptySurface(cfg, opts.ArtifactsRoot, "empty decision grid", start, bc, opts)
+	}
+
+	var dq *DataQuality
+	if opts.SynthFill {
+		synthOpts := opts.Synth
+		synthOpts.Normalize()
+		report := applySynthFill(prices, booksByTok, ts, from, to, synthOpts, useBooks)
+		promoteMax := opts.SynthPromoteMaxShare
+		if promoteMax <= 0 {
+			promoteMax = datagap.PromoteMaxSynthShare
+		}
+		sigShare := opts.SynthSignificantShare
+		if sigShare <= 0 {
+			sigShare = datagap.SignificantSynthShare
+		}
+		report.MaxGap = synthOpts.MaxGap.String()
+		report.HoldMax = synthOpts.HoldMax.String()
+		report.Finalize(promoteMax, sigShare)
+		dq = dataQualityFromReport(report)
+		if ban := report.Banner(); ban != "" {
+			fmt.Fprint(os.Stderr, ban)
+			if report.Significant {
+				log.Error("significant_synthetic_data",
+					"synth_price_share", report.SynthPriceShare,
+					"synth_book_share", report.SynthBookShare,
+					"block_promote", report.BlockPromote,
+					"warning", report.Warning,
+				)
+			} else {
+				log.Warn("synthetic_fill_active",
+					"synth_price_share", report.SynthPriceShare,
+					"synth_book_share", report.SynthBookShare,
+					"block_promote", report.BlockPromote,
+					"warning", report.Warning,
+				)
+			}
+		}
+		log.Info("synth fill applied",
+			"price_venue", report.PriceMix.Venue,
+			"price_synth_interp", report.PriceMix.SynthInterp,
+			"price_synth_hold", report.PriceMix.SynthHold,
+			"book_synth", report.BookMix.SynthBook,
+			"synth_price_share", report.SynthPriceShare,
+			"synth_book_share", report.SynthBookShare,
+		)
 	}
 
 	minDepth := bc.Weights.MinDepthShares
@@ -257,6 +312,7 @@ func RunDBOnly(ctx context.Context, opts RunnerOpts) (*RunResult, error) {
 	s.PipelineVersion = env.PipelineVersion
 	s.CodeCommit = env.CodeCommit
 	s.GeneratedAt = env.GeneratedAt
+	s.DataQuality = dq
 	s.StrategyName = bc.Weights.Name
 	if s.StrategyName == "" {
 		s.StrategyName = "default"
@@ -348,6 +404,111 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// applySynthFill mutates prices and booksByTok in place with development gap-fill.
+func applySynthFill(
+	prices map[string]PriceSeries,
+	booksByTok map[string]BookSeries,
+	decisionTimes []time.Time,
+	from, to time.Time,
+	opts datagap.Opts,
+	useBooks bool,
+) datagap.Report {
+	report := datagap.Report{FillMode: "real_plus_synth"}
+	grid := decisionTimes
+	if len(grid) == 0 {
+		grid = datagap.BuildHourlyGrid(from, to, opts.GridStep)
+	}
+	for tok, ps := range prices {
+		real := make([]datagap.PricePoint, 0, len(ps.Times))
+		for i := range ps.Times {
+			real = append(real, datagap.PricePoint{
+				Time: ps.Times[i], Price: ps.Prices[i], Source: datagap.SourceVenue,
+			})
+		}
+		filled, mix := datagap.FillPrices(real, grid, opts)
+		report.PriceMix.Add(mix)
+		ns := PriceSeries{TokenID: tok}
+		for _, p := range filled {
+			ns.Times = append(ns.Times, p.Time)
+			ns.Prices = append(ns.Prices, p.Price)
+		}
+		prices[tok] = ns
+	}
+	if !useBooks {
+		return report
+	}
+	for tok, ps := range prices {
+		bs := booksByTok[tok]
+		realB := make([]datagap.BookPoint, 0, len(bs.Points))
+		for _, p := range bs.Points {
+			realB = append(realB, datagap.BookPoint{
+				Time: p.Time, BestBid: p.BestBid, BestAsk: p.BestAsk,
+				TotalBidDepth: p.TotalBidDepth, TotalAskDepth: p.TotalAskDepth,
+				Source: datagap.SourceVenue,
+			})
+		}
+		midAt := func(t time.Time) (float64, bool) {
+			return ps.MidAsOf(t)
+		}
+		filledB, mix := datagap.FillBooks(realB, grid, midAt, opts)
+		report.BookMix.Add(mix)
+		nbs := BookSeries{TokenID: tok}
+		for _, p := range filledB {
+			nbs.Points = append(nbs.Points, BookPoint{
+				Time: p.Time, BestBid: p.BestBid, BestAsk: p.BestAsk,
+				TotalBidDepth: p.TotalBidDepth, TotalAskDepth: p.TotalAskDepth,
+			})
+		}
+		if len(nbs.Points) > 0 {
+			booksByTok[tok] = nbs
+		}
+	}
+	// Tokens with prices but no book series entry
+	for tok, ps := range prices {
+		if _, ok := booksByTok[tok]; ok {
+			continue
+		}
+		midAt := func(t time.Time) (float64, bool) { return ps.MidAsOf(t) }
+		filledB, mix := datagap.FillBooks(nil, grid, midAt, opts)
+		report.BookMix.Add(mix)
+		nbs := BookSeries{TokenID: tok}
+		for _, p := range filledB {
+			nbs.Points = append(nbs.Points, BookPoint{
+				Time: p.Time, BestBid: p.BestBid, BestAsk: p.BestAsk,
+				TotalBidDepth: p.TotalBidDepth, TotalAskDepth: p.TotalAskDepth,
+			})
+		}
+		if len(nbs.Points) > 0 {
+			booksByTok[tok] = nbs
+		}
+	}
+	return report
+}
+
+func dataQualityFromReport(r datagap.Report) *DataQuality {
+	return &DataQuality{
+		PriceSourceMix: map[string]int{
+			"venue":        r.PriceMix.Venue,
+			"synth_interp": r.PriceMix.SynthInterp,
+			"synth_hold":   r.PriceMix.SynthHold,
+			"missing":      r.PriceMix.Missing,
+		},
+		BookSourceMix: map[string]int{
+			"venue":              r.BookMix.Venue,
+			"synth_book_from_mid": r.BookMix.SynthBook,
+			"missing":            r.BookMix.Missing,
+		},
+		SynthPriceShare:  r.SynthPriceShare,
+		SynthBookShare:   r.SynthBookShare,
+		FillMode:         r.FillMode,
+		SynthMaxGap:      r.MaxGap,
+		SynthHoldMax:     r.HoldMax,
+		Warning:          r.Warning,
+		SignificantSynth: r.Significant,
+		BlockPromote:     r.BlockPromote,
+	}
 }
 
 func loadUniverse(ctx context.Context, conn db.DBInterface, strategy string, cap int, log *slog.Logger) ([]db.EvalMarketMeta, []string, error) {

@@ -70,7 +70,9 @@ func (e *Emitter) Evaluate(now time.Time, strategy string, board BoardSnap, book
 	}
 
 	// Opportunity + cost
-	opportunity, modelEdge, path, fvSrc, fv := opportunityBps(board, mid)
+	// edge.Score stores EdgeBps/ModelEdgeBps as net (after cost). Fair-value path
+	// yields a raw residual vs live mid and must still subtract live cost once.
+	opportunity, modelEdge, path, fvSrc, fv, alreadyNet := opportunityBps(board, mid)
 	probe := cfg.ProbeSizeUSD
 	cost := edge.ComputeCost(edge.CostInput{
 		BestBid:     book.BestBid,
@@ -86,7 +88,14 @@ func (e *Emitter) Evaluate(now time.Time, strategy string, board BoardSnap, book
 		return nil
 	}
 	// Signed net: BUY when residual after cost > 0 (cheap vs FV/edge); SELL when rich.
-	signedNet := opportunity - cost.TotalCostBps - cfg.BufferBps
+	// Board net paths: do not re-subtract live cost (would double-count scan-time costs).
+	// Live cost is still recorded on the signal for microstructure observability.
+	var signedNet float64
+	if alreadyNet {
+		signedNet = opportunity - cfg.BufferBps
+	} else {
+		signedNet = opportunity - cost.TotalCostBps - cfg.BufferBps
+	}
 	var side string
 	if signedNet > cfg.MinEdgeBps {
 		side = SideBuy
@@ -97,7 +106,7 @@ func (e *Emitter) Evaluate(now time.Time, strategy string, board BoardSnap, book
 	}
 	absNet := math.Abs(signedNet)
 
-	// Debounce
+	// Debounce: read-only check. Commit after successful DB insert (see Commit).
 	e.mu.Lock()
 	prev, hasPrev := e.last[board.ConditionID]
 	if hasPrev && cfg.Cooldown > 0 {
@@ -184,13 +193,18 @@ func (e *Emitter) Evaluate(now time.Time, strategy string, board BoardSnap, book
 		fvPtr = fv
 	}
 
+	notes := "board net edge at scan time; live cost observational; paper only"
+	if !alreadyNet {
+		notes = "live residual after cost; paper only"
+	}
 	reason := map[string]any{
 		"gates":         []string{"on_board", "net_edge_gt_min", "book_fresh", "spread_ok"},
 		"min_edge_bps":  cfg.MinEdgeBps,
 		"net_edge_bps":  signedNet,
 		"reissue":       hasPrev,
 		"debounce_sec":  int(cfg.Cooldown.Seconds()),
-		"notes":         "live residual after cost; paper only",
+		"edge_already_net": alreadyNet,
+		"notes":         notes,
 	}
 
 	sig := &PaperSignal{
@@ -243,18 +257,33 @@ func (e *Emitter) Evaluate(now time.Time, strategy string, board BoardSnap, book
 		Tags:              append([]string(nil), board.StrategyTags...),
 		Reason:            reason,
 	}
-
-	e.mu.Lock()
-	e.last[board.ConditionID] = lastEmit{At: now, Side: side, EdgeBps: signedNet, ID: id}
-	e.mu.Unlock()
+	// Debounce state is committed only after successful persistence (Commit).
 	return sig
+}
+
+// Commit records a successfully persisted signal for debounce/cooldown.
+// Call only after InsertSignals (or equivalent) succeeds.
+func (e *Emitter) Commit(sig *PaperSignal) {
+	if e == nil || sig == nil || sig.ConditionID == "" {
+		return
+	}
+	e.mu.Lock()
+	e.last[sig.ConditionID] = lastEmit{
+		At:      sig.Time,
+		Side:    sig.Side,
+		EdgeBps: sig.EdgeBps,
+		ID:      sig.SignalID,
+	}
+	e.mu.Unlock()
 }
 
 func bookOK(b BookSnap) bool {
 	return b.BestBid > 0 && b.BestAsk > 0 && b.BestAsk >= b.BestBid
 }
 
-func opportunityBps(board BoardSnap, mid float64) (opp float64, model *float64, path, fvSrc string, fv *float64) {
+// opportunityBps returns the edge input for netting.
+// alreadyNet=true when the value is edge.Score net (ModelEdgeBps/EdgeBps); false for live FV residual.
+func opportunityBps(board BoardSnap, mid float64) (opp float64, model *float64, path, fvSrc string, fv *float64, alreadyNet bool) {
 	if board.FairValue != nil && mid > 0 {
 		v := *board.FairValue
 		fv = &v
@@ -262,7 +291,7 @@ func opportunityBps(board BoardSnap, mid float64) (opp float64, model *float64, 
 		if fvSrc == "" {
 			fvSrc = "board"
 		}
-		// residual: FV - mid in bps (long YES when FV > mid)
+		// residual: FV - mid in bps (long YES when FV > mid) — gross; caller subtracts live cost
 		opp = (v - mid) * 10_000
 		path = "fair_value"
 		if board.ModelEdgeBps != nil {
@@ -272,22 +301,24 @@ func opportunityBps(board BoardSnap, mid float64) (opp float64, model *float64, 
 			m := opp
 			model = &m
 		}
-		return
+		return opp, model, path, fvSrc, fv, false
 	}
 	if board.ModelEdgeBps != nil {
+		// ModelEdgeBps from edge.Score is already net of cost (+ model buffer on FV path).
 		opp = *board.ModelEdgeBps
 		m := opp
 		model = &m
 		path = "model_edge"
-		return
+		return opp, model, path, "", nil, true
 	}
 	if board.EdgeBps != nil {
+		// EdgeBps from edge.Score is already net of cost.
 		opp = *board.EdgeBps
 		path = "board_edge"
-		return
+		return opp, nil, path, "", nil, true
 	}
 	path = "none"
-	return 0, nil, path, "", nil
+	return 0, nil, path, "", nil, false
 }
 
 func newSignalID() string {

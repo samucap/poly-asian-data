@@ -9,6 +9,7 @@
     "schema_version": { "type": "string", "const": "signal_eval_surface_v1" },
     "run_id": { "type": "string" },
     "ok": { "type": "boolean" },
+    "economic_pass": { "type": "boolean", "description": "total_pnl_usd > 0; not M4 promote_eligible" },
     "purpose": { "type": "string" },
     "config_hash": { "type": "string" },
     "risk": { "type": "object" },

@@ -82,11 +82,6 @@ func ComputeEquityStats(points []EquityPoint, startingEquity, periodsPerYear flo
 	mean, stdev := meanStdev(rets)
 	out.MeanPeriodReturn = mean
 	out.PeriodReturnStdev = stdev
-	if len(rets) < MinHoursForSharpe {
-		out.SharpeNote = "insufficient_periods"
-		out.Sharpe = 0
-		return out
-	}
 	// Near-constant hourly path → mean/stdev explodes under √(24*365) annualization.
 	minStd := 1e-8
 	if abs := math.Abs(mean); abs > 0 {

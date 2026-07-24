@@ -1,4 +1,4 @@
-// Command edge-eval runs bias-aware offline evaluation (M4).
+// Command edge-eval runs bias-aware offline board-policy evaluation.
 //
 // Default mode is DB-only: reads prices_history (+ optional books) and writes
 // artifacts/eval_surface/{run_id}.json. Does not call CLOB in the T-loop.
@@ -15,6 +15,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -26,6 +27,7 @@ import (
 	"github.com/samucap/poly-asian-data/internal/config"
 	"github.com/samucap/poly-asian-data/internal/db"
 	"github.com/samucap/poly-asian-data/internal/edge"
+	"github.com/samucap/poly-asian-data/internal/datagap"
 	"github.com/samucap/poly-asian-data/internal/enrich"
 	"github.com/samucap/poly-asian-data/internal/eval"
 	"github.com/samucap/poly-asian-data/internal/fetcher"
@@ -50,6 +52,12 @@ func main() {
 	weightsFlag := flag.String("weights", "", "strategy weights YAML (default configs/strategies/default.yaml)")
 	versionIDFlag := flag.Int64("version-id", 0, "load board-policy weights from strategy_versions.id (M5)")
 	noBooks := flag.Bool("no-books", false, "prices-only costs (skip orderbook_snapshots load)")
+	synthFill := flag.Bool("synth-fill", false, "dev: interpolate/hold sparse prices + synth books; labeled; blocks promote if share high")
+	synthMaxGap := flag.Duration("synth-max-gap", 48*time.Hour, "max anchor distance for linear price interp")
+	synthHoldMax := flag.Duration("synth-hold-max", 6*time.Hour, "max flat hold from a single price anchor")
+	synthSpreadBps := flag.Float64("synth-default-spread-bps", 50, "full spread bps for synthetic books when no recent book")
+	synthPromoteMax := flag.Float64("synth-promote-max-share", 0.05, "synth share above this blocks promote_eligible")
+	synthSignificant := flag.Float64("synth-significant-share", 0.20, "synth share at/above this is ALERT and ok=false")
 	flag.Parse()
 
 	logging.Init(os.Getenv("ENV"))
@@ -180,18 +188,27 @@ func main() {
 		"use_books", useBooks,
 	)
 
+	synthOpts := datagap.DefaultOpts()
+	synthOpts.MaxGap = *synthMaxGap
+	synthOpts.HoldMax = *synthHoldMax
+	synthOpts.DefaultHalfSpreadBps = *synthSpreadBps
+
 	res, err := eval.RunDBOnly(ctx, eval.RunnerOpts{
-		DB:                dbPool,
-		Logger:            logger,
-		Cfg:               evalCfg,
-		Backtest:          bc,
-		ArtifactsRoot:     *artifactsRoot,
-		Strategy:          *strategy,
-		PersistLabels:     *persistLabels,
-		UseBooks:          &useBooks,
-		WeightsPath:       weightsPath,
-		StrategyVersionID: strategyVersionID,
-		WeightsHash:       weightsHash,
+		DB:                    dbPool,
+		Logger:                logger,
+		Cfg:                   evalCfg,
+		Backtest:              bc,
+		ArtifactsRoot:         *artifactsRoot,
+		Strategy:              *strategy,
+		PersistLabels:         *persistLabels,
+		UseBooks:              &useBooks,
+		WeightsPath:           weightsPath,
+		StrategyVersionID:     strategyVersionID,
+		WeightsHash:           weightsHash,
+		SynthFill:             *synthFill,
+		Synth:                 synthOpts,
+		SynthPromoteMaxShare:  *synthPromoteMax,
+		SynthSignificantShare: *synthSignificant,
 	})
 	if err != nil {
 		logger.Error("edge-eval failed", "error", err)
@@ -217,9 +234,85 @@ func main() {
 		"duration", res.Duration.String(),
 		"artifact", res.Write.LatestPath,
 	)
+	if s != nil {
+		printBoardBacktestSummary(*s, res.Write.LatestPath)
+	}
 	if !*once {
 		// reserved for future continuous mode
 	}
 	// Exit 0 even when ok=false (honest thin sample is success of the tool).
 	// Exit 1 only on hard errors above.
+}
+
+// printBoardBacktestSummary is a one-screen human readout for board-policy backtest.
+// Labels ≠ paper signals; portfolio metrics are backtest path risk, not live P&L.
+func printBoardBacktestSummary(s eval.EvalSurface, artifact string) {
+	o := s.Metrics.Overall
+	var totRet, maxDD, sharpe float64
+	var nPer int
+	if s.Metrics.Portfolio != nil {
+		totRet = s.Metrics.Portfolio.TotalReturnBps
+		maxDD = s.Metrics.Portfolio.MaxDrawdownBps
+		sharpe = s.Metrics.Portfolio.Sharpe
+		nPer = s.Metrics.Portfolio.NPeriods
+	} else {
+		maxDD = o.MaxDrawdownBps
+	}
+	deltaVol := 0.0
+	deltaRnd := 0.0
+	if s.Metrics.DeltaVsBaselines != nil {
+		deltaVol = s.Metrics.DeltaVsBaselines["volume_top_n"]
+		deltaRnd = s.Metrics.DeltaVsBaselines["random_board"]
+	}
+	name := s.StrategyName
+	if name == "" {
+		name = s.WeightsPath
+	}
+	if name == "" {
+		name = "(default weights)"
+	}
+	dqLine := "venue_only"
+	if s.DataQuality != nil {
+		dqLine = fmt.Sprintf("price_synth=%.1f%% book_synth=%.1f%% significant=%v block_promote=%v",
+			100*s.DataQuality.SynthPriceShare, 100*s.DataQuality.SynthBookShare,
+			s.DataQuality.SignificantSynth, s.DataQuality.BlockPromote)
+		if s.DataQuality.Warning != "" {
+			dqLine += "\n  warn: " + s.DataQuality.Warning
+		}
+	}
+	fmt.Fprintf(os.Stdout, `
+======== BOARD-POLICY BACKTEST (edge-eval) ========
+weights:          %s
+labels (n):       %d
+after_cost_bps:   %.2f          # mean label economy after costs
+hit_rate:         %.3f
+total_return_bps: %.2f          # backtest path (~%.2f%%)
+max_dd_bps:       %.2f          # backtest path max drawdown
+sharpe:           %.2f          # backtest path only (not live)
+portfolio_periods:%d
+vs volume_top_n:  %+.2f bps     # delta after_cost vs liquid baseline
+vs random_board:  %+.2f bps
+ok:               %v
+promote_eligible: %v            # false if synth share high
+data_quality:     %s
+book_coverage:    %.2f  fv_coverage: %.2f
+artifact:         %s
+======================================================
+`,
+		name,
+		s.Metrics.N,
+		o.AfterCostReturnBps,
+		o.HitRate,
+		totRet, totRet/100.0,
+		maxDD,
+		sharpe,
+		nPer,
+		deltaVol,
+		deltaRnd,
+		s.OK,
+		s.PromoteEligible,
+		dqLine,
+		s.BookCoverage, s.FVCoverage,
+		artifact,
+	)
 }

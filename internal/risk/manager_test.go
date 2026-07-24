@@ -36,6 +36,52 @@ func TestMaxPositions(t *testing.T) {
 	require.Equal(t, ReasonMaxPositions, d2.Reason)
 }
 
+func TestAlreadyOpenDistinctFromMaxPositions(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxPositions = 10
+	m := NewManager(cfg)
+	now := time.Now().UTC()
+	d1 := m.Accept(SignalInput{Time: now, ConditionID: "a", Side: "BUY", SizeUSD: 50, Conviction: 0.8})
+	require.True(t, d1.Accept)
+	m.OnOpen(Position{ConditionID: "a", Side: "BUY", SizeUSD: d1.SizeUSD, OpenedAt: now})
+	d2 := m.Accept(SignalInput{Time: now, ConditionID: "a", Side: "BUY", SizeUSD: 50, Conviction: 0.8})
+	require.False(t, d2.Accept)
+	require.Equal(t, ReasonAlreadyOpen, d2.Reason)
+}
+
+func TestVolTargetScalesWithPeriodReturns(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SizingMode = SizingVolTarget
+	cfg.VolLookbackPeriods = 24
+	cfg.MaxPositionUSD = 10_000
+	cfg.MaxGrossUSD = 50_000
+	m := NewManager(cfg)
+	now := time.Now().UTC()
+	// High realized vol → scale down
+	for i := 0; i < 20; i++ {
+		if i%2 == 0 {
+			m.RecordPeriodReturn(0.05)
+		} else {
+			m.RecordPeriodReturn(-0.05)
+		}
+	}
+	dVol := m.Accept(SignalInput{
+		Time: now, ConditionID: "v1", Side: "BUY", SizeUSD: 500, Conviction: 1, CapacityUSD: 1e9,
+	})
+	require.True(t, dVol.Accept)
+
+	m2 := NewManager(cfg)
+	// Flat path → scale ~1
+	for i := 0; i < 20; i++ {
+		m2.RecordPeriodReturn(0.0001)
+	}
+	dFlat := m2.Accept(SignalInput{
+		Time: now, ConditionID: "v2", Side: "BUY", SizeUSD: 500, Conviction: 1, CapacityUSD: 1e9,
+	})
+	require.True(t, dFlat.Accept)
+	require.Less(t, dVol.SizeUSD, dFlat.SizeUSD, "high vol should size smaller than near-flat path")
+}
+
 func TestDailyDDHalt(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.MaxDailyDrawdownBps = 100

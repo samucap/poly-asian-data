@@ -54,7 +54,24 @@ type EvalSurface struct {
 	BaselineNotes string `json:"baseline_notes,omitempty"`
 	// PromoteEligible: protocol ok + after_cost > 0 + policy_parity=scan_board_v1.
 	// M5 must promote only when promote_eligible is true.
+	// Forced false when DataQuality.BlockPromote (synthetic share too high).
 	PromoteEligible bool `json:"promote_eligible"`
+	// DataQuality documents venue vs synthetic fill (dev gap-fill). Optional.
+	DataQuality *DataQuality `json:"data_quality,omitempty"`
+}
+
+// DataQuality is eval-time price/book source mix (development synthetic fill).
+type DataQuality struct {
+	PriceSourceMix  map[string]int     `json:"price_source_mix,omitempty"`
+	BookSourceMix   map[string]int     `json:"book_source_mix,omitempty"`
+	SynthPriceShare float64            `json:"synth_price_share"`
+	SynthBookShare  float64            `json:"synth_book_share"`
+	FillMode        string             `json:"fill_mode,omitempty"`
+	SynthMaxGap     string             `json:"synth_max_gap,omitempty"`
+	SynthHoldMax    string             `json:"synth_hold_max,omitempty"`
+	Warning         string             `json:"warning,omitempty"`
+	SignificantSynth bool              `json:"significant_synth"`
+	BlockPromote    bool               `json:"block_promote"`
 }
 
 // ErrorItem mirrors artifacts.ErrorItem without importing cycles.
@@ -277,25 +294,42 @@ func EvaluateGates(s *EvalSurface, cfg GateConfig) {
 		fail(GatePolicyParity, s.PolicyParity+" (need "+PolicyParityScanBoard+")")
 	}
 
+	// Synthetic fill: fail gate when share too high for promote; significant → not OK for real actions.
+	if s.DataQuality != nil && s.DataQuality.BlockPromote {
+		fail(GateSynthShareOK, s.DataQuality.Warning)
+	} else if s.DataQuality != nil && (s.DataQuality.SynthPriceShare > 0 || s.DataQuality.SynthBookShare > 0) {
+		pass(GateSynthShareOK, fmt.Sprintf("price_synth=%.3f book_synth=%.3f under promote cap",
+			s.DataQuality.SynthPriceShare, s.DataQuality.SynthBookShare))
+	}
+
 	s.GatesPassed = passed
 	s.GatesFailed = failed
 	s.OK = len(failed) == 0
+	// Significant synthetic share always blocks "success" for real-action consumers.
+	if s.DataQuality != nil && s.DataQuality.SignificantSynth {
+		s.OK = false
+	}
 
 	// Promote is separate from ok: protocol may pass while after-cost ≤ 0.
-	// Listed in gates_passed/failed for M5 machine readers; does not flip ok.
+	// Hard rule: DataQuality.BlockPromote forces promote_eligible=false.
 	s.PromoteEligible = s.OK &&
 		s.Metrics.Overall.AfterCostReturnBps > 0 &&
 		n >= cfg.MinSample &&
-		s.PolicyParity == PolicyParityScanBoard
+		s.PolicyParity == PolicyParityScanBoard &&
+		(s.DataQuality == nil || !s.DataQuality.BlockPromote)
 	if s.PromoteEligible {
 		s.GatesPassed = append(s.GatesPassed, GatePromoteEligible)
 		s.GateDetails[GatePromoteEligible] = fmt.Sprintf("after_cost_bps=%.2f", s.Metrics.Overall.AfterCostReturnBps)
 	} else {
 		s.GatesFailed = append(s.GatesFailed, GatePromoteEligible)
-		s.GateDetails[GatePromoteEligible] = fmt.Sprintf(
+		detail := fmt.Sprintf(
 			"ok=%v after_cost=%.2f parity=%s n=%d",
 			s.OK, s.Metrics.Overall.AfterCostReturnBps, s.PolicyParity, n,
 		)
+		if s.DataQuality != nil && s.DataQuality.BlockPromote {
+			detail += "; synth_block=true"
+		}
+		s.GateDetails[GatePromoteEligible] = detail
 	}
 
 	if s.OK {

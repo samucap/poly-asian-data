@@ -27,7 +27,9 @@ func NewResolveQueue() *ResolveQueue {
 	return &ResolveQueue{byKey: make(map[string]MarketResolution)}
 }
 
-// Enqueue stores/overwrites one resolution (dedupe by condition or gamma id).
+// Enqueue stores one resolution (dedupe by condition or gamma id).
+// Prefer newer ResolvedAt; on equal time, keep non-empty winner/asset fields.
+// Safe for failed-batch requeue concurrent with a fresher WS event.
 func (q *ResolveQueue) Enqueue(r MarketResolution) {
 	if q == nil {
 		return
@@ -43,8 +45,38 @@ func (q *ResolveQueue) Enqueue(r MarketResolution) {
 		r.ResolvedAt = time.Now().UTC()
 	}
 	q.mu.Lock()
+	defer q.mu.Unlock()
+	if prev, ok := q.byKey[key]; ok {
+		if r.ResolvedAt.Before(prev.ResolvedAt) {
+			// Stale requeue must not overwrite a newer resolution.
+			return
+		}
+		if r.ResolvedAt.Equal(prev.ResolvedAt) {
+			r = mergeResolution(prev, r)
+		}
+	}
 	q.byKey[key] = r
-	q.mu.Unlock()
+}
+
+// mergeResolution prefers non-empty fields from newer (b) over older (a).
+func mergeResolution(a, b MarketResolution) MarketResolution {
+	out := b
+	if out.WinningOutcome == "" {
+		out.WinningOutcome = a.WinningOutcome
+	}
+	if out.WinningAssetID == "" {
+		out.WinningAssetID = a.WinningAssetID
+	}
+	if out.GammaID == "" {
+		out.GammaID = a.GammaID
+	}
+	if out.ConditionID == "" {
+		out.ConditionID = a.ConditionID
+	}
+	if len(out.AssetIDs) == 0 {
+		out.AssetIDs = append([]string(nil), a.AssetIDs...)
+	}
+	return out
 }
 
 // Len returns pending unique resolutions.

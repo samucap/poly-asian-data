@@ -71,6 +71,24 @@ func TestTakeDirtyBatch(t *testing.T) {
 	require.Equal(t, 1, store.DirtyCount())
 }
 
+func TestPeekDirtySurvivesUntilMarkFlushed(t *testing.T) {
+	store := NewBookStore()
+	store.Apply(ParsedEvent{
+		Type: EventBook, AssetID: "a",
+		Bids: []Level{{Price: 0.4, Size: 1}}, Asks: []Level{{Price: 0.6, Size: 1}},
+	})
+	require.Equal(t, 1, store.DirtyCount())
+	peek := store.PeekDirty(10)
+	require.Len(t, peek, 1)
+	// Simulated upsert failure: still dirty
+	require.Equal(t, 1, store.DirtyCount())
+	peek2 := store.PeekDirty(10)
+	require.Len(t, peek2, 1)
+	store.MarkFlushed([]string{"a"})
+	require.Equal(t, 0, store.DirtyCount())
+	require.Empty(t, store.PeekDirty(10))
+}
+
 func TestParseLastTrade(t *testing.T) {
 	raw := []byte(`{
 		"asset_id": "x",
@@ -113,13 +131,40 @@ func TestParseMarketResolved(t *testing.T) {
 
 func TestResolveQueueDedupeAndTake(t *testing.T) {
 	q := NewResolveQueue()
-	q.Enqueue(MarketResolution{ConditionID: "c1", WinningOutcome: "Yes"})
-	q.Enqueue(MarketResolution{ConditionID: "c1", WinningOutcome: "No"}) // overwrite
-	q.Enqueue(MarketResolution{ConditionID: "c2", WinningOutcome: "Yes"})
+	t0 := time.Now().UTC()
+	q.Enqueue(MarketResolution{ConditionID: "c1", WinningOutcome: "Yes", ResolvedAt: t0})
+	q.Enqueue(MarketResolution{ConditionID: "c1", WinningOutcome: "No", ResolvedAt: t0.Add(time.Second)}) // newer wins
+	q.Enqueue(MarketResolution{ConditionID: "c2", WinningOutcome: "Yes", ResolvedAt: t0})
 	require.Equal(t, 2, q.Len())
 	all := q.TakeAll()
 	require.Len(t, all, 2)
 	require.Equal(t, 0, q.Len())
+	var c1 MarketResolution
+	for _, r := range all {
+		if r.ConditionID == "c1" {
+			c1 = r
+		}
+	}
+	require.Equal(t, "No", c1.WinningOutcome)
+}
+
+func TestResolveQueuePrefersNewerOnRequeue(t *testing.T) {
+	q := NewResolveQueue()
+	t0 := time.Now().UTC()
+	q.Enqueue(MarketResolution{ConditionID: "c1", WinningOutcome: "Yes", WinningAssetID: "y", ResolvedAt: t0})
+	// Simulate: drain for failed batch, concurrent newer event, then requeue older
+	batch := q.TakeAll()
+	require.Len(t, batch, 1)
+	q.Enqueue(MarketResolution{
+		ConditionID: "c1", WinningOutcome: "No", WinningAssetID: "n",
+		ResolvedAt: t0.Add(time.Minute), AssetIDs: []string{"n", "y"},
+	})
+	// Stale requeue from failed DB write must not overwrite
+	q.Enqueue(batch[0])
+	all := q.TakeAll()
+	require.Len(t, all, 1)
+	require.Equal(t, "No", all[0].WinningOutcome)
+	require.Equal(t, "n", all[0].WinningAssetID)
 }
 
 func TestRuntimeStatsObserve(t *testing.T) {

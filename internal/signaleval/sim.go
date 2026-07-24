@@ -177,20 +177,8 @@ func Simulate(cfg SimConfig, signals []SignalIn, prices PriceIndex) Result {
 			nOpen++
 		}
 	}
-	nAccepted := 0
-	for _, tr := range trades {
-		_ = tr
-		nAccepted++
-	}
-	// recount accepted from trades len; rejected = n_signals - decisions that weren't accept
-	// Better: nAccepted = len(trades)
-	nAccepted = len(trades)
-	nRejected := len(sigs) - nAccepted
-	if nRejected < 0 {
-		nRejected = 0
-	}
-	// Fix reject count: sum rejectReasons
-	nRejected = 0
+	nAccepted := len(trades)
+	nRejected := 0
 	for _, c := range rejectReasons {
 		nRejected += c
 	}
@@ -281,12 +269,15 @@ func closeTrade(mgr *risk.Manager, tr *Trade, prices PriceIndex, at time.Time, c
 	tr.ExitTime = at
 	tr.PnLUSD = pnl
 	tr.Closed = true
+	eqBefore := mgr.Equity
 	mgr.OnClose(tr.ConditionID, pnl, at)
+	// Feed vol_target lookback (fractional period return on close).
+	if eqBefore > 0 {
+		mgr.RecordPeriodReturn(pnl / eqBefore)
+	}
 	if curve != nil {
 		*curve = append(*curve, EquityPoint{Time: at, Equity: mgr.Equity})
 	}
-	// period return for vol
-	// approximate: pnl/equity_before
 }
 
 func buildSelectionQuality(accE, rejE, accC, rejC []float64) *SelectionQuality {

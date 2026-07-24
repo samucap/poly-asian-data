@@ -18,6 +18,7 @@ const (
 	ReasonHaltedDay    = "halted_day"
 	ReasonHaltedDD     = "halted_dd"
 	ReasonMaxPositions = "max_positions"
+	ReasonAlreadyOpen  = "already_open"
 	ReasonMaxGross     = "max_gross"
 	ReasonSizeZero     = "size_zero"
 	ReasonInvalidSig   = "invalid_signal"
@@ -131,7 +132,7 @@ func (m *Manager) Accept(sig SignalInput) Decision {
 	}
 
 	if _, open := m.Positions[sig.ConditionID]; open {
-		d.Reason = ReasonMaxPositions
+		d.Reason = ReasonAlreadyOpen
 		return d
 	}
 	if len(m.Positions) >= m.Cfg.MaxPositions {

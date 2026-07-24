@@ -209,7 +209,9 @@ func (s *BookStore) changedEnough(b *BookState) bool {
 		math.Abs(b.BestAsk-b.LastFlushBA) >= s.Epsilon
 }
 
-// Snapshot returns a copy of book state for token.
+// Snapshot returns a shallow copy of book state for token (BBA/depth scalars).
+// Bids/Asks map pointers are shared with the store — safe for current top-of-book
+// consumers; do not mutate depth maps off the snapshot under concurrent Apply.
 func (s *BookStore) Snapshot(tokenID string) (BookState, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -221,9 +223,9 @@ func (s *BookStore) Snapshot(tokenID string) (BookState, bool) {
 	return cp, true
 }
 
-// TakeDirty returns dirty books and clears Dirty flags; records last-flush BBA for skip logic.
-// maxN caps batch size (0 = unlimited).
-func (s *BookStore) TakeDirty(maxN int) []BookState {
+// PeekDirty returns up to maxN dirty books without clearing Dirty or last-flush marks.
+// Call MarkFlushed after a successful DB upsert. maxN 0 = unlimited.
+func (s *BookStore) PeekDirty(maxN int) []BookState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []BookState
@@ -236,11 +238,42 @@ func (s *BookStore) TakeDirty(maxN int) []BookState {
 		}
 		cp := *b
 		out = append(out, cp)
+	}
+	return out
+}
+
+// MarkFlushed clears Dirty and advances last-flush BBA for tokens after durable write.
+func (s *BookStore) MarkFlushed(tokenIDs []string) {
+	if s == nil || len(tokenIDs) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range tokenIDs {
+		b := s.books[id]
+		if b == nil {
+			continue
+		}
 		b.Dirty = false
 		b.LastFlushMid = b.Mid()
 		b.LastFlushBB = b.BestBid
 		b.LastFlushBA = b.BestAsk
 	}
+}
+
+// TakeDirty returns dirty books and clears Dirty flags; records last-flush BBA for skip logic.
+// Prefer PeekDirty + MarkFlushed when the write can fail (durable SoR).
+// maxN caps batch size (0 = unlimited).
+func (s *BookStore) TakeDirty(maxN int) []BookState {
+	out := s.PeekDirty(maxN)
+	if len(out) == 0 {
+		return out
+	}
+	ids := make([]string, len(out))
+	for i := range out {
+		ids[i] = out[i].TokenID
+	}
+	s.MarkFlushed(ids)
 	return out
 }
 

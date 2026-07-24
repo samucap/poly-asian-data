@@ -58,13 +58,25 @@ run-edge-scan:
 run-edge-scan-once:
 	go run ./cmd/edge-scan --once $(ARGS)
 
-# M4 edge-eval (DB-only by default; optional --backfill-prices)
+# Board-policy backtest / edge-eval (DB-only by default; optional --backfill-prices)
 #   make run-edge-eval
 #   make run-edge-eval ARGS='--lookback 168h --persist-labels'
 #   make run-edge-eval ARGS='--backfill-prices --lookback 720h'
 #   make run-edge-eval ARGS='--version-id 1'
+#   make backtest-board ARGS='--lookback 168h'   # alias
+# Empty --weights → configs/strategies/default.yaml
 run-edge-eval:
 	go run ./cmd/edge-eval $(ARGS)
+
+# Human alias: board-policy backtest. Not paper $ PnL.
+.PHONY: backtest-board
+backtest-board: run-edge-eval
+
+# Dev: real CLOB price pull + synthetic gap-fill (labeled; blocks promote if synth high).
+#   make backtest-board-dev ARGS='--lookback 168h --weights configs/strategies/balanced_spread_capture.yaml'
+.PHONY: backtest-board-dev
+backtest-board-dev:
+	go run ./cmd/edge-eval --backfill-prices --synth-fill $(ARGS)
 
 # =============================================================================
 # M5 strategy versions (register / promote / rollback)
@@ -132,18 +144,23 @@ test-ws:
 	go test ./internal/ws/market/ ./internal/signals/ ./internal/db/ -count=1 -run 'Cap|Parse|Diff|TakeDirty|Evaluate|BuildFactors|Clean|PriceChange|Book|Subscribe'
 
 # =============================================================================
-# M8 signal-eval (paper risk manager + fill metrics for external AO; no OMS)
+# Paper signal + risk eval (fill metrics for external AO; no OMS)
 #   make build-signal-eval
 #   make run-signal-eval ARGS='--synthetic'
 #   make run-signal-eval ARGS='--lookback 168h --risk configs/risk/default.yaml'
+#   make backtest-paper ARGS='--synthetic'   # alias
 #   make test-signal-eval
 # =============================================================================
 build-signal-eval:
-	@echo "Building signal-eval (M8)..."
+	@echo "Building signal-eval..."
 	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/signal-eval ./cmd/signal-eval
 
 run-signal-eval:
 	go run ./cmd/signal-eval $(ARGS)
+
+# Human alias: paper signals + risk sim. $ PnL / MaxDD.
+.PHONY: backtest-paper
+backtest-paper: run-signal-eval
 
 test-signal-eval:
 	go test ./internal/risk/ ./internal/signaleval/ -count=1

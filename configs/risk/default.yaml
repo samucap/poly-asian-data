@@ -18,4 +18,4 @@ daily_halt_policy: reject_new
 min_size_usd: 1
 opportunity_edge_weight: 1.0
 opportunity_conviction_weight: 1.0
-batch_window_ms: 0               # >0 ranks simultaneous signals by opportunity
+batch_window_ms: 500             # >0 ranks simultaneous signals by opportunity; 0 = time order

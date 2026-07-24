@@ -49,8 +49,53 @@ func TestEvaluateDebounce(t *testing.T) {
 	book := BookSnap{BestBid: 0.48, BestAsk: 0.50, Mid: 0.49, BidDepth: 100, AskDepth: 100, UpdatedAt: now}
 	s1 := e.Evaluate(now, "default", board, book)
 	require.NotNil(t, s1)
-	s2 := e.Evaluate(now.Add(time.Second), "default", board, book)
+	// Without Commit, second evaluate may re-emit (debounce only after persist).
+	sRe := e.Evaluate(now.Add(time.Second), "default", board, book)
+	require.NotNil(t, sRe)
+	e.Commit(s1)
+	s2 := e.Evaluate(now.Add(2*time.Second), "default", board, book)
 	require.Nil(t, s2)
+}
+
+func TestEvaluate_BoardEdgeAlreadyNet_NoDoubleCost(t *testing.T) {
+	cfg := DefaultGateConfig()
+	cfg.Cooldown = 0
+	cfg.BufferBps = 0
+	cfg.MinEdgeBps = 0
+	e := NewEmitter(cfg)
+	now := time.Now().UTC()
+	// Board EdgeBps is already net (edge.Score). Live cost on this book is large;
+	// if double-counted, net would collapse below MinEdgeBps / flip sign.
+	netBoard := 80.0
+	board := BoardSnap{ConditionID: "c1", TokenID: "t1", EdgeBps: &netBoard, CapacityUSD: ptr(1e9)}
+	// ~200 bps half-spread alone (0.49/0.51 mid 0.50 → 400 bps full spread)
+	book := BookSnap{BestBid: 0.49, BestAsk: 0.51, Mid: 0.50, BidDepth: 1e6, AskDepth: 1e6, UpdatedAt: now}
+	sig := e.Evaluate(now, "default", board, book)
+	require.NotNil(t, sig)
+	require.InDelta(t, netBoard, sig.EdgeBps, 1e-6, "board net must not re-subtract live cost")
+	require.Equal(t, "board_edge", sig.ScorePath)
+	require.Greater(t, sig.CostBps, 0.0, "live cost still recorded observationally")
+}
+
+func TestEvaluate_FairValue_SubtractsLiveCost(t *testing.T) {
+	cfg := DefaultGateConfig()
+	cfg.Cooldown = 0
+	cfg.BufferBps = 0
+	cfg.MinEdgeBps = 0
+	cfg.DefaultFeeBps = 0
+	e := NewEmitter(cfg)
+	now := time.Now().UTC()
+	fv := 0.55
+	// residual = (0.55-0.50)*10000 = 500 bps gross
+	board := BoardSnap{ConditionID: "c1", TokenID: "t1", FairValue: &fv, CapacityUSD: ptr(1e9)}
+	book := BookSnap{BestBid: 0.49, BestAsk: 0.51, Mid: 0.50, BidDepth: 1e6, AskDepth: 1e6, UpdatedAt: now}
+	sig := e.Evaluate(now, "default", board, book)
+	require.NotNil(t, sig)
+	require.Equal(t, "fair_value", sig.ScorePath)
+	// half-spread = 200 bps; with zero fee/impact approx net = 500 - 200 = 300
+	require.Less(t, sig.EdgeBps, 500.0)
+	require.Greater(t, sig.EdgeBps, 0.0)
+	require.InDelta(t, 500-sig.CostBps, sig.EdgeBps, 1e-6)
 }
 
 func TestEvaluateRejectsWideSpread(t *testing.T) {

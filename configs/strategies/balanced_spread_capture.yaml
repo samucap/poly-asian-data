@@ -1,0 +1,49 @@
+# Board-policy experiment: balanced_spread_capture
+#
+# Objective: rank markets where after-cost edge is more likely to survive —
+# tighter microstructure, book imbalance/neg-risk structure, less pure vol chase.
+# Cost stack (half-spread + impact) still dominates ranking via edge_bps = opp − cost.
+#
+# This is NOT live until: edge-eval → register → promote_eligible → promote.
+# Backtest: make backtest-board ARGS='--lookback 168h --weights configs/strategies/balanced_spread_capture.yaml'
+name: balanced_spread_capture
+
+# Opportunity family mix (relative; sums to 1.0)
+# Lower vol (noise/wide books); higher imbalance + neg_risk structural residual.
+w_vol: 0.15
+w_oi: 0.15
+w_imbalance: 0.25
+w_ttr: 0.10
+w_neg_risk: 0.20
+w_flow: 0.05
+w_activity: 0.10
+
+# Cost defaults — slightly more conservative than default (favor fillable clips)
+default_taker_fee_bps: 0
+impact_cap_bps: 20
+impact_coeff: 60
+probe_size_usd: 50
+model_buffer_bps: 25
+
+# Quality gates — fresher books, need depth, drop missing books, flag wider spreads earlier
+max_feature_age_sec: 180
+max_book_age_sec: 120
+wide_spread_bps: 150
+min_depth_shares: 25
+drop_missing_book: true
+stale_penalty_bps: 75
+
+# Vol / OI scaling — damp pure vol family into opportunity
+vol_scale: 0.7
+vol_cap_bps: 300
+oi_scale: 100
+oi_cap_bps: 180
+
+# Fair value — keep complement path; slightly pickier confidence; avoid lottery tails
+fv_enabled: true
+fv_min_confidence: 0.45
+fv_min_other_legs: 1
+drop_extreme_price: true
+extreme_lo: 0.08
+extreme_hi: 0.92
+group_expand_cap: 100

@@ -122,7 +122,21 @@
     },
     "strategy_version_id": { "type": ["integer", "null"] },
     "strategy_name": { "type": "string" },
-    "errors": { "type": "array" }
+    "errors": { "type": "array" },
+    "data_quality": {
+      "type": "object",
+      "description": "Venue vs development synthetic fill mix; significant_synth / block_promote prevent real actions",
+      "properties": {
+        "price_source_mix": { "type": "object" },
+        "book_source_mix": { "type": "object" },
+        "synth_price_share": { "type": "number" },
+        "synth_book_share": { "type": "number" },
+        "fill_mode": { "type": "string" },
+        "warning": { "type": "string" },
+        "significant_synth": { "type": "boolean" },
+        "block_promote": { "type": "boolean" }
+      }
+    }
   },
   "additionalProperties": true
 }

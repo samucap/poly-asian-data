@@ -1,6 +1,6 @@
-// Command signal-eval runs M8 paper portfolio risk + fill simulation.
+// Command signal-eval runs paper portfolio risk + fill simulation.
 // Scores signals + deciding logic for an external auto-optimizer.
-// No live orders (OMS). Not M4 board eval / promote_eligible.
+// No live orders (OMS). Not board-policy edge-eval / promote_eligible.
 package main
 
 import (
@@ -138,6 +138,7 @@ func main() {
 
 	summary, _ := json.Marshal(map[string]any{
 		"ok":                     surf.OK,
+		"economic_pass":          surf.EconomicPass,
 		"n_signals":              res.Metrics.NSignals,
 		"n_accepted":             res.Metrics.NAccepted,
 		"n_rejected":             res.Metrics.NRejectedRisk,
@@ -154,6 +155,28 @@ func main() {
 		"path":                   wr.LatestPath,
 	})
 	fmt.Println(string(summary))
+	fmt.Fprintf(os.Stdout, `
+======== PAPER SIGNAL + RISK BACKTEST (signal-eval) ========
+signals:          %d  accepted: %d  rejected_risk: %d
+hit_rate:         %.3f
+total_pnl_usd:    %.2f
+total_return_bps: %.2f          # (~%.2f%% on starting equity)
+max_dd_bps:       %.2f
+sharpe:           %.2f  note=%s  # paper sim path
+ok:               %v            # protocol/sample only
+economic_pass:    %v            # total_pnl_usd > 0
+artifact:         %s
+===============================================================
+`,
+		res.Metrics.NSignals, res.Metrics.NAccepted, res.Metrics.NRejectedRisk,
+		res.Metrics.HitRate,
+		res.Metrics.TotalPnLUSD,
+		res.Metrics.TotalReturnBps, res.Metrics.TotalReturnBps/100.0,
+		res.Metrics.MaxDrawdownBps,
+		res.Metrics.Sharpe, res.Metrics.SharpeNote,
+		surf.OK, surf.EconomicPass,
+		wr.LatestPath,
+	)
 	if !surf.OK {
 		os.Exit(2)
 	}

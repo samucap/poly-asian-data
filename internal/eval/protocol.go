@@ -78,6 +78,8 @@ const (
 	GatePromoteEligible = "promote_eligible"
 	// GatePolicyParity: candidate uses edge.SelectBoard (scan_board_v1)
 	GatePolicyParity = "policy_parity"
+	// GateSynthShareOK: synthetic fill share below promote threshold
+	GateSynthShareOK = "synth_share_ok"
 )
 
 // DefaultMinSample is the minimum labeled decisions for promote-eligible overall metrics.

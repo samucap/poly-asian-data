@@ -64,7 +64,9 @@ func DefaultConfig() Config {
 		MinSizeUSD:                  1,
 		OpportunityEdgeWeight:       1.0,
 		OpportunityConvictionWeight: 1.0,
-		BatchWindowMs:               0,
+		// >0 ranks near-simultaneous signals by opportunity when budget is scarce.
+		// 0 = strict time order (no re-rank).
+		BatchWindowMs: 500,
 	}
 }
 

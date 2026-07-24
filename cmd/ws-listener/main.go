@@ -122,6 +122,30 @@ func main() {
 			resolveQ.Enqueue(r)
 			stats.AddResolveQueued(1)
 
+			// If WS omitted asset IDs, resolve tokens from board meta.
+			if len(r.AssetIDs) == 0 && r.ConditionID != "" {
+				boardMu.RLock()
+				bm := boardMeta
+				boardMu.RUnlock()
+				if bm != nil {
+					if m, ok := bm.ByCondition[r.ConditionID]; ok {
+						r.AssetIDs = append([]string(nil), m.TokenIDs...)
+						if m.PrimaryTokenID != "" {
+							found := false
+							for _, a := range r.AssetIDs {
+								if a == m.PrimaryTokenID {
+									found = true
+									break
+								}
+							}
+							if !found {
+								r.AssetIDs = append(r.AssetIDs, m.PrimaryTokenID)
+							}
+						}
+					}
+				}
+			}
+
 			resolvedMu.Lock()
 			if r.ConditionID != "" {
 				resolvedConds[r.ConditionID] = struct{}{}
@@ -165,8 +189,25 @@ func main() {
 				logger.Warn("load board assets", "error", err)
 				return
 			}
-			// Filter resolved assets out of subscribe set
-			resolvedMu.RLock()
+			// Filter resolved assets out of subscribe set; prune maps for markets
+			// no longer on the board (bounded memory for long-running listeners).
+			boardTok := make(map[string]struct{}, len(set.TokenIDs))
+			for _, tid := range set.TokenIDs {
+				boardTok[tid] = struct{}{}
+			}
+			resolvedMu.Lock()
+			for c := range resolvedConds {
+				if _, ok := set.ByCondition[c]; !ok {
+					delete(resolvedConds, c)
+				}
+			}
+			for a := range resolvedAssets {
+				if _, ok := boardTok[a]; !ok {
+					if _, ok2 := set.ByToken[a]; !ok2 {
+						delete(resolvedAssets, a)
+					}
+				}
+			}
 			filtered := make([]string, 0, len(set.TokenIDs))
 			for _, tid := range set.TokenIDs {
 				if _, bad := resolvedAssets[tid]; bad {
@@ -174,7 +215,6 @@ func main() {
 				}
 				filtered = append(filtered, tid)
 			}
-			// Also drop primaries whose condition resolved
 			var primaries []db.BoardAssetMeta
 			for _, p := range set.Primaries {
 				if _, bad := resolvedConds[p.ConditionID]; bad {
@@ -182,7 +222,7 @@ func main() {
 				}
 				primaries = append(primaries, p)
 			}
-			resolvedMu.RUnlock()
+			resolvedMu.Unlock()
 
 			set.TokenIDs = filtered
 			set.Primaries = primaries
@@ -227,11 +267,13 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				dirty := store.TakeDirty(100)
+				// Peek then mark flushed only after successful upsert (durable SoR).
+				dirty := store.PeekDirty(100)
 				if len(dirty) == 0 {
 					continue
 				}
 				rows := make([]db.FeaturesLatestRow, 0, len(dirty))
+				ids := make([]string, 0, len(dirty))
 				now := time.Now().UTC()
 				boardMu.RLock()
 				bm := boardMeta
@@ -253,11 +295,13 @@ func main() {
 						Imbalance: b.Imbalance, BidDepth: b.BidDepth, AskDepth: b.AskDepth,
 						UpdatedAt: pickTime(b.UpdatedAt, now),
 					})
+					ids = append(ids, b.TokenID)
 				}
 				if err := db.UpsertFeaturesLatest(ctx, pool, rows); err != nil {
 					logger.Warn("flush features_latest", "error", err, "n", len(rows))
 					continue
 				}
+				store.MarkFlushed(ids)
 				stats.AddFeatFlush(len(rows))
 			}
 		}
@@ -406,7 +450,15 @@ func main() {
 				}
 				if err := db.InsertSignals(ctx, pool, out); err != nil {
 					logger.Warn("insert signals", "error", err, "n", len(out))
+					// Do not Commit — allow re-emit on next interval after transient DB failure.
 					continue
+				}
+				// Debounce only after durable insert.
+				for _, row := range out {
+					emitter.Commit(&signals.PaperSignal{
+						Time: row.Time, SignalID: row.SignalID, ConditionID: row.ConditionID,
+						Side: row.Side, EdgeBps: row.EdgeBps,
+					})
 				}
 				stats.AddSignals(len(out))
 				// No per-batch Info spam — status line carries aggregates
