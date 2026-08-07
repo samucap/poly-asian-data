@@ -6,7 +6,7 @@ DOCKER_COMPOSE_POSTGRES=docker-compose.postgres.yml
 DOCKER_COMPOSE_APP=docker-compose.app.yml
 MAIN_PATH=cmd/main.go
 
-.PHONY: all build build-catalog build-top-markets build-edge-scan build-edge-eval build-strategy build-ws-listener build-signal-eval clean test coverage lint run run-catalog-markets run-catalog-markets-once run-edge-scan run-edge-scan-once run-edge-eval run-strategy run-strategy-register run-strategy-list run-strategy-active run-strategy-show run-strategy-promote run-strategy-rollback run-strategy-candidate run-ws-listener run-signal-eval test-eval test-strategy test-ws test-signal-eval edge-board-top edge-board-verify edge-scan-once-top edge-scan-top edge-scan-verify dev audit sec docker-up docker-down db-up db-down app-up app-down
+.PHONY: all build build-catalog build-top-markets build-edge-scan build-edge-eval build-strategy build-ws-listener build-signal-eval clean test coverage lint run run-catalog-markets run-catalog-markets-once run-edge-scan run-edge-scan-once run-edge-eval run-strategy run-strategy-register run-strategy-list run-strategy-active run-strategy-show run-strategy-promote run-strategy-rollback run-strategy-candidate run-ws-listener run-signal-eval test-eval test-strategy test-ws test-signal-eval edge-board-top edge-board-verify edge-scan-once-top edge-scan-top edge-scan-verify scorecard-freeze scorecard-list scorecard-show dev audit sec docker-up docker-down db-up db-down app-up app-down
 
 all: build
 
@@ -164,6 +164,36 @@ backtest-paper: run-signal-eval
 
 test-signal-eval:
 	go test ./internal/risk/ ./internal/signaleval/ -count=1
+
+# =============================================================================
+# Scorecard freezes — immutable backtest result checkpoints (research progress)
+#
+# After run-edge-eval + run-signal-eval:
+#   make scorecard-freeze                    # auto title/summary; no NOTE required
+#   make scorecard-freeze LABEL=after-d2     # optional tag only
+#   make scorecard-list / scorecard-show
+#
+# Dir name uses LOCAL time by default (e.g. 2026-08-06T202748), not UTC 03:xxZ.
+# Manifest auto_title / auto_summary / vs_previous / verdicts — no manual interpretation.
+#
+# "Scorecard" = economic result of a backtest (not live logs; not volume baselines).
+# =============================================================================
+LABEL ?=
+NOTE ?=
+BOARD_EVAL ?= artifacts/eval_surface/latest.json
+PAPER_EVAL ?= artifacts/signal_eval_surface/latest.json
+
+scorecard-freeze:
+	@LABEL="$(LABEL)" NOTE="$(NOTE)" BOARD="$(BOARD_EVAL)" PAPER="$(PAPER_EVAL)" \
+		./scripts/freeze_scorecards.sh
+
+scorecard-list:
+	@ls -1 artifacts/scorecards 2>/dev/null | grep -E '^[0-9]{4}-' || echo "(none yet — make scorecard-freeze)"
+
+# Show auto summary for latest freeze (or SCORECARD=dir name)
+SCORECARD ?=
+scorecard-show:
+	@./scripts/show_scorecard.sh "$(SCORECARD)"
 
 # Explain top N markets from artifacts/edge_board/latest.json (no DB required)
 # Usage: make edge-board-top
