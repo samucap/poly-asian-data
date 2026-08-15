@@ -52,3 +52,49 @@ func MidAsOf(points []PricePoint, t time.Time) float64 {
 	}
 	return best
 }
+
+// SpotCheck is M2 hygiene: signal mid vs price series as-of T.
+type SpotCheck struct {
+	SignalID     string  `json:"signal_id"`
+	ConditionID  string  `json:"condition_id"`
+	SignalMid    float64 `json:"signal_mid"`
+	SeriesMid    float64 `json:"series_mid"`
+	CostBps      float64 `json:"cost_bps"`
+	OK           bool    `json:"ok"`
+	Detail       string  `json:"detail,omitempty"`
+}
+
+// SpotCheckFills compares the first n signals' mids to the price index (join sanity).
+func SpotCheckFills(sigs []SignalIn, prices PriceIndex, n int) []SpotCheck {
+	if n <= 0 {
+		n = 2
+	}
+	if n > len(sigs) {
+		n = len(sigs)
+	}
+	out := make([]SpotCheck, 0, n)
+	for i := 0; i < n; i++ {
+		s := sigs[i]
+		sc := SpotCheck{SignalID: s.SignalID, ConditionID: s.ConditionID, SignalMid: s.Mid, CostBps: s.CostBps}
+		sc.SeriesMid = MidAsOf(prices[s.TokenID], s.Time)
+		switch {
+		case s.Mid <= 0 && sc.SeriesMid <= 0:
+			sc.OK = false
+			sc.Detail = "no mid on signal or series"
+		case s.Mid <= 0 && sc.SeriesMid > 0:
+			sc.OK = true
+			sc.Detail = "signal mid empty; series has mid (eval uses series)"
+		case sc.SeriesMid <= 0:
+			sc.OK = true
+			sc.Detail = "no series point at T; eval uses signal mid"
+		default:
+			rel := math.Abs(s.Mid-sc.SeriesMid) / sc.SeriesMid
+			sc.OK = rel < 0.05
+			if !sc.OK {
+				sc.Detail = "signal mid vs series mid disagree >5%"
+			}
+		}
+		out = append(out, sc)
+	}
+	return out
+}

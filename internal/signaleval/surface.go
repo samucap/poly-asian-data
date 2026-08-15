@@ -31,9 +31,13 @@ type Surface struct {
 
 // WindowMeta documents the eval window.
 type WindowMeta struct {
-	From     string `json:"from,omitempty"`
-	To       string `json:"to,omitempty"`
-	NSignals int    `json:"n_signals"`
+	From        string `json:"from,omitempty"`
+	To          string `json:"to,omitempty"`
+	NSignals    int    `json:"n_signals"`
+	NSignalsDB  int    `json:"n_signals_db,omitempty"`
+	LoadLimit   int    `json:"load_limit,omitempty"`
+	Capped      bool   `json:"capped,omitempty"`
+	Worthiness  string `json:"worthiness_filter,omitempty"`
 }
 
 // FillModelDoc documents paper fill assumptions.
@@ -70,7 +74,7 @@ func BuildSurface(runID, strategy string, res Result, from, to time.Time, minSam
 			Exit:  "mid_at_horizon",
 			Notes: "paper only",
 		},
-		Notes: "Hard risk constraints first; opportunity ranking allocates scarce budget. Strategy research is external. Do not treat ok as economic success — use economic_pass and metrics.",
+		Notes: "Hard risk constraints first. When auction_enabled, alloc_window ranks the set (outranked ≠ halt). Do not treat ok as economic success — use economic_pass and metrics. Tune from scorecards only (not live edge_bps).",
 	}
 	s.EconomicPass = res.Metrics.TotalPnLUSD > 0
 	if !from.IsZero() {
@@ -99,4 +103,19 @@ func BuildSurface(runID, strategy string, res Result, from, to time.Time, minSam
 		s.Status = "partial"
 	}
 	return s
+}
+
+// ApplyLoadMeta records D5 cap honesty on the window.
+func (s *Surface) ApplyLoadMeta(loaded, dbCount, limit int, capped bool, worthiness string) {
+	if s == nil {
+		return
+	}
+	s.Window.NSignals = loaded
+	s.Window.NSignalsDB = dbCount
+	s.Window.LoadLimit = limit
+	s.Window.Capped = capped
+	s.Window.Worthiness = worthiness
+	if capped {
+		s.Notes += " signal load capped; scorecard is a slice of the window, not the full population."
+	}
 }

@@ -225,7 +225,8 @@ func main() {
 		"after_cost_bps", s.Metrics.Overall.AfterCostReturnBps,
 		"policy", s.PolicyID,
 		"fv_coverage", s.FVCoverage,
-		"book_coverage", s.BookCoverage,
+		"book_coverage_board", s.BookCoverageBoard,
+		"book_coverage_universe", s.BookCoverageUniverse,
 		"weights_hash", s.WeightsHash,
 		"strategy_version_id", s.StrategyVersionID,
 		"gates_failed", s.GatesFailed,
@@ -295,7 +296,7 @@ vs random_board:  %+.2f bps
 ok:               %v
 promote_eligible: %v            # false if synth share high
 data_quality:     %s
-book_coverage:    %.2f  fv_coverage: %.2f
+book_coverage:    %.2f  (board)  universe: %.2f  fv_coverage: %.2f
 artifact:         %s
 ======================================================
 `,
@@ -312,7 +313,7 @@ artifact:         %s
 		s.OK,
 		s.PromoteEligible,
 		dqLine,
-		s.BookCoverage, s.FVCoverage,
+		s.BookCoverageBoard, s.BookCoverageUniverse, s.FVCoverage,
 		artifact,
 	)
 }

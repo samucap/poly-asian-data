@@ -16,7 +16,8 @@ type SimConfig struct {
 }
 
 // Simulate runs risk decisions + paper fills on signals in time order.
-// When BatchWindowMs > 0, signals in a window are ranked by opportunity before Accept.
+// AuctionEnabled: bucket by AllocWindowSec, dedupe, rank, Accept top-K; rest outranked.
+// Else if BatchWindowMs > 0: rank only that burst, then sequential Accept (legacy).
 func Simulate(cfg SimConfig, signals []SignalIn, prices PriceIndex) Result {
 	rcfg := cfg.Risk
 	rcfg.Normalize()
@@ -112,21 +113,19 @@ func Simulate(cfg SimConfig, signals []SignalIn, prices PriceIndex) Result {
 		equityCurve = append(equityCurve, EquityPoint{Time: sig.Time, Equity: mgr.Equity})
 	}
 
-	// Batch window processing
-	win := time.Duration(rcfg.BatchWindowMs) * time.Millisecond
-	i := 0
-	for i < len(sigs) {
-		if win <= 0 {
-			processOne(sigs[i])
-			i++
-			continue
+	auctionOn := rcfg.AuctionEnabled
+	allocWin := time.Duration(rcfg.AllocWindowSec) * time.Second
+	if auctionOn && allocWin <= 0 {
+		allocWin = 60 * time.Second
+	}
+	burstWin := time.Duration(rcfg.BatchWindowMs) * time.Millisecond
+
+	rankAndProcess := func(batch []SignalIn, outrankRest bool) {
+		if len(batch) == 0 {
+			return
 		}
-		// collect batch
-		start := sigs[i].Time
-		var batch []SignalIn
-		for i < len(sigs) && !sigs[i].Time.After(start.Add(win)) {
-			batch = append(batch, sigs[i])
-			i++
+		if rcfg.AuctionDedupe == "condition" || (auctionOn && rcfg.AuctionDedupe == "") {
+			batch = dedupeBestPerCondition(rcfg, batch)
 		}
 		edges := make([]float64, len(batch))
 		convs := make([]float64, len(batch))
@@ -137,9 +136,48 @@ func Simulate(cfg SimConfig, signals []SignalIn, prices PriceIndex) Result {
 			urgs[j] = s.Urgency
 		}
 		order := risk.BuildRankOrder(rcfg, edges, convs, urgs)
+		if !outrankRest {
+			for _, j := range order {
+				processOne(batch[j])
+			}
+			return
+		}
+		// Offer in rank order; once this window's budget is gone, remaining are outranked.
 		for _, j := range order {
+			if auctionBudgetBound(mgr) {
+				rejectReasons[risk.ReasonOutranked]++
+				rejectedBudgetEdges = append(rejectedBudgetEdges, math.Abs(batch[j].EdgeBps))
+				rejectedBudgetConv = append(rejectedBudgetConv, batch[j].Conviction)
+				continue
+			}
 			processOne(batch[j])
 		}
+	}
+
+	i := 0
+	for i < len(sigs) {
+		if auctionOn {
+			start := sigs[i].Time
+			var batch []SignalIn
+			for i < len(sigs) && !sigs[i].Time.After(start.Add(allocWin)) {
+				batch = append(batch, sigs[i])
+				i++
+			}
+			rankAndProcess(batch, true)
+			continue
+		}
+		if burstWin <= 0 {
+			processOne(sigs[i])
+			i++
+			continue
+		}
+		start := sigs[i].Time
+		var batch []SignalIn
+		for i < len(sigs) && !sigs[i].Time.After(start.Add(burstWin)) {
+			batch = append(batch, sigs[i])
+			i++
+		}
+		rankAndProcess(batch, false)
 	}
 
 	// Final time: close remaining at last known price
@@ -218,6 +256,47 @@ func Simulate(cfg SimConfig, signals []SignalIn, prices PriceIndex) Result {
 		RiskCfg:     rcfg,
 		ConfigHash:  risk.ConfigHash(rcfg),
 	}
+}
+
+func auctionBudgetBound(mgr *risk.Manager) bool {
+	if mgr == nil || mgr.State != risk.StateOK {
+		return false
+	}
+	if len(mgr.Positions) >= mgr.Cfg.MaxPositions {
+		return true
+	}
+	return mgr.Cfg.MaxGrossUSD-mgr.GrossExposure() < mgr.Cfg.MinSizeUSD
+}
+
+func dedupeBestPerCondition(cfg risk.Config, batch []SignalIn) []SignalIn {
+	best := map[string]int{}
+	for i, s := range batch {
+		id := s.ConditionID
+		if id == "" {
+			id = s.TokenID
+		}
+		prev, ok := best[id]
+		if !ok {
+			best[id] = i
+			continue
+		}
+		cur := risk.OpportunityScore(cfg, s.EdgeBps, s.Conviction, s.Urgency)
+		old := risk.OpportunityScore(cfg, batch[prev].EdgeBps, batch[prev].Conviction, batch[prev].Urgency)
+		if cur > old {
+			best[id] = i
+		}
+	}
+	out := make([]SignalIn, 0, len(best))
+	seen := map[int]struct{}{}
+	for _, idx := range best {
+		seen[idx] = struct{}{}
+	}
+	for i, s := range batch {
+		if _, ok := seen[i]; ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func closeDue(mgr *risk.Manager, trades *[]Trade, openByCond map[string]int, prices PriceIndex, now time.Time, curve *[]EquityPoint) {

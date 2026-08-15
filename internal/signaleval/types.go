@@ -28,6 +28,9 @@ type SignalIn struct {
 	Mid               float64
 	HorizonSec        int
 	KellyFrac         *float64
+	SpreadBps         float64
+	FVSource          string
+	ScorePath         string
 }
 
 // PriceIndex maps token_id → sorted (time, mid) points for exit/MTM.

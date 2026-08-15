@@ -22,6 +22,7 @@ const (
 	ReasonMaxGross     = "max_gross"
 	ReasonSizeZero     = "size_zero"
 	ReasonInvalidSig   = "invalid_signal"
+	ReasonOutranked    = "outranked"
 )
 
 // SignalInput is the subset of a paper signal the risk manager needs.

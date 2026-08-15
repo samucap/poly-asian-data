@@ -18,4 +18,8 @@ daily_halt_policy: reject_new
 min_size_usd: 1
 opportunity_edge_weight: 1.0
 opportunity_conviction_weight: 1.0
-batch_window_ms: 500             # >0 ranks simultaneous signals by opportunity; 0 = time order
+batch_window_ms: 500             # burst reorder when auction_enabled is false
+auction_enabled: true            # windowed top-K vs first-to-fire
+alloc_window_sec: 60             # auction bucket; 0 with auction on uses 60s
+auction_dedupe: condition        # keep best opportunity per condition_id
+replace_delta: 0                 # 0 = do not kick weaker open names (follow-up)

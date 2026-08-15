@@ -139,10 +139,10 @@ type GateConfig struct {
 // DefaultGateConfig returns sensible M6 defaults.
 func DefaultGateConfig() GateConfig {
 	return GateConfig{
-		MinEdgeBps:      0,
-		MaxSpreadBps:    500,
+		MinEdgeBps:      25,
+		MaxSpreadBps:    500, // PM mids are often 200–400 bp wide; tighten via signal-eval replay first
 		MaxBookAge:      30 * time.Second,
-		Cooldown:        60 * time.Second,
+		Cooldown:        10 * time.Minute,
 		ReissueDeltaBps: 50,
 		ProbeSizeUSD:    25,
 		CapacityFrac:    0.1,

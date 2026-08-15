@@ -34,6 +34,11 @@ func main() {
 	synthetic := flag.Bool("synthetic", false, "use built-in fixture (no DB signals required)")
 	minSample := flag.Int("min-sample", 3, "min signals for ok gate")
 	startingEquity := flag.Float64("starting-equity", 0, "override risk starting_equity_usd (0=config)")
+	limit := flag.Int("limit", db.DefaultSignalLoadLimit, "max signals to load (0=unlimited; default 50000)")
+	minEdgeBps := flag.Float64("min-edge-bps", 0, "replay worthiness: drop |edge_bps| below this")
+	maxSpreadBps := flag.Float64("max-spread-bps", 0, "replay worthiness: drop spread_bps above this (0=off)")
+	requireFV := flag.Bool("require-fv", false, "replay worthiness: keep only FV-path intents")
+	spotN := flag.Int("spot-check", 0, "M2: print N signal mid vs price-series checks (0=off)")
 	flag.Parse()
 
 	logging.Init(os.Getenv("ENV"))
@@ -50,9 +55,10 @@ func main() {
 	rcfg.Normalize()
 
 	var (
-		sigs    []signaleval.SignalIn
-		prices  signaleval.PriceIndex
+		sigs     []signaleval.SignalIn
+		prices   signaleval.PriceIndex
 		from, to time.Time
+		loadMeta db.SignalLoadMeta
 	)
 
 	if *synthetic {
@@ -101,9 +107,18 @@ func main() {
 			From:     from,
 			To:       to,
 		}
+		if *limit == 0 {
+			fil.Limit = -1
+		} else {
+			fil.Limit = *limit
+		}
 		if *versionID > 0 {
 			v := *versionID
 			fil.StrategyVersionID = &v
+		}
+		dbCount, err := db.CountSignals(ctx, pool, fil)
+		if err != nil {
+			logger.Warn("count signals", "error", err)
 		}
 		rows, err := db.LoadSignals(ctx, pool, fil)
 		if err != nil {
@@ -121,12 +136,38 @@ func main() {
 				prices = priceIndexFromDB(series)
 			}
 		}
-		logger.Info("loaded signals", "n", len(sigs), "tokens", len(toks))
+		applied := fil.Limit
+		if applied == 0 {
+			applied = db.DefaultSignalLoadLimit
+		}
+		loadMeta = db.SignalLoadMetaFrom(len(sigs), dbCount, applied)
+		logger.Info("loaded signals", "n", len(sigs), "n_db", dbCount, "limit", applied, "capped", loadMeta.Capped, "tokens", len(toks))
+	}
+
+	wf := signaleval.WorthinessFilter{
+		MinEdgeBps: *minEdgeBps, MaxSpreadBps: *maxSpreadBps, RequireFV: *requireFV,
+	}
+	beforeW := len(sigs)
+	sigs = signaleval.ApplyWorthiness(sigs, wf)
+	if beforeW != len(sigs) {
+		logger.Info("worthiness filter", "before", beforeW, "after", len(sigs), "min_edge_bps", *minEdgeBps, "max_spread_bps", *maxSpreadBps, "require_fv", *requireFV)
+	}
+
+	if *spotN > 0 {
+		checks := signaleval.SpotCheckFills(sigs, prices, *spotN)
+		raw, _ := json.Marshal(map[string]any{"spot_checks": checks})
+		fmt.Println(string(raw))
+		for _, c := range checks {
+			if !c.OK {
+				logger.Warn("spot-check failed", "signal_id", c.SignalID, "detail", c.Detail)
+			}
+		}
 	}
 
 	res := signaleval.Simulate(signaleval.SimConfig{Risk: rcfg}, sigs, prices)
 	runID := newRunID()
 	surf := signaleval.BuildSurface(runID, *strategy, res, from, to, *minSample)
+	surf.ApplyLoadMeta(len(sigs), loadMeta.DBCount, loadMeta.Limit, loadMeta.Capped, wf.Note())
 
 	wr, err := artifacts.WriteJSON(runID, "signal_eval_surface", surf, artifacts.WriteOptions{
 		Root: *artifactsRoot, WriteLatest: true,
@@ -192,6 +233,7 @@ func rowsToSignals(rows []db.SignalRow) []signaleval.SignalIn {
 			Side: r.Side, Action: r.Action, EdgeBps: r.EdgeBps, Conviction: r.Conviction,
 			Urgency: r.Urgency, SizeUSD: r.SizeUSD, CapacityUSD: r.CapacityUSD,
 			CostBps: r.CostBps, Mid: r.Mid, HorizonSec: r.HorizonSec, KellyFrac: r.KellyFrac,
+			SpreadBps: r.SpreadBps, FVSource: r.FVSource, ScorePath: r.ScorePath,
 		})
 	}
 	return out

@@ -53,6 +53,10 @@ type CycleDeps struct {
 	PriceWarmMaxAge time.Duration
 	// ForceColdPrices force full lookback even when series exist.
 	ForceColdPrices bool
+
+	// Attention chooses who to enrich. Nil → ActivityThenEdge (default pack).
+	// Enrich HTTP still receives only ID lists.
+	Attention AttentionPolicy
 }
 
 // CycleResult is the outcome of one edge-scan cycle.
@@ -141,7 +145,7 @@ func RunCycle(ctx context.Context, deps CycleDeps) CycleResult {
 		"events", logging.FormatCount(int64(len(events))),
 	)
 
-	// 2. Stage-1 budget (not published)
+	// 2. Stage-1 budget (not published) — attention policy, not the enrich adapters.
 	stage = time.Now()
 	pool := FlattenCandidates(events)
 	filter := marketranking.MarketFilter{
@@ -151,7 +155,11 @@ func RunCycle(ctx context.Context, deps CycleDeps) CycleResult {
 		MinVolatility: esc.MinVolatility,
 		MaxN:          esc.Stage1MaxN,
 	}
-	stage1 := SelectStage1(pool, BuildOptions{
+	attn := deps.Attention
+	if attn == nil {
+		attn = DefaultAttention()
+	}
+	stage1 := attn.EnrichSet(pool, BuildOptions{
 		Filter:             filter,
 		StickyConditionIDs: sticky,
 		Strategy:           strategy,
@@ -162,6 +170,7 @@ func RunCycle(ctx context.Context, deps CycleDeps) CycleResult {
 	log.Info("stage complete",
 		"stage", "stage1_budget",
 		"duration", logging.FormatDuration(time.Since(stage)),
+		"attention_policy", attn.Name(),
 		"pool", logging.FormatCount(int64(stage1.PoolCount)),
 		"stage1", logging.FormatCount(int64(stage1.Stage1Count)),
 	)
@@ -333,12 +342,13 @@ func RunCycle(ctx context.Context, deps CycleDeps) CycleResult {
 
 	// 5. Artifact + persist
 	extra := BoardStats{
-		CycleMS:        time.Since(start).Milliseconds(),
-		EnrichMS:       res.EnrichMS,
-		EnrichCoverage: res.EnrichCoverage,
-		FVCoverage:     build.FVCoverage,
-		FVHits:         build.FVHits,
-		TokensExpanded: tokensExpanded,
+		CycleMS:         time.Since(start).Milliseconds(),
+		EnrichMS:        res.EnrichMS,
+		EnrichCoverage:  res.EnrichCoverage,
+		FVCoverage:      build.FVCoverage,
+		FVHits:          build.FVHits,
+		TokensExpanded:  tokensExpanded,
+		AttentionPolicy: attn.Name(),
 	}
 	doc, err := BuildArtifactWithStats(build.Rows, build.PoolCount, build.Stage1Count, build.DroppedSummary, res.Status, res.Errors, extra)
 	if err != nil {

@@ -119,11 +119,13 @@ type SnapshotAtT struct {
 
 // BoardSelectStats diagnostics for policy_parity.
 type BoardSelectStats struct {
-	FVHits         int
-	BoardN         int
-	WithBook       int
-	UniverseN      int
-	ExtremeDropped int
+	FVHits           int
+	BoardN           int
+	WithBook         int // deprecated alias: universe-with-book (do not use as board coverage)
+	UniverseWithBook int
+	BoardWithBook    int
+	UniverseN        int
+	ExtremeDropped   int
 }
 
 // RunBacktest ranks with edge.SelectBoard (production policy) + PIT baselines.
@@ -172,7 +174,9 @@ func RunBacktest(snaps []SnapshotAtT, prices map[string]PriceSeries, bc Backtest
 		cand, st := selectCandidateBoard(universe, bc.BoardN, w)
 		stats.FVHits += st.FVHits
 		stats.BoardN += len(cand)
-		stats.WithBook += st.WithBook
+		stats.WithBook += st.UniverseWithBook
+		stats.UniverseWithBook += st.UniverseWithBook
+		stats.BoardWithBook += st.BoardWithBook
 
 		vol := topN(universe, bc.BoardN, func(m MarketPoint) float64 { return m.VolumeProxy })
 		act := topN(universe, bc.BoardN, func(m MarketPoint) float64 { return m.ActivityProxy })
@@ -279,6 +283,7 @@ func selectCandidateBoard(universe []MarketPoint, n int, w edge.Weights) ([]Mark
 	for _, m := range universe {
 		byTok[m.TokenID] = m
 		if !m.Features.MissingBook {
+			st.UniverseWithBook++
 			st.WithBook++
 		}
 		cands = append(cands, edge.BoardCandidate{
@@ -309,6 +314,9 @@ func selectCandidateBoard(universe []MarketPoint, n int, w edge.Weights) ([]Mark
 			st.FVHits++
 		} else if r.Result.Path != "" {
 			m.FVSource = r.Result.Path
+		}
+		if r.Result.Cost.HasBook || !r.Candidate.Features.MissingBook {
+			st.BoardWithBook++
 		}
 		out = append(out, m)
 	}

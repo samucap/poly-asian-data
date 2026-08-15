@@ -41,7 +41,16 @@ type Config struct {
 	OpportunityEdgeWeight       float64 `yaml:"opportunity_edge_weight" json:"opportunity_edge_weight"`
 	OpportunityConvictionWeight float64 `yaml:"opportunity_conviction_weight" json:"opportunity_conviction_weight"`
 	// BatchWindowMs: if >0, sim groups signals within window and ranks by opportunity.
+	// Used when AuctionEnabled is false (legacy burst reorder).
 	BatchWindowMs int `yaml:"batch_window_ms" json:"batch_window_ms"`
+	// AuctionEnabled: allocate a windowed set (top-K by opportunity) instead of first-to-fire.
+	AuctionEnabled bool `yaml:"auction_enabled" json:"auction_enabled"`
+	// AllocWindowSec: auction bucket size. 0 with auction on → 60s. Auction off → ignored.
+	AllocWindowSec int `yaml:"alloc_window_sec" json:"alloc_window_sec"`
+	// AuctionDedupe: "condition" keeps the best score per condition_id in the window.
+	AuctionDedupe string `yaml:"auction_dedupe" json:"auction_dedupe"`
+	// ReplaceDelta: reserved; 0 = do not displace weaker open names this slice.
+	ReplaceDelta float64 `yaml:"replace_delta" json:"replace_delta"`
 }
 
 // DefaultConfig returns conservative paper defaults.
@@ -66,7 +75,11 @@ func DefaultConfig() Config {
 		OpportunityConvictionWeight: 1.0,
 		// >0 ranks near-simultaneous signals by opportunity when budget is scarce.
 		// 0 = strict time order (no re-rank).
-		BatchWindowMs: 500,
+		BatchWindowMs:  500,
+		AuctionEnabled: false, // YAML default.yaml turns this on for live/eval
+		AllocWindowSec: 60,
+		AuctionDedupe:  "condition",
+		ReplaceDelta:   0,
 	}
 }
 

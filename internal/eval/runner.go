@@ -328,7 +328,7 @@ func RunDBOnly(ctx context.Context, opts RunnerOpts) (*RunResult, error) {
 		hitRate = float64(snapHit) / float64(snapHit+snapMiss)
 	}
 	s.UniverseNote = fmt.Sprintf(
-		"membership=series_mid@T; snapshots=%d times/%d rows; snap_meta_hit_rate=%.3f; sticky=live_only; features/labels=PIT",
+		"membership=series_mid@T; snapshots=%d times/%d rows; snap_meta_hit_rate=%.3f; sticky=live_only; features/labels=PIT; book_coverage=board (see book_coverage_universe for WithBook/UniverseN)",
 		snapTimes, snapN, hitRate,
 	)
 	s.BaselineNotes = "volume_top_n=snapshot_volume|series_proxy; activity_stage1=series sum|Δmid| 24h; label costs=edge.ComputeCost/Score TotalCostBps; candidate action_model=" + s.ActionModel + "; baselines=long_yes"
@@ -347,10 +347,14 @@ func RunDBOnly(ctx context.Context, opts RunnerOpts) (*RunResult, error) {
 		s.WeightsHash = WeightsHashBytes(opts.WeightsYAML)
 	}
 
-	// Coverages from selection stats
+	// Coverages: board is the trade-set KPI; universe is a secondary diagnostic.
 	if selStats.BoardN > 0 {
 		s.FVCoverage = float64(selStats.FVHits) / float64(selStats.BoardN)
-		s.BookCoverage = float64(selStats.WithBook) / float64(max(selStats.UniverseN, 1))
+		s.BookCoverageBoard = float64(selStats.BoardWithBook) / float64(selStats.BoardN)
+		s.BookCoverage = s.BookCoverageBoard
+	}
+	if selStats.UniverseN > 0 {
+		s.BookCoverageUniverse = float64(selStats.UniverseWithBook) / float64(selStats.UniverseN)
 	}
 
 	if metrics.N == 0 {
@@ -387,7 +391,8 @@ func RunDBOnly(ctx context.Context, opts RunnerOpts) (*RunResult, error) {
 			"promote_eligible", s.PromoteEligible,
 			"policy_parity", s.PolicyParity,
 			"fv_coverage", s.FVCoverage,
-			"book_coverage", s.BookCoverage,
+			"book_coverage_board", s.BookCoverageBoard,
+			"book_coverage_universe", s.BookCoverageUniverse,
 			"n", s.Metrics.N,
 			"weights_hash", s.WeightsHash,
 		)

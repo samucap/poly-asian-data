@@ -265,7 +265,19 @@ type SignalFilter struct {
 	From              time.Time
 	To                time.Time
 	StrategyVersionID *int64
+	// Limit: 0 = default 50_000; <0 = no cap; >0 = that many rows.
 	Limit             int
+}
+
+// DefaultSignalLoadLimit is the safety cap when SignalFilter.Limit == 0.
+const DefaultSignalLoadLimit = 50_000
+
+// SignalLoadMeta describes how many rows existed vs how many were loaded.
+type SignalLoadMeta struct {
+	Loaded  int
+	DBCount int
+	Limit   int // applied cap; -1 = unlimited
+	Capped  bool
 }
 
 // LoadSignals loads signal rows matching filter ordered by time ASC.
@@ -282,8 +294,8 @@ func LoadSignals(ctx context.Context, conn DBInterface, f SignalFilter) ([]Signa
 		mode = "paper"
 	}
 	limit := f.Limit
-	if limit <= 0 {
-		limit = 50_000
+	if limit == 0 {
+		limit = DefaultSignalLoadLimit
 	}
 	from := f.From
 	to := f.To
@@ -312,10 +324,10 @@ func LoadSignals(ctx context.Context, conn DBInterface, f SignalFilter) ([]Signa
 	if f.StrategyVersionID != nil {
 		q += ` AND strategy_version_id = $5`
 		args = append(args, *f.StrategyVersionID)
-		q += fmt.Sprintf(` ORDER BY time ASC LIMIT $%d`, len(args)+1)
-		args = append(args, limit)
-	} else {
-		q += ` ORDER BY time ASC LIMIT $5`
+	}
+	q += ` ORDER BY time ASC`
+	if limit > 0 {
+		q += fmt.Sprintf(` LIMIT $%d`, len(args)+1)
 		args = append(args, limit)
 	}
 
@@ -353,5 +365,53 @@ func LoadSignals(ctx context.Context, conn DBInterface, f SignalFilter) ([]Signa
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// CountSignals returns how many rows match the filter (ignores Limit).
+func CountSignals(ctx context.Context, conn DBInterface, f SignalFilter) (int, error) {
+	if conn == nil {
+		return 0, ErrNilDB
+	}
+	strategy := f.Strategy
+	if strategy == "" {
+		strategy = "default"
+	}
+	mode := f.Mode
+	if mode == "" {
+		mode = "paper"
+	}
+	from := f.From
+	to := f.To
+	if to.IsZero() {
+		to = time.Now().UTC()
+	}
+	if from.IsZero() {
+		from = to.Add(-30 * 24 * time.Hour)
+	}
+	q := `SELECT count(*) FROM signals WHERE strategy = $1 AND mode = $2 AND time >= $3 AND time <= $4`
+	args := []any{strategy, mode, from.UTC(), to.UTC()}
+	if f.StrategyVersionID != nil {
+		q += ` AND strategy_version_id = $5`
+		args = append(args, *f.StrategyVersionID)
+	}
+	var n int
+	if err := conn.QueryRow(ctx, q, args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("db: count signals: %w", err)
+	}
+	return n, nil
+}
+
+// SignalLoadMetaFrom builds cap diagnostics after a load.
+func SignalLoadMetaFrom(loaded, dbCount, appliedLimit int) SignalLoadMeta {
+	m := SignalLoadMeta{Loaded: loaded, DBCount: dbCount, Limit: appliedLimit}
+	if appliedLimit < 0 {
+		m.Limit = -1
+		return m
+	}
+	m.Capped = dbCount > loaded || (appliedLimit > 0 && loaded >= appliedLimit && dbCount > loaded)
+	if appliedLimit > 0 && dbCount > appliedLimit {
+		m.Capped = true
+	}
+	return m
 }
 

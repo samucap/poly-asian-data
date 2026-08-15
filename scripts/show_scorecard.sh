@@ -30,12 +30,18 @@ jq '{
   board: {
     after_cost_bps: .board_eval.after_cost_return_bps,
     promote: .board_eval.promote_eligible,
-    n: .board_eval.n
+    n: .board_eval.n,
+    book_coverage_board: .board_eval.book_coverage_board,
+    book_coverage_universe: .board_eval.book_coverage_universe,
+    fv_coverage: .board_eval.fv_coverage
   },
   paper: {
     pnl_usd: .paper_eval.total_pnl_usd,
     accepted: .paper_eval.n_accepted,
     signals: .paper_eval.n_signals,
-    max_dd_bps: .paper_eval.max_drawdown_bps
+    n_signals_db: .paper_eval.n_signals_db,
+    capped: .paper_eval.capped,
+    max_dd_bps: .paper_eval.max_drawdown_bps,
+    reject_reasons: .paper_eval.reject_reasons
   }
 }' "${DIR}/manifest.json"

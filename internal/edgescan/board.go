@@ -324,6 +324,8 @@ type BoardStats struct {
 	FVCoverage       float64 `json:"fv_coverage,omitempty"`
 	FVHits           int     `json:"fv_hits,omitempty"`
 	TokensExpanded   int     `json:"tokens_expanded,omitempty"`
+	// AttentionPolicy names who chose the enrich set (not the HTTP fetchers).
+	AttentionPolicy  string  `json:"attention_policy,omitempty"`
 }
 
 // BoardEntry is one self-contained board row for agents / WS.
@@ -454,6 +456,7 @@ func BuildArtifactWithStats(rows []db.EdgeBoardRow, poolN, stage1N int, dropped 
 		FVCoverage:      extra.FVCoverage,
 		FVHits:          extra.FVHits,
 		TokensExpanded:  extra.TokensExpanded,
+		AttentionPolicy: extra.AttentionPolicy,
 	}
 
 	doc := EdgeBoardV1{

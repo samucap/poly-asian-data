@@ -33,9 +33,13 @@ type EvalSurface struct {
 	WeightsHash string `json:"weights_hash,omitempty"`
 	// WeightsPath optional source path.
 	WeightsPath string `json:"weights_path,omitempty"`
-	// BookCoverage fraction of candidate features with books at T (diag).
+	// BookCoverage is board-denominated (alias of BookCoverageBoard).
 	BookCoverage float64 `json:"book_coverage,omitempty"`
-	// FVCoverage fraction of candidate labels/rows with FV path (diag).
+	// BookCoverageBoard = board rows with a book / BoardN (primary trade-set KPI).
+	BookCoverageBoard float64 `json:"book_coverage_board,omitempty"`
+	// BookCoverageUniverse = universe mids with a book / UniverseN (secondary diagnostic).
+	BookCoverageUniverse float64 `json:"book_coverage_universe,omitempty"`
+	// FVCoverage fraction of selected board rows with FV path (diag).
 	FVCoverage float64 `json:"fv_coverage,omitempty"`
 	// UniverseNote documents non-PIT universe membership.
 	UniverseNote string   `json:"universe_note,omitempty"`

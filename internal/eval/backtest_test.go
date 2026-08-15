@@ -91,6 +91,30 @@ func TestRunBacktest_SelectBoardPolicy(t *testing.T) {
 	require.Contains(t, m.Baselines, "activity_stage1")
 }
 
+func TestSelectCandidateBoard_BookCoverageBoardVsUniverse(t *testing.T) {
+	w := edge.DefaultWeights()
+	w.DropMissingBook = false
+	w.DropExtremePrice = false
+	w.FVEnabled = false
+
+	withBook := MarketPoint{
+		ConditionID: "a", TokenID: "ta", VolumeProxy: 100,
+		Features: edge.FeatureVector{
+			TokenID: "ta", ConditionID: "a", Mid: 0.4,
+			BestBid: 0.39, BestAsk: 0.41, BidDepth: 1e6, AskDepth: 1e6, MissingBook: false,
+		},
+	}
+	noBook := MarketPoint{
+		ConditionID: "b", TokenID: "tb", VolumeProxy: 1,
+		Features: edge.FeatureVector{TokenID: "tb", ConditionID: "b", Mid: 0.5, MissingBook: true},
+	}
+	cand, st := selectCandidateBoard([]MarketPoint{withBook, noBook}, 1, w)
+	require.Equal(t, 1, st.UniverseWithBook)
+	require.Len(t, cand, 1)
+	require.Equal(t, 1, st.BoardWithBook)
+	require.Equal(t, "a", cand[0].ConditionID)
+}
+
 func TestFinalizeSurface_PromoteAndParity(t *testing.T) {
 	cfg := DefaultConfig()
 	s := robustSurface()
