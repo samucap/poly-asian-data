@@ -316,6 +316,8 @@ jq -n \
 			n_signals_db: $p.window.n_signals_db,
 			load_limit: $p.window.load_limit,
 			capped: $p.window.capped,
+			load_order: $p.window.load_order,
+			source: $p.window.source,
 			worthiness_filter: $p.window.worthiness_filter,
 			n_accepted: $p.metrics.n_accepted,
 			n_rejected_risk: $p.metrics.n_rejected_risk,

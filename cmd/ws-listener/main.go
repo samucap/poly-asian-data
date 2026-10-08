@@ -14,10 +14,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/samucap/poly-asian-data/internal/alloc"
 	"github.com/samucap/poly-asian-data/internal/config"
 	"github.com/samucap/poly-asian-data/internal/db"
 	"github.com/samucap/poly-asian-data/internal/logging"
 	"github.com/samucap/poly-asian-data/internal/pipeline"
+	"github.com/samucap/poly-asian-data/internal/risk"
 	"github.com/samucap/poly-asian-data/internal/signals"
 	"github.com/samucap/poly-asian-data/internal/ws/market"
 )
@@ -32,7 +34,10 @@ func main() {
 	featuresFlush := flag.Duration("features-flush", 3*time.Second, "dirty features_latest batch interval")
 	snapshotFlush := flag.Duration("snapshot-flush", 15*time.Second, "dirty orderbook_snapshots batch (0=off)")
 	noSnapshots := flag.Bool("no-snapshots", false, "disable orderbook_snapshots writes")
-	signalEvery := flag.Duration("signal-every", 2*time.Second, "paper signal eval interval (memory)")
+	signalEvery := flag.Duration("signal-every", 2*time.Second, "firehose eval interval (only --signal-mode firehose)")
+	signalMode := flag.String("signal-mode", "board", "paper emit: board (whole listen set, top-K) or firehose")
+	allocEvery := flag.Duration("alloc-every", 0, "board-mode allocation interval (0=use --board-poll)")
+	riskPath := flag.String("risk", "configs/risk/default.yaml", "risk YAML for board-mode max_positions / gross")
 	signalCooldown := flag.Duration("signal-cooldown", 10*time.Minute, "debounce per condition")
 	minEdgeBps := flag.Float64("min-edge-bps", 25, "min |net edge| to emit paper signal")
 	maxSpreadBps := flag.Float64("max-spread-bps", 500, "reject books wider than this")
@@ -78,6 +83,9 @@ func main() {
 		logger.Error("ensure signals", "error", err)
 		os.Exit(1)
 	}
+	if err := db.EnsureAllocationsTable(ctx, pool); err != nil {
+		logger.Warn("ensure allocations", "error", err)
+	}
 	if err := db.EnsureEdgeBoardTable(ctx, pool); err != nil {
 		logger.Warn("ensure edge_board", "error", err)
 	}
@@ -100,6 +108,13 @@ func main() {
 	gate.Cooldown = *signalCooldown
 	gate.ProbeSizeUSD = *probeSize
 	emitter := signals.NewEmitter(gate)
+
+	rcfg, err := risk.LoadConfig(*riskPath)
+	if err != nil {
+		logger.Warn("risk config; using defaults", "error", err)
+		rcfg = risk.DefaultConfig()
+	}
+	rcfg.Normalize()
 
 	var boardMeta *db.BoardSubscribeSet
 	var boardMu sync.RWMutex
@@ -396,10 +411,22 @@ func main() {
 
 	// Paper signals from memory
 	go func() {
-		if *signalEvery <= 0 {
+		mode := *signalMode
+		if mode == "" {
+			mode = "board"
+		}
+		interval := *signalEvery
+		if mode == "board" {
+			interval = *allocEvery
+			if interval <= 0 {
+				interval = *boardPoll
+			}
+		}
+		if interval <= 0 {
 			return
 		}
-		t := time.NewTicker(*signalEvery)
+		worth := alloc.Worthiness{MinEdgeBps: *minEdgeBps, MaxSpreadBps: *maxSpreadBps}
+		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {
@@ -413,7 +440,27 @@ func main() {
 					continue
 				}
 				now := time.Now().UTC()
-				var out []db.SignalRow
+				if mode == "firehose" {
+					var out []db.SignalRow
+					for _, p := range bm.Primaries {
+						resolvedMu.RLock()
+						_, dead := resolvedConds[p.ConditionID]
+						resolvedMu.RUnlock()
+						if dead {
+							continue
+						}
+						sig := evalPrimary(emitter, store, p, now, *strategyFlag, true)
+						if sig == nil {
+							continue
+						}
+						out = append(out, paperToRow(sig))
+					}
+					persistSignals(ctx, pool, emitter, stats, out)
+					continue
+				}
+				// board: score every primary, allocate top-K, persist only Taken.
+				var cands []*signals.PaperSignal
+				var names []alloc.Name
 				for _, p := range bm.Primaries {
 					resolvedMu.RLock()
 					_, dead := resolvedConds[p.ConditionID]
@@ -421,47 +468,39 @@ func main() {
 					if dead {
 						continue
 					}
-					bk, ok := store.Snapshot(p.PrimaryTokenID)
-					if !ok || !bk.ValidBook() {
+					sig := evalPrimary(emitter, store, p, now, *strategyFlag, false)
+					if sig == nil {
 						continue
 					}
-					board := signals.BoardSnap{
-						ConditionID: p.ConditionID, MarketID: p.MarketID, TokenID: p.PrimaryTokenID,
-						Rank: p.Rank, Score: p.Score, EdgeBps: p.EdgeBps, CostBps: p.CostBps,
-						CapacityUSD: p.CapacityUSD, Urgency: p.Urgency, FairValue: p.FairValue,
-						ModelEdgeBps: p.ModelEdgeBps, FVSource: p.FVSource, NegRisk: p.NegRisk,
-						NegRiskGroupID: p.NegRiskGroupID, StrategyTags: p.StrategyTags,
-						RiskFlags: p.RiskFlags, KeyFeatures: p.KeyFeatures,
-						StrategyVersionID: p.StrategyVersionID, RunID: p.RunID,
-					}
-					book := signals.BookSnap{
-						BestBid: bk.BestBid, BestAsk: bk.BestAsk, Mid: bk.Mid(),
-						LastTradePrice: bk.LastTradePrice, Imbalance: bk.Imbalance,
-						BidDepth: bk.BidDepth, AskDepth: bk.AskDepth, UpdatedAt: bk.UpdatedAt,
-					}
-					sig := emitter.Evaluate(now, *strategyFlag, board, book)
-					if sig == nil {
+					cands = append(cands, sig)
+					names = append(names, signals.NameFromPaper(sig))
+				}
+				res := alloc.Run(alloc.Input{Names: names, Risk: rcfg, Worth: worth})
+				var allocRows []db.AllocationRow
+				for i, n := range res.Taken {
+					allocRows = append(allocRows, db.AllocationRow{
+						Time: now, Strategy: *strategyFlag, ConditionID: n.ConditionID, TokenID: n.TokenID,
+						Rank: i + 1, EdgeBps: n.EdgeBps, Conviction: n.Conviction, Taken: true, SelectedAt: now,
+					})
+				}
+				for _, r := range res.Rejected {
+					allocRows = append(allocRows, db.AllocationRow{
+						Time: now, Strategy: *strategyFlag, ConditionID: r.Name.ConditionID, TokenID: r.Name.TokenID,
+						EdgeBps: r.Name.EdgeBps, Conviction: r.Name.Conviction, Taken: false, RejectReason: r.Reason, SelectedAt: now,
+					})
+				}
+				if err := db.InsertAllocations(ctx, pool, allocRows); err != nil {
+					logger.Warn("insert allocations", "error", err, "n", len(allocRows))
+				}
+				taken := signals.SelectTaken(cands, res)
+				var out []db.SignalRow
+				for _, sig := range taken {
+					if emitter.BlockedByCooldown(sig.ConditionID, sig.Side, sig.EdgeBps, now) {
 						continue
 					}
 					out = append(out, paperToRow(sig))
 				}
-				if len(out) == 0 {
-					continue
-				}
-				if err := db.InsertSignals(ctx, pool, out); err != nil {
-					logger.Warn("insert signals", "error", err, "n", len(out))
-					// Do not Commit — allow re-emit on next interval after transient DB failure.
-					continue
-				}
-				// Debounce only after durable insert.
-				for _, row := range out {
-					emitter.Commit(&signals.PaperSignal{
-						Time: row.Time, SignalID: row.SignalID, ConditionID: row.ConditionID,
-						Side: row.Side, EdgeBps: row.EdgeBps,
-					})
-				}
-				stats.AddSignals(len(out))
-				// No per-batch Info spam — status line carries aggregates
+				persistSignals(ctx, pool, emitter, stats, out)
 			}
 		}
 	}()
@@ -514,6 +553,7 @@ func main() {
 		"url", *wsURL,
 		"strategy", *strategyFlag,
 		"max_assets", *maxAssets,
+		"signal_mode", *signalMode,
 		"features_flush", *featuresFlush,
 		"snapshot_flush", *snapshotFlush,
 		"no_snapshots", *noSnapshots,
@@ -530,6 +570,49 @@ func main() {
 	logger.Info("ws-listener stopped", stats.Attrs(market.StatusInput{
 		Sub: len(client.Subscribed()), Mem: store.Len(), Pending: store.DirtyCount(),
 	})...)
+}
+
+func evalPrimary(emitter *signals.Emitter, store *market.BookStore, p db.BoardAssetMeta, now time.Time, strategy string, applyGates bool) *signals.PaperSignal {
+	bk, ok := store.Snapshot(p.PrimaryTokenID)
+	if !ok || !bk.ValidBook() {
+		return nil
+	}
+	board := signals.BoardSnap{
+		ConditionID: p.ConditionID, MarketID: p.MarketID, TokenID: p.PrimaryTokenID,
+		Rank: p.Rank, Score: p.Score, EdgeBps: p.EdgeBps, CostBps: p.CostBps,
+		CapacityUSD: p.CapacityUSD, Urgency: p.Urgency, FairValue: p.FairValue,
+		ModelEdgeBps: p.ModelEdgeBps, FVSource: p.FVSource, NegRisk: p.NegRisk,
+		NegRiskGroupID: p.NegRiskGroupID, StrategyTags: p.StrategyTags,
+		RiskFlags: p.RiskFlags, KeyFeatures: p.KeyFeatures,
+		StrategyVersionID: p.StrategyVersionID, RunID: p.RunID,
+	}
+	book := signals.BookSnap{
+		BestBid: bk.BestBid, BestAsk: bk.BestAsk, Mid: bk.Mid(),
+		LastTradePrice: bk.LastTradePrice, Imbalance: bk.Imbalance,
+		BidDepth: bk.BidDepth, AskDepth: bk.AskDepth, UpdatedAt: bk.UpdatedAt,
+	}
+	_ = applyGates
+	if applyGates {
+		return emitter.Evaluate(now, strategy, board, book)
+	}
+	return emitter.Candidate(now, strategy, board, book)
+}
+
+func persistSignals(ctx context.Context, pool db.DBInterface, emitter *signals.Emitter, stats *market.RuntimeStats, out []db.SignalRow) {
+	if len(out) == 0 {
+		return
+	}
+	if err := db.InsertSignals(ctx, pool, out); err != nil {
+		logging.Logger.Warn("insert signals", "error", err, "n", len(out))
+		return
+	}
+	for _, row := range out {
+		emitter.Commit(&signals.PaperSignal{
+			Time: row.Time, SignalID: row.SignalID, ConditionID: row.ConditionID,
+			Side: row.Side, EdgeBps: row.EdgeBps,
+		})
+	}
+	stats.AddSignals(len(out))
 }
 
 func pickTime(a, fallback time.Time) time.Time {

@@ -34,7 +34,9 @@ func main() {
 	synthetic := flag.Bool("synthetic", false, "use built-in fixture (no DB signals required)")
 	minSample := flag.Int("min-sample", 3, "min signals for ok gate")
 	startingEquity := flag.Float64("starting-equity", 0, "override risk starting_equity_usd (0=config)")
-	limit := flag.Int("limit", db.DefaultSignalLoadLimit, "max signals to load (0=unlimited; default 50000)")
+	limit := flag.Int("limit", db.DefaultSignalLoadLimit, "max signals to load when --source=signals (0=unlimited; default 50000)")
+	loadOrder := flag.String("load-order", db.SignalOrderNewest, "signals load: newest (latest N) or oldest (prefix)")
+	source := flag.String("source", "board", "paper input: board (edge_board_snapshots, whole listen set) or signals (intent tape)")
 	minEdgeBps := flag.Float64("min-edge-bps", 0, "replay worthiness: drop |edge_bps| below this")
 	maxSpreadBps := flag.Float64("max-spread-bps", 0, "replay worthiness: drop spread_bps above this (0=off)")
 	requireFV := flag.Bool("require-fv", false, "replay worthiness: keep only FV-path intents")
@@ -59,7 +61,11 @@ func main() {
 		prices   signaleval.PriceIndex
 		from, to time.Time
 		loadMeta db.SignalLoadMeta
+		srcUsed  = "signals"
 	)
+	wf := signaleval.WorthinessFilter{
+		MinEdgeBps: *minEdgeBps, MaxSpreadBps: *maxSpreadBps, RequireFV: *requireFV,
+	}
 
 	if *synthetic {
 		sigs, prices = signaleval.SyntheticFixture()
@@ -101,32 +107,71 @@ func main() {
 
 		to = time.Now().UTC()
 		from = to.Add(-*lookback)
-		fil := db.SignalFilter{
-			Strategy: *strategy,
-			Mode:     "paper",
-			From:     from,
-			To:       to,
+		srcUsed = *source
+		if srcUsed == "" {
+			srcUsed = "board"
 		}
-		if *limit == 0 {
-			fil.Limit = -1
-		} else {
-			fil.Limit = *limit
+		switch srcUsed {
+		case "board":
+			snaps, err := db.LoadEdgeBoardSnapshots(ctx, pool, *strategy, from, to)
+			if err != nil {
+				logger.Error("load edge_board_snapshots", "error", err)
+				os.Exit(1)
+			}
+			// Snapshot times are the allocation clock — do not also auction a firehose.
+			rcfg.AuctionEnabled = false
+			rcfg.BatchWindowMs = 0
+			var meta signaleval.BoardAllocMeta
+			sigs, meta = signaleval.AllocateFromBoardSnapshots(snaps, rcfg, wf)
+			loadMeta = db.SignalLoadMeta{Loaded: len(sigs), DBCount: meta.NamesSeen, Capped: false, Order: "board"}
+			logger.Info("board allocation replay",
+				"snapshot_times", meta.SnapshotTimes,
+				"names_seen", meta.NamesSeen,
+				"taken", meta.Taken,
+				"rejected", meta.Rejected,
+				"signals", len(sigs),
+			)
+			srcUsed = "board_snapshots"
+		default:
+			srcUsed = "signals"
+			fil := db.SignalFilter{
+				Strategy: *strategy,
+				Mode:     "paper",
+				From:     from,
+				To:       to,
+				Order:    db.NormalizeSignalOrder(*loadOrder),
+			}
+			if *limit == 0 {
+				fil.Limit = -1
+			} else {
+				fil.Limit = *limit
+			}
+			if *versionID > 0 {
+				v := *versionID
+				fil.StrategyVersionID = &v
+			}
+			dbCount, err := db.CountSignals(ctx, pool, fil)
+			if err != nil {
+				logger.Warn("count signals", "error", err)
+			}
+			rows, err := db.LoadSignals(ctx, pool, fil)
+			if err != nil {
+				logger.Error("load signals", "error", err)
+				os.Exit(1)
+			}
+			sigs = rowsToSignals(rows)
+			beforeW := len(sigs)
+			sigs = signaleval.ApplyWorthiness(sigs, wf)
+			if beforeW != len(sigs) {
+				logger.Info("worthiness filter", "before", beforeW, "after", len(sigs), "min_edge_bps", *minEdgeBps, "max_spread_bps", *maxSpreadBps, "require_fv", *requireFV)
+			}
+			applied := fil.Limit
+			if applied == 0 {
+				applied = db.DefaultSignalLoadLimit
+			}
+			loadMeta = db.SignalLoadMetaFromOrder(len(sigs), dbCount, applied, fil.Order)
+			logger.Info("loaded signals", "n", len(sigs), "n_db", dbCount, "limit", applied, "capped", loadMeta.Capped, "order", fil.Order)
 		}
-		if *versionID > 0 {
-			v := *versionID
-			fil.StrategyVersionID = &v
-		}
-		dbCount, err := db.CountSignals(ctx, pool, fil)
-		if err != nil {
-			logger.Warn("count signals", "error", err)
-		}
-		rows, err := db.LoadSignals(ctx, pool, fil)
-		if err != nil {
-			logger.Error("load signals", "error", err)
-			os.Exit(1)
-		}
-		sigs = rowsToSignals(rows)
-		// Prices: load series for tokens
 		toks := uniqueTokens(sigs)
 		if len(toks) > 0 {
 			series, err := db.LoadPriceSeries(ctx, pool, toks, from.Add(-2*time.Hour), to.Add(48*time.Hour))
@@ -136,21 +181,6 @@ func main() {
 				prices = priceIndexFromDB(series)
 			}
 		}
-		applied := fil.Limit
-		if applied == 0 {
-			applied = db.DefaultSignalLoadLimit
-		}
-		loadMeta = db.SignalLoadMetaFrom(len(sigs), dbCount, applied)
-		logger.Info("loaded signals", "n", len(sigs), "n_db", dbCount, "limit", applied, "capped", loadMeta.Capped, "tokens", len(toks))
-	}
-
-	wf := signaleval.WorthinessFilter{
-		MinEdgeBps: *minEdgeBps, MaxSpreadBps: *maxSpreadBps, RequireFV: *requireFV,
-	}
-	beforeW := len(sigs)
-	sigs = signaleval.ApplyWorthiness(sigs, wf)
-	if beforeW != len(sigs) {
-		logger.Info("worthiness filter", "before", beforeW, "after", len(sigs), "min_edge_bps", *minEdgeBps, "max_spread_bps", *maxSpreadBps, "require_fv", *requireFV)
 	}
 
 	if *spotN > 0 {
@@ -167,7 +197,7 @@ func main() {
 	res := signaleval.Simulate(signaleval.SimConfig{Risk: rcfg}, sigs, prices)
 	runID := newRunID()
 	surf := signaleval.BuildSurface(runID, *strategy, res, from, to, *minSample)
-	surf.ApplyLoadMeta(len(sigs), loadMeta.DBCount, loadMeta.Limit, loadMeta.Capped, wf.Note())
+	surf.ApplyWindowExtra(len(sigs), loadMeta.DBCount, loadMeta.Limit, loadMeta.Capped, loadMeta.Order, srcUsed, wf.Note())
 
 	wr, err := artifacts.WriteJSON(runID, "signal_eval_surface", surf, artifacts.WriteOptions{
 		Root: *artifactsRoot, WriteLatest: true,

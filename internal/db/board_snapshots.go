@@ -175,3 +175,28 @@ func LoadEdgeBoardSnapshots(ctx context.Context, conn DBInterface, strategy stri
 	}
 	return out, rows.Err()
 }
+
+// GroupSnapshotsBySelectedAt groups rows already ordered by selected_at, rank.
+func GroupSnapshotsBySelectedAt(rows []EdgeBoardSnapshotRow) [][]EdgeBoardSnapshotRow {
+	if len(rows) == 0 {
+		return nil
+	}
+	var out [][]EdgeBoardSnapshotRow
+	var cur []EdgeBoardSnapshotRow
+	var t time.Time
+	for i, r := range rows {
+		if i == 0 || !r.SelectedAt.Equal(t) {
+			if len(cur) > 0 {
+				out = append(out, cur)
+			}
+			cur = []EdgeBoardSnapshotRow{r}
+			t = r.SelectedAt
+			continue
+		}
+		cur = append(cur, r)
+	}
+	if len(cur) > 0 {
+		out = append(out, cur)
+	}
+	return out
+}

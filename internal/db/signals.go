@@ -267,6 +267,9 @@ type SignalFilter struct {
 	StrategyVersionID *int64
 	// Limit: 0 = default 50_000; <0 = no cap; >0 = that many rows.
 	Limit             int
+	// Order: "newest" (default) takes the latest Limit rows then returns them
+	// chronological (time ASC). "oldest" is the historical ASC prefix.
+	Order             string
 }
 
 // DefaultSignalLoadLimit is the safety cap when SignalFilter.Limit == 0.
@@ -278,6 +281,7 @@ type SignalLoadMeta struct {
 	DBCount int
 	Limit   int // applied cap; -1 = unlimited
 	Capped  bool
+	Order   string
 }
 
 // LoadSignals loads signal rows matching filter ordered by time ASC.
@@ -325,7 +329,12 @@ func LoadSignals(ctx context.Context, conn DBInterface, f SignalFilter) ([]Signa
 		q += ` AND strategy_version_id = $5`
 		args = append(args, *f.StrategyVersionID)
 	}
-	q += ` ORDER BY time ASC`
+	order := NormalizeSignalOrder(f.Order)
+	if order == SignalOrderNewest && limit > 0 {
+		q += ` ORDER BY time DESC`
+	} else {
+		q += ` ORDER BY time ASC`
+	}
 	if limit > 0 {
 		q += fmt.Sprintf(` LIMIT $%d`, len(args)+1)
 		args = append(args, limit)
@@ -364,7 +373,34 @@ func LoadSignals(ctx context.Context, conn DBInterface, f SignalFilter) ([]Signa
 		}
 		out = append(out, r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if order == SignalOrderNewest && limit > 0 {
+		reverseSignalRows(out)
+	}
+	return out, nil
+}
+
+const (
+	SignalOrderNewest = "newest"
+	SignalOrderOldest = "oldest"
+)
+
+// NormalizeSignalOrder maps empty/unknown to newest (P1 default).
+func NormalizeSignalOrder(s string) string {
+	switch s {
+	case SignalOrderOldest:
+		return SignalOrderOldest
+	default:
+		return SignalOrderNewest
+	}
+}
+
+func reverseSignalRows(rows []SignalRow) {
+	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+		rows[i], rows[j] = rows[j], rows[i]
+	}
 }
 
 // CountSignals returns how many rows match the filter (ignores Limit).
@@ -403,7 +439,11 @@ func CountSignals(ctx context.Context, conn DBInterface, f SignalFilter) (int, e
 
 // SignalLoadMetaFrom builds cap diagnostics after a load.
 func SignalLoadMetaFrom(loaded, dbCount, appliedLimit int) SignalLoadMeta {
-	m := SignalLoadMeta{Loaded: loaded, DBCount: dbCount, Limit: appliedLimit}
+	return SignalLoadMetaFromOrder(loaded, dbCount, appliedLimit, SignalOrderNewest)
+}
+
+func SignalLoadMetaFromOrder(loaded, dbCount, appliedLimit int, order string) SignalLoadMeta {
+	m := SignalLoadMeta{Loaded: loaded, DBCount: dbCount, Limit: appliedLimit, Order: NormalizeSignalOrder(order)}
 	if appliedLimit < 0 {
 		m.Limit = -1
 		return m

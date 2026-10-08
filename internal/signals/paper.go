@@ -35,6 +35,16 @@ func NewEmitter(cfg GateConfig) *Emitter {
 
 // Evaluate attempts to build a paper signal. Returns nil if gates fail.
 func (e *Emitter) Evaluate(now time.Time, strategy string, board BoardSnap, book BookSnap) *PaperSignal {
+	return e.evaluate(now, strategy, board, book, true)
+}
+
+// Candidate scores a boarded name from the live book without min-edge or cooldown.
+// Used for whole-board capital allocation; caller applies worthiness + top-K.
+func (e *Emitter) Candidate(now time.Time, strategy string, board BoardSnap, book BookSnap) *PaperSignal {
+	return e.evaluate(now, strategy, board, book, false)
+}
+
+func (e *Emitter) evaluate(now time.Time, strategy string, board BoardSnap, book BookSnap, applyGates bool) *PaperSignal {
 	if e == nil {
 		return nil
 	}
@@ -97,29 +107,40 @@ func (e *Emitter) Evaluate(now time.Time, strategy string, board BoardSnap, book
 		signedNet = opportunity - cost.TotalCostBps - cfg.BufferBps
 	}
 	var side string
-	if signedNet > cfg.MinEdgeBps {
+	minE := 0.0
+	if applyGates {
+		minE = cfg.MinEdgeBps
+	}
+	if signedNet > minE {
 		side = SideBuy
-	} else if signedNet < -cfg.MinEdgeBps {
+	} else if signedNet < -minE {
 		side = SideSell
-	} else {
+	} else if applyGates {
 		return nil
+	} else if signedNet >= 0 {
+		side = SideBuy
+	} else {
+		side = SideSell
 	}
 	absNet := math.Abs(signedNet)
 
-	// Debounce: read-only check. Commit after successful DB insert (see Commit).
-	e.mu.Lock()
-	prev, hasPrev := e.last[board.ConditionID]
-	if hasPrev && cfg.Cooldown > 0 {
-		sameSide := prev.Side == side
-		elapsed := now.Sub(prev.At)
-		if sameSide && elapsed < cfg.Cooldown {
-			if math.Abs(absNet-math.Abs(prev.EdgeBps)) < cfg.ReissueDeltaBps {
-				e.mu.Unlock()
-				return nil
+	var hasPrev bool
+	var prev lastEmit
+	if applyGates {
+		e.mu.Lock()
+		prev, hasPrev = e.last[board.ConditionID]
+		if hasPrev && cfg.Cooldown > 0 {
+			sameSide := prev.Side == side
+			elapsed := now.Sub(prev.At)
+			if sameSide && elapsed < cfg.Cooldown {
+				if math.Abs(absNet-math.Abs(prev.EdgeBps)) < cfg.ReissueDeltaBps {
+					e.mu.Unlock()
+					return nil
+				}
 			}
 		}
+		e.mu.Unlock()
 	}
-	e.mu.Unlock()
 
 	conviction := absNet / cfg.ConvictionScale
 	if conviction > 1 {
@@ -259,6 +280,30 @@ func (e *Emitter) Evaluate(now time.Time, strategy string, board BoardSnap, book
 	}
 	// Debounce state is committed only after successful persistence (Commit).
 	return sig
+}
+
+// BlockedByCooldown reports whether a taken name should not be re-emitted yet.
+func (e *Emitter) BlockedByCooldown(conditionID, side string, edgeBps float64, now time.Time) bool {
+	if e == nil || conditionID == "" {
+		return false
+	}
+	cfg := e.cfg
+	if cfg.Cooldown <= 0 {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	prev, ok := e.last[conditionID]
+	if !ok {
+		return false
+	}
+	if prev.Side != side {
+		return false
+	}
+	if now.Sub(prev.At) >= cfg.Cooldown {
+		return false
+	}
+	return math.Abs(math.Abs(edgeBps)-math.Abs(prev.EdgeBps)) < cfg.ReissueDeltaBps
 }
 
 // Commit records a successfully persisted signal for debounce/cooldown.

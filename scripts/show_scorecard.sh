@@ -41,6 +41,8 @@ jq '{
     signals: .paper_eval.n_signals,
     n_signals_db: .paper_eval.n_signals_db,
     capped: .paper_eval.capped,
+    load_order: .paper_eval.load_order,
+    source: .paper_eval.source,
     max_dd_bps: .paper_eval.max_drawdown_bps,
     reject_reasons: .paper_eval.reject_reasons
   }

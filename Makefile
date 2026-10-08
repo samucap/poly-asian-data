@@ -148,7 +148,9 @@ test-ws:
 #   make build-signal-eval
 #   make run-signal-eval ARGS='--synthetic'
 #   make run-signal-eval ARGS='--lookback 168h --risk configs/risk/default.yaml'
-#   make run-signal-eval ARGS='--lookback 168h --limit 50000 --min-edge-bps 25 --max-spread-bps 200'
+#   make run-signal-eval ARGS='--lookback 168h --source board'
+#   make run-signal-eval ARGS='--lookback 168h --source signals --load-order newest --limit 50000'
+#   make run-signal-eval ARGS='--lookback 168h --source signals --limit 0'   # full intent tape (RAM)
 #   make backtest-paper ARGS='--synthetic'   # alias
 #   make test-signal-eval
 # =============================================================================

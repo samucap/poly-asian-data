@@ -39,6 +39,21 @@ func TestEvaluateEmitsOnPositiveEdge(t *testing.T) {
 	require.Contains(t, sig.Reason, "gates")
 }
 
+func TestCandidateIncludesBelowMinEdge(t *testing.T) {
+	cfg := DefaultGateConfig()
+	cfg.MinEdgeBps = 100
+	cfg.Cooldown = 0
+	e := NewEmitter(cfg)
+	now := time.Now().UTC()
+	net := 40.0
+	board := BoardSnap{ConditionID: "c1", TokenID: "t1", EdgeBps: &net, CapacityUSD: ptr(1e9)}
+	book := BookSnap{BestBid: 0.48, BestAsk: 0.50, Mid: 0.49, BidDepth: 500, AskDepth: 500, UpdatedAt: now}
+	require.Nil(t, e.Evaluate(now, "default", board, book))
+	got := e.Candidate(now, "default", board, book)
+	require.NotNil(t, got)
+	require.Greater(t, got.EdgeBps, 0.0)
+}
+
 func TestEvaluateMinEdgeSkip(t *testing.T) {
 	cfg := DefaultGateConfig()
 	cfg.MinEdgeBps = 100

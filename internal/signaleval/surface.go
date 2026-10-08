@@ -37,6 +37,8 @@ type WindowMeta struct {
 	NSignalsDB  int    `json:"n_signals_db,omitempty"`
 	LoadLimit   int    `json:"load_limit,omitempty"`
 	Capped      bool   `json:"capped,omitempty"`
+	LoadOrder   string `json:"load_order,omitempty"`
+	Source      string `json:"source,omitempty"`
 	Worthiness  string `json:"worthiness_filter,omitempty"`
 }
 
@@ -74,7 +76,7 @@ func BuildSurface(runID, strategy string, res Result, from, to time.Time, minSam
 			Exit:  "mid_at_horizon",
 			Notes: "paper only",
 		},
-		Notes: "Hard risk constraints first. When auction_enabled, alloc_window ranks the set (outranked ≠ halt). Do not treat ok as economic success — use economic_pass and metrics. Tune from scorecards only (not live edge_bps).",
+		Notes: "Hard risk constraints first. --source board allocates over each published board (all names at T). --source signals uses a load-limited intent tape (default newest N). Do not treat ok as economic success — use economic_pass and metrics. Tune from scorecards only (not live edge_bps).",
 	}
 	s.EconomicPass = res.Metrics.TotalPnLUSD > 0
 	if !from.IsZero() {
@@ -107,6 +109,11 @@ func BuildSurface(runID, strategy string, res Result, from, to time.Time, minSam
 
 // ApplyLoadMeta records D5 cap honesty on the window.
 func (s *Surface) ApplyLoadMeta(loaded, dbCount, limit int, capped bool, worthiness string) {
+	s.ApplyWindowExtra(loaded, dbCount, limit, capped, "", "signals", worthiness)
+}
+
+// ApplyWindowExtra records load cap, order, and eval source.
+func (s *Surface) ApplyWindowExtra(loaded, dbCount, limit int, capped bool, order, source, worthiness string) {
 	if s == nil {
 		return
 	}
@@ -114,8 +121,13 @@ func (s *Surface) ApplyLoadMeta(loaded, dbCount, limit int, capped bool, worthin
 	s.Window.NSignalsDB = dbCount
 	s.Window.LoadLimit = limit
 	s.Window.Capped = capped
+	s.Window.LoadOrder = order
+	s.Window.Source = source
 	s.Window.Worthiness = worthiness
-	if capped {
+	if capped && source != "board_snapshots" {
 		s.Notes += " signal load capped; scorecard is a slice of the window, not the full population."
+	}
+	if source == "board_snapshots" {
+		s.Notes += " paper path: whole-board allocation on edge_board_snapshots."
 	}
 }
