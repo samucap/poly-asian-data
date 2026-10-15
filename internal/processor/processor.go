@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/url"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,6 +53,12 @@ type Processor struct {
 	// OI merge buffer for top-markets: conditionID → oi value (MergeOI metadata).
 	oiMergeMu sync.Mutex
 	oiMerge   map[string]float64
+
+	// Sport-sync: IDs + league rows collected from /sports; tag defs then hierarchy applied after.
+	// Serial GET /tags/{id} avoids Cloudflare 1015; hierarchy runs only after defs (no null stubs).
+	sportTagDefMu     sync.Mutex
+	sportTagDefIDs    map[string]struct{}
+	pendingLeagues    []services.PlyMktSport
 }
 
 // SaverPayload represents a chunk of data destined for a specific table.
@@ -129,6 +136,7 @@ func New(ctx context.Context, cfg *config.Config, numWorkers, qSize int) (*Proce
 		cfg:                 cfg,
 		processedConditions: make(map[string]bool),
 		oiMerge:             make(map[string]float64),
+		sportTagDefIDs:      make(map[string]struct{}),
 	}
 
 	pool, err := workerpool.NewPool(ctx, "processor", numWorkers, qSize, logger, p.workerTask)
@@ -251,19 +259,54 @@ func (p *Processor) workerTask(ctx context.Context, resp *fetcher.Response) (*Ou
 // Logic Implementation
 // =============================================================================
 
-// processTags handles /tags response.
-// 1. Identifies Sport Categories.
-// 2. Generates Derived Requests for events for each Sport Category.
-// 3. Emits all tags for saving.
+// processTags handles /tags responses:
+//   - list:  GET /tags?limit=&offset=  → JSON array
+//   - by id: GET /tags/{id}           → JSON object
+// Non-JSON bodies (Gamma error text at high offset, etc.) are soft-skipped.
 func (p *Processor) processTags(resp *fetcher.Response) (*Output, error) {
 	var tags []services.PlyMktTag
-	if err := json.Unmarshal(resp.Data, &tags); err != nil {
-		return nil, err
+
+	data := bytes.TrimSpace(resp.Data)
+	if len(data) == 0 {
+		return &Output{ItemCount: 0, OriginalRequest: resp.Request}, nil
+	}
+
+	switch data[0] {
+	case '[':
+		if err := json.Unmarshal(data, &tags); err != nil {
+			// Soft-fail: deep pagination often returns non-array error text.
+			p.logger.Warn("tags list unmarshal failed; skipping page",
+				slog.String("url", resp.URL),
+				slog.String("error", err.Error()),
+			)
+			return &Output{ItemCount: 0, OriginalRequest: resp.Request}, nil
+		}
+	case '{':
+		// Single tag object (GET /tags/{id}) or error object.
+		var one services.PlyMktTag
+		if err := json.Unmarshal(data, &one); err != nil {
+			p.logger.Warn("tag object unmarshal failed; skipping",
+				slog.String("url", resp.URL),
+				slog.String("error", err.Error()),
+			)
+			return &Output{ItemCount: 0, OriginalRequest: resp.Request}, nil
+		}
+		if one.ID == "" {
+			// e.g. {"error":"..."} without id
+			return &Output{ItemCount: 0, OriginalRequest: resp.Request}, nil
+		}
+		tags = []services.PlyMktTag{one}
+	default:
+		// Non-JSON (e.g. "error ..." / "exceeded ...")
+		p.logger.Warn("tags response not JSON; skipping",
+			slog.String("url", resp.URL),
+			slog.String("prefix", string(data[:min(40, len(data))])),
+		)
+		return &Output{ItemCount: 0, OriginalRequest: resp.Request}, nil
 	}
 
 	payloads := []SaverPayload{}
 	if len(tags) > 0 {
-		// Start of the pipeline: definitions
 		payloads = append(payloads, SaverPayload{TableName: "tags_definitions", Data: tags})
 	}
 
@@ -456,16 +499,57 @@ func (p *Processor) processEvents(resp *fetcher.Response) (*Output, error) {
 }
 
 // processLeagues handles /sports response (which are Leagues).
+// Saves league rows only. Queues tag IDs for serial GET /tags/{id} and league
+// rows for hierarchy apply after definitions exist (no null label/slug stubs).
 func (p *Processor) processLeagues(resp *fetcher.Response) (*Output, error) {
+	data := bytes.TrimSpace(resp.Data)
+	if len(data) == 0 || data[0] != '[' {
+		p.logger.Warn("sports/leagues response not a JSON array; skipping",
+			slog.String("url", resp.URL),
+		)
+		return &Output{ItemCount: 0, OriginalRequest: resp.Request}, nil
+	}
+
 	var leagues []services.PlyMktSport
-	if err := json.Unmarshal(resp.Data, &leagues); err != nil {
+	if err := json.Unmarshal(data, &leagues); err != nil {
 		return nil, err
 	}
 
 	payloads := []SaverPayload{}
 	if len(leagues) > 0 {
+		// League metadata only here. Hierarchy runs later in SyncSportsTags after
+		// serial tag defs so UPDATE parent_tag_id never races blank INSERT stubs.
 		payloads = append(payloads, SaverPayload{TableName: "leagues", Data: leagues})
 	}
+
+	// Queue tag IDs + league rows for post-batch apply (not concurrent DerivedRequests —
+	// Gamma/Cloudflare rate-limits burst GET /tags/{id} with 1015).
+	p.sportTagDefMu.Lock()
+	if p.sportTagDefIDs == nil {
+		p.sportTagDefIDs = make(map[string]struct{})
+	}
+	p.sportTagDefIDs["1"] = struct{}{}   // Sports
+	p.sportTagDefIDs["64"] = struct{}{}  // Esports
+	p.sportTagDefIDs["678"] = struct{}{} // baseball
+	for _, l := range leagues {
+		p.pendingLeagues = append(p.pendingLeagues, l)
+		for _, id := range strings.Split(l.Tags, ",") {
+			id = strings.TrimSpace(id)
+			if id == "" || id == "100639" { // skip Games meta
+				continue
+			}
+			p.sportTagDefIDs[id] = struct{}{}
+		}
+	}
+	pendingIDs := len(p.sportTagDefIDs)
+	pendingLeagues := len(p.pendingLeagues)
+	p.sportTagDefMu.Unlock()
+
+	p.logger.Info("queued sport tag definitions for serial fetch",
+		slog.Int("unique_tag_ids", pendingIDs),
+		slog.Int("pending_leagues", pendingLeagues),
+		slog.Int("leagues_this_page", len(leagues)),
+	)
 
 	return &Output{
 		SaverPayloads:   payloads,
@@ -474,11 +558,60 @@ func (p *Processor) processLeagues(resp *fetcher.Response) (*Output, error) {
 	}, nil
 }
 
+// TakePendingSportTagIDs returns and clears tag IDs queued by processLeagues.
+func (p *Processor) TakePendingSportTagIDs() []string {
+	p.sportTagDefMu.Lock()
+	defer p.sportTagDefMu.Unlock()
+	if len(p.sportTagDefIDs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(p.sportTagDefIDs))
+	for id := range p.sportTagDefIDs {
+		out = append(out, id)
+	}
+	p.sportTagDefIDs = make(map[string]struct{})
+	sort.Strings(out)
+	return out
+}
+
+// TakePendingLeagues returns and clears league rows queued by processLeagues
+// (for hierarchy apply after tag definitions are saved).
+func (p *Processor) TakePendingLeagues() []services.PlyMktSport {
+	p.sportTagDefMu.Lock()
+	defer p.sportTagDefMu.Unlock()
+	out := p.pendingLeagues
+	p.pendingLeagues = nil
+	return out
+}
+
+// ProcessTagsForSave unmarshals a tag API body and returns saver payloads (tags_definitions).
+// Used by sports-sync serial definition fetch outside the worker pool.
+func (p *Processor) ProcessTagsForSave(resp *fetcher.Response) ([]SaverPayload, error) {
+	out, err := p.processTags(resp)
+	if err != nil {
+		return nil, err
+	}
+	if out == nil {
+		return nil, nil
+	}
+	return out.SaverPayloads, nil
+}
+
 // processTeams handles /teams response.
 func (p *Processor) processTeams(resp *fetcher.Response) (*Output, error) {
+	data := bytes.TrimSpace(resp.Data)
+	if len(data) == 0 || data[0] != '[' {
+		// Empty or non-JSON at high offset — not a hard failure.
+		return &Output{ItemCount: 0, OriginalRequest: resp.Request}, nil
+	}
+
 	var teams []services.PlyMktTeam
-	if err := json.Unmarshal(resp.Data, &teams); err != nil {
-		return nil, err
+	if err := json.Unmarshal(data, &teams); err != nil {
+		p.logger.Warn("teams unmarshal failed; skipping page",
+			slog.String("url", resp.URL),
+			slog.String("error", err.Error()),
+		)
+		return &Output{ItemCount: 0, OriginalRequest: resp.Request}, nil
 	}
 
 	payloads := []SaverPayload{}

@@ -17,6 +17,9 @@ go.work
 # Test Output
 coverage.out
 
+# Pipeline run artifacts (catalog_v1, edge_board, etc.)
+artifacts
+
 # IDEs
 .idea/
 .vscode/

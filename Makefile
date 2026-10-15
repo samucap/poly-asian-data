@@ -6,14 +6,239 @@ DOCKER_COMPOSE_POSTGRES=docker-compose.postgres.yml
 DOCKER_COMPOSE_APP=docker-compose.app.yml
 MAIN_PATH=cmd/main.go
 
-.PHONY: all build clean test coverage lint run dev audit sec docker-up docker-down db-up db-down app-up app-down
+.PHONY: all build build-catalog build-top-markets build-edge-scan build-edge-eval build-strategy build-ws-listener build-signal-eval clean test coverage lint run run-catalog-markets run-catalog-markets-once run-edge-scan run-edge-scan-once run-edge-eval run-strategy run-strategy-register run-strategy-list run-strategy-active run-strategy-show run-strategy-promote run-strategy-rollback run-strategy-candidate run-ws-listener run-signal-eval test-eval test-strategy test-ws test-signal-eval edge-board-top edge-board-verify edge-scan-once-top edge-scan-top edge-scan-verify scorecard-freeze scorecard-list scorecard-show dev audit sec docker-up docker-down db-up db-down app-up app-down
 
 all: build
+
+# Pass-through to the Go binary — same flags as `go run ./cmd/... --once`.
+# Make steals bare `--once`, so put CLI flags in ARGS:
+#   make run-edge-scan ARGS='--once'
+#   make run-edge-scan ARGS='--once --weights configs/strategies/default.yaml'
+#   make run-catalog-markets ARGS='--once'
+# Default ARGS empty = continuous (no --once).
+ARGS ?=
 
 # Build the binary
 build:
 	@echo "Building..."
 	CGO_ENABLED=0 go build -ldflags="-w -s" -o bin/$(BINARY_NAME) $(MAIN_PATH)
+
+# Catalog-markets: full open-universe sync + catalog_v1 artifact
+build-catalog:
+	@echo "Building catalog-markets..."
+	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/catalog-markets ./cmd/catalog-markets
+
+build-edge-scan:
+	@echo "Building edge-scan..."
+	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/edge-scan ./cmd/edge-scan
+
+build-edge-eval:
+	@echo "Building edge-eval..."
+	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/edge-eval ./cmd/edge-eval
+
+build-strategy:
+	@echo "Building strategy (M5)..."
+	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/strategy ./cmd/strategy
+
+# Catalog run (default continuous)
+run-catalog-markets:
+	go run ./cmd/catalog-markets $(ARGS)
+
+run-catalog-markets-once:
+	go run ./cmd/catalog-markets --once $(ARGS)
+
+# Wipe tags (FK-safe) + sports-sync + force API catalog rebuild (always one-shot)
+run-catalog-markets-reset-tags:
+	go run ./cmd/catalog-markets --reset-tags --once $(ARGS)
+
+# Edge-scan run (default continuous)
+run-edge-scan:
+	go run ./cmd/edge-scan $(ARGS)
+
+run-edge-scan-once:
+	go run ./cmd/edge-scan --once $(ARGS)
+
+# Board-policy backtest / edge-eval (DB-only by default; optional --backfill-prices)
+#   make run-edge-eval
+#   make run-edge-eval ARGS='--lookback 168h --persist-labels'
+#   make run-edge-eval ARGS='--backfill-prices --lookback 720h'
+#   make run-edge-eval ARGS='--version-id 1'
+#   make backtest-board ARGS='--lookback 168h'   # alias
+# Empty --weights → configs/strategies/default.yaml
+run-edge-eval:
+	go run ./cmd/edge-eval $(ARGS)
+
+# Human alias: board-policy backtest. Not paper $ PnL.
+.PHONY: backtest-board
+backtest-board: run-edge-eval
+
+# Dev: real CLOB price pull + synthetic gap-fill (labeled; blocks promote if synth high).
+#   make backtest-board-dev ARGS='--lookback 168h --weights configs/strategies/balanced_spread_capture.yaml'
+.PHONY: backtest-board-dev
+backtest-board-dev:
+	go run ./cmd/edge-eval --backfill-prices --synth-fill $(ARGS)
+
+# =============================================================================
+# M5 strategy versions (register / promote / rollback)
+# Make steals bare flags — put them in ARGS / named vars:
+#   make run-strategy CMD=list
+#   make run-strategy-register
+#   make run-strategy-register WEIGHTS=configs/strategies/default.yaml ARGS='--note baseline'
+#   make run-strategy-promote ID=1 SURFACE=artifacts/eval_surface/latest.json
+#   make run-strategy-active
+#   make run-strategy-rollback STRATEGY=default
+#   make test-strategy
+# =============================================================================
+CMD ?=
+WEIGHTS ?= configs/strategies/default.yaml
+ID ?=
+SURFACE ?= artifacts/eval_surface/latest.json
+STRATEGY ?= default
+
+run-strategy:
+	@if [ -z "$(CMD)" ]; then echo "usage: make run-strategy CMD=<register|list|active|show|promote|rollback|candidate> ARGS='...'"; exit 1; fi
+	go run ./cmd/strategy $(CMD) $(ARGS)
+
+run-strategy-register:
+	go run ./cmd/strategy register --weights $(WEIGHTS) $(ARGS)
+
+run-strategy-list:
+	go run ./cmd/strategy list --strategy $(STRATEGY) $(ARGS)
+
+run-strategy-active:
+	go run ./cmd/strategy active --strategy $(STRATEGY) $(ARGS)
+
+run-strategy-show:
+	@if [ -z "$(ID)" ]; then echo "usage: make run-strategy-show ID=<version_id>"; exit 1; fi
+	go run ./cmd/strategy show --id $(ID) $(ARGS)
+
+run-strategy-promote:
+	@if [ -z "$(ID)" ]; then echo "usage: make run-strategy-promote ID=<version_id> SURFACE=$(SURFACE)"; exit 1; fi
+	go run ./cmd/strategy promote --id $(ID) --surface $(SURFACE) $(ARGS)
+
+run-strategy-rollback:
+	go run ./cmd/strategy rollback --strategy $(STRATEGY) $(ARGS)
+
+run-strategy-candidate:
+	@if [ -z "$(ID)" ]; then echo "usage: make run-strategy-candidate ID=<version_id>"; exit 1; fi
+	go run ./cmd/strategy candidate --id $(ID) $(ARGS)
+
+test-strategy:
+	go test ./internal/strategyreg/ ./internal/db/ -count=1 -run 'Strategy|Promote|Resolve|CheckPromote|Params|Gate'
+
+# =============================================================================
+# M6 ws-listener (board-only market WS + paper signals; no OMS)
+#   make build-ws-listener
+#   make run-ws-listener
+#   make run-ws-listener ARGS='--once --no-snapshots'
+#   make test-ws
+# =============================================================================
+build-ws-listener:
+	@echo "Building ws-listener (M6)..."
+	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/ws-listener ./cmd/ws-listener
+
+run-ws-listener:
+	go run ./cmd/ws-listener $(ARGS)
+
+test-ws:
+	go test ./internal/ws/market/ ./internal/signals/ ./internal/db/ -count=1 -run 'Cap|Parse|Diff|TakeDirty|Evaluate|BuildFactors|Clean|PriceChange|Book|Subscribe'
+
+# =============================================================================
+# Paper signal + risk eval (fill metrics for external AO; no OMS)
+#   make build-signal-eval
+#   make run-signal-eval ARGS='--synthetic'
+#   make run-signal-eval ARGS='--lookback 168h --risk configs/risk/default.yaml'
+#   make run-signal-eval ARGS='--lookback 168h --source board'
+#   make run-signal-eval ARGS='--lookback 168h --source signals --load-order newest --limit 50000'
+#   make run-signal-eval ARGS='--lookback 168h --source signals --limit 0'   # full intent tape (RAM)
+#   make backtest-paper ARGS='--synthetic'   # alias
+#   make test-signal-eval
+# =============================================================================
+build-signal-eval:
+	@echo "Building signal-eval..."
+	CGO_ENABLED=0 go build -ldflags="-w -s -X github.com/samucap/poly-asian-data/internal/artifacts.CodeCommit=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" -o bin/signal-eval ./cmd/signal-eval
+
+run-signal-eval:
+	go run ./cmd/signal-eval $(ARGS)
+
+# Human alias: paper signals + risk sim. $ PnL / MaxDD.
+.PHONY: backtest-paper
+backtest-paper: run-signal-eval
+
+test-signal-eval:
+	go test ./internal/risk/ ./internal/signaleval/ -count=1
+
+# =============================================================================
+# Scorecard freezes — immutable backtest result checkpoints (research progress)
+#
+# After run-edge-eval + run-signal-eval:
+#   make scorecard-freeze                    # auto title/summary; no NOTE required
+#   make scorecard-freeze LABEL=after-d2     # optional tag only
+#   make scorecard-list / scorecard-show
+#
+# Dir name uses LOCAL time by default (e.g. 2026-08-06T202748), not UTC 03:xxZ.
+# Manifest auto_title / auto_summary / vs_previous / verdicts — no manual interpretation.
+#
+# "Scorecard" = economic result of a backtest (not live logs; not volume baselines).
+# =============================================================================
+LABEL ?=
+NOTE ?=
+BOARD_EVAL ?= artifacts/eval_surface/latest.json
+PAPER_EVAL ?= artifacts/signal_eval_surface/latest.json
+
+scorecard-freeze:
+	@LABEL="$(LABEL)" NOTE="$(NOTE)" BOARD="$(BOARD_EVAL)" PAPER="$(PAPER_EVAL)" \
+		./scripts/freeze_scorecards.sh
+
+scorecard-list:
+	@ls -1 artifacts/scorecards 2>/dev/null | grep -E '^[0-9]{4}-' || echo "(none yet — make scorecard-freeze)"
+
+# Show auto summary for latest freeze (or SCORECARD=dir name)
+SCORECARD ?=
+scorecard-show:
+	@./scripts/show_scorecard.sh "$(SCORECARD)"
+
+# Explain top N markets from artifacts/edge_board/latest.json (no DB required)
+# Usage: make edge-board-top
+#        make edge-board-top N=10
+#        make edge-board-top BOARD=artifacts/edge_board/<run_id>.json
+N ?= 5
+BOARD ?= artifacts/edge_board/latest.json
+# VERIFY_ARGS e.g. --require-fv --strict-extreme --buffer 20
+VERIFY_ARGS ?=
+edge-board-top:
+	@python3 scripts/edge_board_top.py --path "$(BOARD)" -n $(N)
+
+# M3.5 accuracy/optimality gates on latest artifact (no network)
+# Usage: make edge-board-verify
+#        make edge-board-verify BOARD=artifacts/edge_board/latest.json VERIFY_ARGS='--require-fv'
+edge-board-verify:
+	@python3 scripts/edge_board_verify.py --path "$(BOARD)" $(VERIFY_ARGS)
+
+# Run edge-scan with ARGS then print top board
+edge-scan-top: run-edge-scan edge-board-top
+
+# One edge-scan cycle then print top board explanation
+edge-scan-once-top:
+	go run ./cmd/edge-scan --once $(ARGS)
+	@$(MAKE) edge-board-top N=$(N) BOARD="$(BOARD)"
+
+# Full M3.5 sign-off: unit tests → one scan → verify → top explain
+# Usage: make edge-scan-verify
+#        make edge-scan-verify VERIFY_ARGS='--require-fv'
+edge-scan-verify:
+	@echo "== unit tests (edge + edgescan) =="
+	go test ./internal/edge/ ./internal/edgescan/ -count=1
+	@echo "== edge-scan --once =="
+	go run ./cmd/edge-scan --once $(ARGS)
+	@echo "== artifact verify =="
+	@python3 scripts/edge_board_verify.py --path "$(BOARD)" $(VERIFY_ARGS)
+	@echo "== top board =="
+	@python3 scripts/edge_board_top.py --path "$(BOARD)" -n $(N)
+
+# M4.0 + M4 eval package unit tests (vanity win-rate must fail gates)
+test-eval:
+	go test ./internal/eval/ ./internal/enrich/ ./internal/db/ -count=1 -run 'Eval|Fill|Backtest|Price|Label|SelectPrice|Normalize'
 
 # Clean build artifacts
 clean:

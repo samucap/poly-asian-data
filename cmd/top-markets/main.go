@@ -25,8 +25,8 @@ import (
 	"github.com/samucap/poly-asian-data/internal/tagagg"
 )
 
-// Categories root on Polymarket; top tags have parent_tag_id = this.
-const topCategoriesParentTagID = "102982"
+// categoriesRootTagID is Polymarket's categories root; top tags have parent_tag_id = this.
+const categoriesRootTagID = "102982"
 
 // Gamma keyset max page size.
 const gammaKeysetLimit = 500
@@ -68,7 +68,6 @@ func main() {
 	defer pipe.Stop()
 
 	dbPool := factory.DB()
-	// TODO: abstract secure HTTP client dial into a modular reusable constructor.
 	httpClient := fetcher.NewSecureHTTPClient()
 
 	defaultFilter := marketranking.MarketFilter{
@@ -79,34 +78,36 @@ func main() {
 		MaxN:          cfg.TopMarkets.MaxN,
 	}
 	fetchInterval := cfg.TopMarkets.RefreshInterval
+	fetcher.PaginateDelay = cfg.TopMarkets.PaginateDelay
 
-	// Catalog: top tags under 102982. Prefer DB; API only when empty.
-	// Metric aggregates are written later after the market pass — not here.
-	// TODO(later): explore related-tags for tags outside root 102982 if taxonomy gaps appear.
-	// TODO(later): event/market tags as FK arrays in Postgres.
-	topCats := loadTopTags(ctx, logger, pipe, dbPool, httpClient, cfg)
-	topTagByID := tagagg.TopByID(topCats, topCategoriesParentTagID)
-	logger.Info("top tags ready", "count", len(topTagByID))
+	// Tag catalog under 102982: DB when watermark fresh; API related-tags BFS when stale.
+	// Metric aggregates are recomputed every cycle after the market pass.
+	// TODO(later): related-tags outside root 102982; event/market tag FK arrays.
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 
+	// TODO: change this into separate pipelines. one for full event/tag fetching and syncing, another for top-market watch with optimized
+	// filters for fetching events
 	runCycle := func() {
 		logger.Info("market refresh cycle starting")
 		start := time.Now()
-		statsBefore := pipe.Stats()
+		stage := start
 
-		// 1. Keyset-fetch all open events (no offset; cursor only).
+		catalog := loadTagCatalog(ctx, logger, dbPool, httpClient, cfg, start)
+		logger.Info("stage complete", "stage", "catalog", "duration", logging.FormatDuration(time.Since(stage)), "tags", logging.FormatCount(int64(len(catalog))))
+
+		// 1. Keyset-fetch open events (sequential pages; filters shrink the universe).
+		stage = time.Now()
 		gammaBase, _ := cfg.Services.PlyMkt.Endpoints["gamma"].(string)
-		if gammaBase == "" {
-			gammaBase = "https://gamma-api.polymarket.com"
-		}
 		u, err := url.Parse(gammaBase + "/events/keyset")
 		if err != nil {
 			logger.Error("failed to parse gamma keyset URL", "error", err)
 			return
 		}
 		// Documented keyset params only — omit offset (callers must not set it).
+		// No volume_min / liquidity_min / end_date_* for now: full open-universe scan
+		// so tag aggregates and market saves are not undercounted. Rank filters stay in-process.
 		q := u.Query()
 		q.Set("closed", "false")
 		q.Set("active", "true")
@@ -120,13 +121,36 @@ func main() {
 			logger.Error("failed to fetch events (keyset)", "error", err)
 			return
 		}
-		logger.Info("events fetched", "count", logging.FormatCount(int64(len(events))))
+		logger.Info("stage complete",
+			"stage", "events_keyset",
+			"duration", logging.FormatDuration(time.Since(stage)),
+			"events", logging.FormatCount(int64(len(events))),
+		)
 
-		// 2. Classify + aggregate once per tradable market onto top category only.
-		agg := tagagg.Aggregate(events, topTagByID)
+		// 2. Classify + aggregate (single-threaded; full event list).
+		stage = time.Now()
+		var agg tagagg.Result
+		if len(catalog) == 0 {
+			logger.Warn("tag catalog map empty; cycle continues without tag aggregates")
+			// TODO: why's this here? Shouldn't it just skip?
+			agg = tagagg.Aggregate(events, nil, categoriesRootTagID)
+		} else {
+			agg = tagagg.Aggregate(events, catalog, categoriesRootTagID)
+			if agg.UnresolvedMarkets > 0 {
+				logger.Info("unresolved markets (no tag path)",
+					"unresolved_markets", logging.FormatCount(int64(agg.UnresolvedMarkets)),
+				)
+			}
+		}
 
 		// 3. Global rank over tradable pool.
 		ranked := marketranking.RankMarkets(agg.Tradable, defaultFilter)
+		logger.Info("stage complete",
+			"stage", "aggregate_rank",
+			"duration", logging.FormatDuration(time.Since(stage)),
+			"tradable", logging.FormatCount(int64(len(agg.Tradable))),
+			"ranked", logging.FormatCount(int64(len(ranked))),
+		)
 
 		var conditionIDs []string
 		var clobTokens []clobToken
@@ -147,7 +171,25 @@ func main() {
 			}
 		}
 
-		// 4. Enrichment then merge OI into save-side markets (and ranked).
+		// 4. Persist tags once (defs + parent + aggregates) before enrichment wait.
+		stage = time.Now()
+		if len(catalog) > 0 {
+			toWrite := tagagg.TagsForUpdate(agg.Tags)
+			// Root first so parent_tag_id FKs resolve for top categories.
+			toWrite = append([]*services.PlyMktTag{{
+				ID:    categoriesRootTagID,
+				Label: "Categories",
+				Slug:  "categories",
+			}}, toWrite...)
+			// TODO: why isn't this a parallelized process?
+			if err := db.UpdateTags(ctx, dbPool, toWrite); err != nil {
+				logger.Error("failed to update tags", "error", err)
+			}
+		}
+		logger.Info("stage complete", "stage", "update_tags", "duration", logging.FormatDuration(time.Since(stage)))
+
+		// 5. Enrichment for ranked markets only (parallel via fetcher/processor pools).
+		stage = time.Now()
 		submitEnrichment(ctx, pipe, cfg, conditionIDs, clobTokens)
 		pipe.WaitUntilIdle(ctx, 500*time.Millisecond)
 
@@ -165,27 +207,15 @@ func main() {
 				m.OpenInterest = sm.OpenInterest
 			}
 		}
+		logger.Info("stage complete",
+			"stage", "enrichment",
+			"duration", logging.FormatDuration(time.Since(stage)),
+			"conditions", logging.FormatCount(int64(len(conditionIDs))),
+			"clob_tokens", logging.FormatCount(int64(len(clobTokens))),
+		)
 
-		// 5. Persist category aggregates after scan (zeros for idle top tags), then events/markets.
-		if err := db.UpdateTagAggregates(ctx, dbPool, tagagg.ToTagAggregates(agg.Categories, topTagByID)); err != nil {
-			logger.Error("failed to update tag aggregates", "error", err)
-		}
-
-		eventsSlice := make([]services.PlyMktEvent, 0, len(events))
-		for _, e := range events {
-			if e != nil {
-				eventsSlice = append(eventsSlice, *e)
-			}
-		}
-		if len(eventsSlice) > 0 {
-			if err := pipe.SubmitSave(ctx, &saver.Record{
-				TableName: "plymkt_events",
-				Data:      eventsSlice,
-				ItemCount: len(eventsSlice),
-			}); err != nil {
-				logger.Error("failed to submit events save", "error", err)
-			}
-		}
+		// 6. Save markets (after OI merge).
+		stage = time.Now()
 		if len(agg.Markets) > 0 {
 			if err := pipe.SubmitSave(ctx, &saver.Record{
 				TableName: "plymkt_markets",
@@ -195,8 +225,8 @@ func main() {
 				logger.Error("failed to submit markets save", "error", err)
 			}
 		}
-
 		pipe.WaitUntilIdle(ctx, 500*time.Millisecond)
+		logger.Info("stage complete", "stage", "save_markets", "duration", logging.FormatDuration(time.Since(stage)))
 
 		duration := time.Since(start)
 		nextAt := time.Now().Add(fetchInterval)
@@ -206,7 +236,7 @@ func main() {
 			"next_at", nextAt.Format("15:04:05"),
 		)
 		// Direct keyset HTTP is outside the fetcher worker pool — stage report is enrichment+saves only.
-		pipe.LogStageReport("cycle", pipeline.DiffStats(statsBefore, pipe.Stats()))
+		pipe.LogStageReport("cycle", pipe.Stats())
 		logCycleOverview(logger, events, agg, ranked)
 	}
 
@@ -230,91 +260,60 @@ func main() {
 	}
 }
 
-// loadTopTags loads top tags under 102982. Freshness uses pipeline watermark
-// (sync_state key top_markets.tag_catalog), NOT tags.updated_at (polluted by aggregates).
-// When watermark is missing/stale (>24h), re-fetch related-tags and refresh definitions/hierarchy.
-func loadTopTags(
-	ctx context.Context,
-	logger *slog.Logger,
-	pipe *pipeline.Pipeline,
-	dbPool db.DBInterface,
-	httpClient *http.Client,
-	cfg *config.Config,
-) []*services.PlyMktTag {
-	dbTags, _, err := db.FetchTopCategoryTags(ctx, dbPool, topCategoriesParentTagID)
-	if err != nil {
-		logger.Warn("failed to load top tags from DB", "error", err)
-		dbTags = nil
-	}
-
+// loadTagCatalog loads the category tag map under categoriesRootTagID.
+// Freshness uses sync_state watermark top_markets.tag_catalog (not tags.updated_at,
+// which is polluted by aggregate writes). When stale/missing, BFS related-tags from API.
+// Always returns a non-nil map (empty if both API and DB fail).
+func loadTagCatalog(ctx context.Context, logger *slog.Logger, dbPool db.DBInterface, httpClient *http.Client, cfg *config.Config, now time.Time) map[string]*services.PlyMktTag {
 	wm, hasWM, err := db.GetWatermark(ctx, dbPool, db.WatermarkTopMarketsTagCatalog)
 	if err != nil {
 		logger.Warn("failed to read tag catalog watermark; will refresh from API", "error", err)
 		hasWM = false
 	}
-	needsRefresh := db.CatalogNeedsRefresh(wm, hasWM, time.Now(), db.DefaultTagCatalogTTL)
 
-	if len(dbTags) > 0 && !needsRefresh {
-		logger.Info("loaded top tags from database",
-			"count", len(dbTags),
-			"catalog_age", logging.FormatDuration(time.Since(wm).Round(time.Minute)),
-		)
-		return dbTags
-	}
+	needsRefresh := db.CatalogNeedsRefresh(wm, hasWM, now, db.DefaultTagCatalogTTL)
 
-	if needsRefresh && len(dbTags) > 0 {
-		logger.Info("tag catalog watermark stale or missing; refreshing related-tags from API",
-			"db_count", len(dbTags),
-			"has_watermark", hasWM,
-		)
+	if !needsRefresh {
+		catalog, err := loadCategoriesFromDB(ctx, dbPool)
+		if err != nil {
+			logger.Warn("failed to load tag catalog from DB; falling back to API", "error", err)
+		} else if len(catalog) > 0 {
+			logger.Info("tag catalog loaded from DB", "count", logging.FormatCount(int64(len(catalog))))
+			return catalog
+		} else {
+			logger.Warn("tag catalog empty in DB despite fresh watermark; refreshing from API")
+		}
 	} else {
-		logger.Info("no top tags in DB; fetching from API")
+		logger.Info("tag catalog watermark stale or missing; refreshing related-tags from API")
 	}
 
-	cats, err := fetchTopCategories(ctx, httpClient, cfg)
+	catalog, err := fetchCategories(ctx, logger, httpClient, cfg)
 	if err != nil {
-		if len(dbTags) > 0 {
-			logger.Error("failed to refresh top categories; using stale DB catalog", "error", err)
-			return dbTags
+		logger.Error("failed to fetch categories from API", "error", err)
+		// Last resort: DB even if watermark said refresh.
+		if dbCatalog, dbErr := loadCategoriesFromDB(ctx, dbPool); dbErr == nil && len(dbCatalog) > 0 {
+			logger.Warn("using DB tag catalog after API failure", "count", logging.FormatCount(int64(len(dbCatalog))))
+			return dbCatalog
 		}
-		logger.Error("failed to fetch top categories", "error", err)
-		os.Exit(1)
+		return map[string]*services.PlyMktTag{}
 	}
 
-	var tagsSlice []services.PlyMktTag
-	for _, t := range cats {
-		if t != nil {
-			tagsSlice = append(tagsSlice, *t)
-		}
-	}
-	if len(tagsSlice) > 0 {
-		// Definitions/hierarchy only — metric aggregates written after market scan.
-		if err := pipe.SubmitSave(ctx, &saver.Record{
-			TableName: "tags_definitions",
-			Data:      tagsSlice,
-			ItemCount: len(tagsSlice),
-		}); err != nil {
-			logger.Error("failed to submit tags save", "error", err)
-		} else {
-			pipe.WaitUntilIdle(ctx, 200*time.Millisecond)
-		}
-		if err := pipe.SubmitSave(ctx, &saver.Record{
-			TableName: "tags_hierarchy",
-			Data:      tagsSlice,
-			ItemCount: len(tagsSlice),
-		}); err != nil {
-			logger.Error("failed to submit tags hierarchy save", "error", err)
-		} else {
-			pipe.WaitUntilIdle(ctx, 200*time.Millisecond)
-		}
-	}
-
-	if err := db.SetWatermark(ctx, dbPool, db.WatermarkTopMarketsTagCatalog, time.Now().UTC()); err != nil {
+	if err := db.SetWatermark(ctx, dbPool, db.WatermarkTopMarketsTagCatalog, now.UTC()); err != nil {
 		logger.Warn("failed to set tag catalog watermark", "error", err)
 	} else {
 		logger.Info("tag catalog watermark updated", "key", db.WatermarkTopMarketsTagCatalog)
 	}
-	return cats
+	logger.Info("tag catalog fetched from API", "count", logging.FormatCount(int64(len(catalog))))
+	return catalog
+}
+
+// loadCategoriesFromDB rebuilds the seed catalog map from tags under the categories root.
+func loadCategoriesFromDB(ctx context.Context, dbPool db.DBInterface) (map[string]*services.PlyMktTag, error) {
+	tags, _, err := db.FetchTagSubtree(ctx, dbPool, categoriesRootTagID)
+	if err != nil {
+		return nil, err
+	}
+	return tagagg.CatalogToMap(tags, categoriesRootTagID), nil
 }
 
 func endpoint(cfg *config.Config, key, fallback string) string {
@@ -330,6 +329,25 @@ func submitEnrichment(ctx context.Context, pipe *pipeline.Pipeline, cfg *config.
 	dataAPI := endpoint(cfg, "data_api", "https://data-api.polymarket.com")
 	clobAPI := endpoint(cfg, "clob", "https://clob.polymarket.com")
 
+	tm := cfg.TopMarkets
+	tradesBatchSize := tm.TradesBatchSize
+	if tradesBatchSize <= 0 {
+		tradesBatchSize = 40
+	}
+	priceBatchSize := tm.PriceBatchSize
+	if priceBatchSize <= 0 {
+		priceBatchSize = 40
+	}
+	priceFidelity := tm.PriceFidelity
+	if priceFidelity <= 0 {
+		priceFidelity = 60
+	}
+	priceLookback := tm.PriceLookback
+	if priceLookback <= 0 {
+		priceLookback = 30 * 24 * time.Hour
+	}
+
+	// OI / trades / prices / books: fetcher only downloads raw bytes; processors unmarshal.
 	for _, id := range conditionIDs {
 		if id == "" {
 			continue
@@ -348,7 +366,6 @@ func submitEnrichment(ctx context.Context, pipe *pipeline.Pipeline, cfg *config.
 		})
 	}
 
-	const tradesBatchSize = 20
 	for i := 0; i < len(conditionIDs); i += tradesBatchSize {
 		end := i + tradesBatchSize
 		if end > len(conditionIDs) {
@@ -371,15 +388,16 @@ func submitEnrichment(ctx context.Context, pipe *pipeline.Pipeline, cfg *config.
 		})
 	}
 
+	// TODO: this needs to be per market? or does the lastUpdated from any lastUpdated cover all?
 	priceFetchFrom := lastPriceFetchTs
 	if priceFetchFrom == 0 {
-		priceFetchFrom = time.Now().Unix() - 30*24*60*60
+		priceFetchFrom = time.Now().Unix() - int64(priceLookback.Seconds())
 	} else {
-		priceFetchFrom -= 3600
+		priceFetchFrom -= 3600 // small overlap with prior cycle
 	}
 	lastPriceFetchTs = time.Now().Unix()
+	fidelityStr := fmt.Sprintf("%d", priceFidelity)
 
-	const priceBatchSize = 20
 	for i := 0; i < len(clobTokens); i += priceBatchSize {
 		end := i + priceBatchSize
 		if end > len(clobTokens) {
@@ -396,7 +414,7 @@ func submitEnrichment(ctx context.Context, pipe *pipeline.Pipeline, cfg *config.
 			"markets":  markets,
 			"start_ts": float64(priceFetchFrom),
 			"interval": "max",
-			"fidelity": 5,
+			"fidelity": priceFidelity,
 		}
 		bodyBytes, _ := json.Marshal(body)
 		mapBytes, _ := json.Marshal(tokenMap)
@@ -408,7 +426,7 @@ func submitEnrichment(ctx context.Context, pipe *pipeline.Pipeline, cfg *config.
 			Metadata: map[string]string{
 				"Entity":         "top_markets_prices",
 				"TokenMarketMap": string(mapBytes),
-				"Fidelity":       "5",
+				"Fidelity":       fidelityStr,
 			},
 		})
 	}
@@ -440,33 +458,45 @@ func submitEnrichment(ctx context.Context, pipe *pipeline.Pipeline, cfg *config.
 	}
 }
 
-// fetchTopCategories loads only tags under the categories root (no subtag walk).
-// Root is included so hierarchy parent FK (102982) can be written.
-func fetchTopCategories(ctx context.Context, client *http.Client, cfg *config.Config) ([]*services.PlyMktTag, error) {
-	catsID := topCategoriesParentTagID
+// fetchCategories BFS-walks Gamma related-tags under the categories root and builds
+// a seed map with ParentTagID set from the walk edge (currID → related tag).
+func fetchCategories(ctx context.Context, logger *slog.Logger, client *http.Client, cfg *config.Config) (map[string]*services.PlyMktTag, error) {
 	gammaBase := endpoint(cfg, "gamma", "https://gamma-api.polymarket.com")
-	u, err := url.Parse(fmt.Sprintf("%s/tags/%s/related-tags/tags?status=active&omit_empty=true", gammaBase, catsID))
-	if err != nil {
-		return nil, err
-	}
-	tags, err := fetcher.FetchPaginated[services.PlyMktTag](ctx, client, u, 100, 0)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]*services.PlyMktTag, 0, len(tags)+1)
-	out = append(out, &services.PlyMktTag{
-		ID:    catsID,
-		Label: "Categories",
-		Slug:  "categories",
-	})
-	for _, tag := range tags {
-		if tag == nil {
-			continue
+	queue := []string{categoriesRootTagID}
+	seen := map[string]bool{categoriesRootTagID: true}
+	catalog := map[string]*services.PlyMktTag{}
+
+	for len(queue) > 0 {
+		currID := queue[0]
+		queue = queue[1:]
+
+		u, err := url.Parse(fmt.Sprintf("%s/tags/%s/related-tags/tags?status=active&omit_empty=true", gammaBase, currID))
+		if err != nil {
+			return nil, err
 		}
-		tag.ParentTagID = catsID
-		out = append(out, tag)
+		tags, err := fetcher.FetchPaginated[services.PlyMktTag](ctx, client, u, 100, 0)
+		if err != nil {
+			logger.Error("related-tags fetch failed", "tag_id", currID, "error", err)
+			return nil, err
+		}
+
+		for _, t := range tags {
+			if t == nil || t.ID == "" {
+				continue
+			}
+			t.ParentTagID = currID
+			// First visit wins parent edge (BFS from root).
+			if _, exists := catalog[t.ID]; !exists {
+				catalog[t.ID] = t
+			}
+			if !seen[t.ID] {
+				seen[t.ID] = true
+				queue = append(queue, t.ID)
+			}
+		}
 	}
-	return out, nil
+
+	return catalog, nil
 }
 
 func logCycleOverview(
@@ -535,7 +565,7 @@ func logCycleOverview(
 		)
 	}
 
-	sorted := tagagg.SortedByVol24(agg.Categories)
+	sorted := tagagg.SortedByVol24(agg.Tags)
 	const maxTagLines = 15
 	for i, c := range sorted {
 		if i >= maxTagLines {

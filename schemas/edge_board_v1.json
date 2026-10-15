@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://poly-asian.local/schemas/edge_board_v1.json",
+  "title": "edge_board_v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "pipeline_version",
+    "run_id",
+    "generated_at",
+    "input_hash",
+    "code_commit",
+    "status",
+    "errors",
+    "strategy",
+    "board_stats",
+    "board",
+    "dropped_summary"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "strategy": { "type": "string" },
+    "board_stats": { "type": "object" },
+    "board": { "type": "array" },
+    "dropped_summary": { "type": "object" }
+  },
+  "additionalProperties": true
+}

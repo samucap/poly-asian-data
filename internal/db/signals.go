@@ -1,0 +1,457 @@
+package db
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+)
+
+// SignalRow is one multi-dimensional paper intent (M6).
+type SignalRow struct {
+	Time              time.Time
+	SignalID          string
+	Event             string
+	SupersedesID      string
+	Strategy          string
+	StrategyVersionID *int64
+	BoardRunID        string
+	BoardRank         int
+	Mode              string
+
+	ConditionID    string
+	MarketID       string
+	TokenID        string
+	Outcome        string
+	NegRisk        bool
+	NegRiskGroupID string
+
+	Side        string
+	Action      string
+	TimeInForce string
+
+	EdgeBps         float64
+	OpportunityBps  float64
+	ModelEdgeBps    *float64
+	CostBps         float64
+	CostBreakdown   map[string]float64
+	FairValue       *float64
+	FVSource        string
+	ScorePath       string
+
+	Conviction  float64
+	HorizonSec  int
+	HalfLifeSec int
+	Urgency     float64
+
+	SizeUSD     float64
+	SizeShares  float64
+	CapacityUSD float64
+	KellyFrac   *float64
+	RiskFlags   []string
+
+	Mid              float64
+	BestBid          float64
+	BestAsk          float64
+	SpreadBps        float64
+	Imbalance        float64
+	BidDepth         float64
+	AskDepth         float64
+	LastTradePrice   float64
+	BookAgeMs        int
+	FeatureAgeMs     int
+
+	Features map[string]any
+	Factors  map[string]float64
+	Tags     []string
+	Reason   map[string]any
+}
+
+// EnsureSignalsTable creates signals hypertable-ish table if missing.
+func EnsureSignalsTable(ctx context.Context, conn DBInterface) error {
+	if conn == nil {
+		return ErrNilDB
+	}
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS signals (
+			time TIMESTAMPTZ NOT NULL,
+			signal_id UUID NOT NULL,
+			event TEXT NOT NULL DEFAULT 'open',
+			supersedes_id UUID,
+			strategy TEXT NOT NULL DEFAULT 'default',
+			strategy_version_id BIGINT,
+			board_run_id TEXT,
+			board_rank INT,
+			mode TEXT NOT NULL DEFAULT 'paper',
+			condition_id TEXT NOT NULL,
+			market_id TEXT,
+			token_id TEXT NOT NULL,
+			outcome TEXT DEFAULT 'YES',
+			neg_risk BOOLEAN NOT NULL DEFAULT FALSE,
+			neg_risk_group_id TEXT,
+			side TEXT NOT NULL,
+			action TEXT NOT NULL DEFAULT 'ENTER',
+			time_in_force TEXT DEFAULT 'IOC_PAPER',
+			edge_bps DOUBLE PRECISION,
+			opportunity_bps DOUBLE PRECISION,
+			model_edge_bps DOUBLE PRECISION,
+			cost_bps DOUBLE PRECISION,
+			cost_breakdown JSONB,
+			fair_value DOUBLE PRECISION,
+			fv_source TEXT,
+			score_path TEXT,
+			conviction DOUBLE PRECISION,
+			horizon_sec INT,
+			half_life_sec INT,
+			urgency DOUBLE PRECISION,
+			size_usd DOUBLE PRECISION,
+			size_shares DOUBLE PRECISION,
+			capacity_usd DOUBLE PRECISION,
+			kelly_frac DOUBLE PRECISION,
+			risk_flags TEXT[] NOT NULL DEFAULT '{}',
+			mid DOUBLE PRECISION,
+			best_bid DOUBLE PRECISION,
+			best_ask DOUBLE PRECISION,
+			spread_bps DOUBLE PRECISION,
+			imbalance DOUBLE PRECISION,
+			bid_depth DOUBLE PRECISION,
+			ask_depth DOUBLE PRECISION,
+			last_trade_price DOUBLE PRECISION,
+			book_age_ms INT,
+			feature_age_ms INT,
+			features JSONB,
+			factors JSONB,
+			tags TEXT[] NOT NULL DEFAULT '{}',
+			reason JSONB NOT NULL DEFAULT '{}',
+			portfolio_heat DOUBLE PRECISION,
+			correlation_group TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_signals_strategy_time ON signals (strategy, time DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_signals_condition_time ON signals (condition_id, time DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_signals_version_time ON signals (strategy_version_id, time DESC) WHERE strategy_version_id IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_signals_signal_id ON signals (signal_id)`,
+	}
+	for _, s := range stmts {
+		if _, err := conn.Exec(ctx, s); err != nil {
+			return fmt.Errorf("db: ensure signals: %w", err)
+		}
+	}
+	// Best-effort hypertable (ignore if extension missing / already hypertable).
+	_, _ = conn.Exec(ctx, `SELECT create_hypertable('signals', 'time', if_not_exists => TRUE)`)
+	return nil
+}
+
+// InsertSignals appends paper signal rows (batched). Low write rate expected (debounced).
+func InsertSignals(ctx context.Context, conn DBInterface, rows []SignalRow) error {
+	if conn == nil {
+		return ErrNilDB
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	args := make([][]any, 0, len(rows))
+	for _, r := range rows {
+		if r.SignalID == "" || r.ConditionID == "" || r.TokenID == "" || r.Side == "" {
+			continue
+		}
+		ts := r.Time
+		if ts.IsZero() {
+			ts = time.Now().UTC()
+		}
+		event := r.Event
+		if event == "" {
+			event = "open"
+		}
+		mode := r.Mode
+		if mode == "" {
+			mode = "paper"
+		}
+		strategy := r.Strategy
+		if strategy == "" {
+			strategy = "default"
+		}
+		action := r.Action
+		if action == "" {
+			action = "ENTER"
+		}
+		tif := r.TimeInForce
+		if tif == "" {
+			tif = "IOC_PAPER"
+		}
+		outcome := r.Outcome
+		if outcome == "" {
+			outcome = "YES"
+		}
+		flags := r.RiskFlags
+		if flags == nil {
+			flags = []string{}
+		}
+		tags := r.Tags
+		if tags == nil {
+			tags = []string{}
+		}
+		costJSON, _ := json.Marshal(r.CostBreakdown)
+		if r.CostBreakdown == nil {
+			costJSON = []byte("{}")
+		}
+		featJSON, _ := json.Marshal(r.Features)
+		if r.Features == nil {
+			featJSON = []byte("{}")
+		}
+		factJSON, _ := json.Marshal(r.Factors)
+		if r.Factors == nil {
+			factJSON = []byte("{}")
+		}
+		reasonJSON, _ := json.Marshal(r.Reason)
+		if r.Reason == nil {
+			reasonJSON = []byte("{}")
+		}
+		var supersedes any
+		if r.SupersedesID != "" {
+			supersedes = r.SupersedesID
+		}
+		args = append(args, []any{
+			ts, r.SignalID, event, supersedes, strategy, r.StrategyVersionID,
+			nullStr(r.BoardRunID), nullInt(r.BoardRank), mode,
+			r.ConditionID, nullStr(r.MarketID), r.TokenID, outcome, r.NegRisk, nullStr(r.NegRiskGroupID),
+			r.Side, action, tif,
+			r.EdgeBps, r.OpportunityBps, r.ModelEdgeBps, r.CostBps, costJSON,
+			r.FairValue, nullStr(r.FVSource), nullStr(r.ScorePath),
+			r.Conviction, nullInt(r.HorizonSec), nullInt(r.HalfLifeSec), r.Urgency,
+			r.SizeUSD, r.SizeShares, r.CapacityUSD, r.KellyFrac, flags,
+			r.Mid, r.BestBid, r.BestAsk, r.SpreadBps, r.Imbalance, r.BidDepth, r.AskDepth, r.LastTradePrice,
+			nullInt(r.BookAgeMs), nullInt(r.FeatureAgeMs),
+			featJSON, factJSON, tags, reasonJSON,
+		})
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	const sql = `
+		INSERT INTO signals (
+			time, signal_id, event, supersedes_id, strategy, strategy_version_id,
+			board_run_id, board_rank, mode,
+			condition_id, market_id, token_id, outcome, neg_risk, neg_risk_group_id,
+			side, action, time_in_force,
+			edge_bps, opportunity_bps, model_edge_bps, cost_bps, cost_breakdown,
+			fair_value, fv_source, score_path,
+			conviction, horizon_sec, half_life_sec, urgency,
+			size_usd, size_shares, capacity_usd, kelly_frac, risk_flags,
+			mid, best_bid, best_ask, spread_bps, imbalance, bid_depth, ask_depth, last_trade_price,
+			book_age_ms, feature_age_ms,
+			features, factors, tags, reason
+		) VALUES (
+			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+			$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,
+			$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49
+		)`
+	if err := BatchExec(ctx, conn, sql, args); err != nil {
+		return fmt.Errorf("db: insert signals: %w", err)
+	}
+	return nil
+}
+
+func nullInt(n int) any {
+	if n == 0 {
+		return nil
+	}
+	return n
+}
+
+// SignalFilter selects paper signals for M8 eval.
+type SignalFilter struct {
+	Strategy          string
+	Mode              string // default paper
+	From              time.Time
+	To                time.Time
+	StrategyVersionID *int64
+	// Limit: 0 = default 50_000; <0 = no cap; >0 = that many rows.
+	Limit             int
+	// Order: "newest" (default) takes the latest Limit rows then returns them
+	// chronological (time ASC). "oldest" is the historical ASC prefix.
+	Order             string
+}
+
+// DefaultSignalLoadLimit is the safety cap when SignalFilter.Limit == 0.
+const DefaultSignalLoadLimit = 50_000
+
+// SignalLoadMeta describes how many rows existed vs how many were loaded.
+type SignalLoadMeta struct {
+	Loaded  int
+	DBCount int
+	Limit   int // applied cap; -1 = unlimited
+	Capped  bool
+	Order   string
+}
+
+// LoadSignals loads signal rows matching filter ordered by time ASC.
+func LoadSignals(ctx context.Context, conn DBInterface, f SignalFilter) ([]SignalRow, error) {
+	if conn == nil {
+		return nil, ErrNilDB
+	}
+	strategy := f.Strategy
+	if strategy == "" {
+		strategy = "default"
+	}
+	mode := f.Mode
+	if mode == "" {
+		mode = "paper"
+	}
+	limit := f.Limit
+	if limit == 0 {
+		limit = DefaultSignalLoadLimit
+	}
+	from := f.From
+	to := f.To
+	if to.IsZero() {
+		to = time.Now().UTC()
+	}
+	if from.IsZero() {
+		from = to.Add(-30 * 24 * time.Hour)
+	}
+
+	q := `
+		SELECT time, signal_id::text, COALESCE(event,'open'), COALESCE(supersedes_id::text,''),
+			strategy, strategy_version_id, COALESCE(board_run_id,''), COALESCE(board_rank,0), COALESCE(mode,'paper'),
+			condition_id, COALESCE(market_id,''), token_id, COALESCE(outcome,'YES'),
+			COALESCE(neg_risk,false), COALESCE(neg_risk_group_id,''),
+			side, COALESCE(action,'ENTER'), COALESCE(time_in_force,''),
+			COALESCE(edge_bps,0), COALESCE(opportunity_bps,0), model_edge_bps, COALESCE(cost_bps,0),
+			COALESCE(fair_value,0), COALESCE(fv_source,''), COALESCE(score_path,''),
+			COALESCE(conviction,0), COALESCE(horizon_sec,0), COALESCE(half_life_sec,0), COALESCE(urgency,0),
+			COALESCE(size_usd,0), COALESCE(size_shares,0), COALESCE(capacity_usd,0), kelly_frac,
+			COALESCE(mid,0), COALESCE(best_bid,0), COALESCE(best_ask,0), COALESCE(spread_bps,0),
+			COALESCE(imbalance,0), COALESCE(bid_depth,0), COALESCE(ask_depth,0), COALESCE(last_trade_price,0)
+		FROM signals
+		WHERE strategy = $1 AND mode = $2 AND time >= $3 AND time <= $4`
+	args := []any{strategy, mode, from.UTC(), to.UTC()}
+	if f.StrategyVersionID != nil {
+		q += ` AND strategy_version_id = $5`
+		args = append(args, *f.StrategyVersionID)
+	}
+	order := NormalizeSignalOrder(f.Order)
+	if order == SignalOrderNewest && limit > 0 {
+		q += ` ORDER BY time DESC`
+	} else {
+		q += ` ORDER BY time ASC`
+	}
+	if limit > 0 {
+		q += fmt.Sprintf(` LIMIT $%d`, len(args)+1)
+		args = append(args, limit)
+	}
+
+	rows, err := conn.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: load signals: %w", err)
+	}
+	defer rows.Close()
+
+	var out []SignalRow
+	for rows.Next() {
+		var r SignalRow
+		var modelEdge, kelly *float64
+		var fv float64
+		if err := rows.Scan(
+			&r.Time, &r.SignalID, &r.Event, &r.SupersedesID,
+			&r.Strategy, &r.StrategyVersionID, &r.BoardRunID, &r.BoardRank, &r.Mode,
+			&r.ConditionID, &r.MarketID, &r.TokenID, &r.Outcome,
+			&r.NegRisk, &r.NegRiskGroupID,
+			&r.Side, &r.Action, &r.TimeInForce,
+			&r.EdgeBps, &r.OpportunityBps, &modelEdge, &r.CostBps,
+			&fv, &r.FVSource, &r.ScorePath,
+			&r.Conviction, &r.HorizonSec, &r.HalfLifeSec, &r.Urgency,
+			&r.SizeUSD, &r.SizeShares, &r.CapacityUSD, &kelly,
+			&r.Mid, &r.BestBid, &r.BestAsk, &r.SpreadBps,
+			&r.Imbalance, &r.BidDepth, &r.AskDepth, &r.LastTradePrice,
+		); err != nil {
+			return nil, err
+		}
+		r.ModelEdgeBps = modelEdge
+		r.KellyFrac = kelly
+		if fv != 0 {
+			r.FairValue = &fv
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if order == SignalOrderNewest && limit > 0 {
+		reverseSignalRows(out)
+	}
+	return out, nil
+}
+
+const (
+	SignalOrderNewest = "newest"
+	SignalOrderOldest = "oldest"
+)
+
+// NormalizeSignalOrder maps empty/unknown to newest (P1 default).
+func NormalizeSignalOrder(s string) string {
+	switch s {
+	case SignalOrderOldest:
+		return SignalOrderOldest
+	default:
+		return SignalOrderNewest
+	}
+}
+
+func reverseSignalRows(rows []SignalRow) {
+	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+		rows[i], rows[j] = rows[j], rows[i]
+	}
+}
+
+// CountSignals returns how many rows match the filter (ignores Limit).
+func CountSignals(ctx context.Context, conn DBInterface, f SignalFilter) (int, error) {
+	if conn == nil {
+		return 0, ErrNilDB
+	}
+	strategy := f.Strategy
+	if strategy == "" {
+		strategy = "default"
+	}
+	mode := f.Mode
+	if mode == "" {
+		mode = "paper"
+	}
+	from := f.From
+	to := f.To
+	if to.IsZero() {
+		to = time.Now().UTC()
+	}
+	if from.IsZero() {
+		from = to.Add(-30 * 24 * time.Hour)
+	}
+	q := `SELECT count(*) FROM signals WHERE strategy = $1 AND mode = $2 AND time >= $3 AND time <= $4`
+	args := []any{strategy, mode, from.UTC(), to.UTC()}
+	if f.StrategyVersionID != nil {
+		q += ` AND strategy_version_id = $5`
+		args = append(args, *f.StrategyVersionID)
+	}
+	var n int
+	if err := conn.QueryRow(ctx, q, args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("db: count signals: %w", err)
+	}
+	return n, nil
+}
+
+// SignalLoadMetaFrom builds cap diagnostics after a load.
+func SignalLoadMetaFrom(loaded, dbCount, appliedLimit int) SignalLoadMeta {
+	return SignalLoadMetaFromOrder(loaded, dbCount, appliedLimit, SignalOrderNewest)
+}
+
+func SignalLoadMetaFromOrder(loaded, dbCount, appliedLimit int, order string) SignalLoadMeta {
+	m := SignalLoadMeta{Loaded: loaded, DBCount: dbCount, Limit: appliedLimit, Order: NormalizeSignalOrder(order)}
+	if appliedLimit < 0 {
+		m.Limit = -1
+		return m
+	}
+	m.Capped = dbCount > loaded || (appliedLimit > 0 && loaded >= appliedLimit && dbCount > loaded)
+	if appliedLimit > 0 && dbCount > appliedLimit {
+		m.Capped = true
+	}
+	return m
+}
+

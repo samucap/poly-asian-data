@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"testing"
+	"time"
 
 	"github.com/samucap/poly-asian-data/internal/config"
 	"github.com/stretchr/testify/assert"
@@ -96,4 +97,20 @@ func TestConfigDefaults(t *testing.T) {
 		assert.NotNil(t, config.DefaultEndpoints["gamma"])
 		assert.NotNil(t, config.DefaultEndpoints["clob"])
 	})
+}
+
+func TestCatalogConfigDefaults(t *testing.T) {
+	os.Unsetenv("CATALOG_REFRESH_INTERVAL")
+	os.Unsetenv("CATALOG_PAGINATE_DELAY")
+	os.Unsetenv("PAGINATE_DELAY")
+	os.Setenv("POSTGRES_URL", "postgres://user:pass@localhost:5432/db")
+	defer func() {
+		os.Unsetenv("POSTGRES_URL")
+		os.Unsetenv("CATALOG_REFRESH_INTERVAL")
+	}()
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, 10*time.Minute, cfg.Catalog.RefreshInterval)
+	assert.Equal(t, time.Duration(0), cfg.Catalog.PaginateDelay)
 }

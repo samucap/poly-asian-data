@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://poly-asian.local/schemas/catalog_v1.json",
+  "title": "catalog_v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "pipeline_version",
+    "run_id",
+    "generated_at",
+    "input_hash",
+    "code_commit",
+    "status",
+    "errors",
+    "universe_stats",
+    "markets",
+    "tags",
+    "diff_from_previous"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "pipeline_version": { "type": "string", "minLength": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string", "minLength": 1 },
+    "input_hash": { "type": "string", "minLength": 1 },
+    "code_commit": { "type": "string" },
+    "status": { "type": "string", "enum": ["success", "partial", "failed"] },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "type": "string" },
+          "message": { "type": "string" },
+          "component": { "type": "string" }
+        }
+      }
+    },
+    "universe_stats": {
+      "type": "object",
+      "required": ["total_markets", "tradable", "total_active", "neg_risk_markets", "neg_risk_groups", "by_tag", "by_liquidity_tier"],
+      "properties": {
+        "total_markets": { "type": "integer", "minimum": 0 },
+        "tradable": { "type": "integer", "minimum": 0 },
+        "total_active": { "type": "integer", "minimum": 0 },
+        "neg_risk_markets": { "type": "integer", "minimum": 0 },
+        "neg_risk_groups": { "type": "integer", "minimum": 0 },
+        "by_tag": { "type": "object", "additionalProperties": { "type": "integer" } },
+        "by_liquidity_tier": { "type": "object", "additionalProperties": { "type": "integer" } }
+      }
+    },
+    "markets": { "type": "array" },
+    "tags": { "type": "array" },
+    "diff_from_previous": {
+      "type": "object",
+      "required": ["added", "removed", "status_changed"],
+      "properties": {
+        "added": { "type": "array", "items": { "type": "string" } },
+        "removed": { "type": "array", "items": { "type": "string" } },
+        "status_changed": { "type": "array" }
+      }
+    }
+  },
+  "additionalProperties": true
+}

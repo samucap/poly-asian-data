@@ -1,0 +1,305 @@
+// Command signal-eval runs paper portfolio risk + fill simulation.
+// Scores signals + deciding logic for an external auto-optimizer.
+// No live orders (OMS). Not board-policy edge-eval / promote_eligible.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"crypto/rand"
+	"encoding/hex"
+
+	"github.com/samucap/poly-asian-data/internal/artifacts"
+	"github.com/samucap/poly-asian-data/internal/config"
+	"github.com/samucap/poly-asian-data/internal/db"
+	"github.com/samucap/poly-asian-data/internal/logging"
+	"github.com/samucap/poly-asian-data/internal/pipeline"
+	"github.com/samucap/poly-asian-data/internal/risk"
+	"github.com/samucap/poly-asian-data/internal/signaleval"
+)
+
+func main() {
+	artifactsRoot := flag.String("artifacts", artifacts.DefaultRoot, "artifact root")
+	riskPath := flag.String("risk", "configs/risk/default.yaml", "risk policy YAML")
+	lookback := flag.Duration("lookback", 7*24*time.Hour, "signal window lookback")
+	strategy := flag.String("strategy", "default", "strategy name filter")
+	versionID := flag.Int64("version-id", 0, "optional strategy_version_id filter")
+	synthetic := flag.Bool("synthetic", false, "use built-in fixture (no DB signals required)")
+	minSample := flag.Int("min-sample", 3, "min signals for ok gate")
+	startingEquity := flag.Float64("starting-equity", 0, "override risk starting_equity_usd (0=config)")
+	limit := flag.Int("limit", db.DefaultSignalLoadLimit, "max signals to load when --source=signals (0=unlimited; default 50000)")
+	loadOrder := flag.String("load-order", db.SignalOrderNewest, "signals load: newest (latest N) or oldest (prefix)")
+	source := flag.String("source", "board", "paper input: board (edge_board_snapshots, whole listen set) or signals (intent tape)")
+	minEdgeBps := flag.Float64("min-edge-bps", 0, "replay worthiness: drop |edge_bps| below this")
+	maxSpreadBps := flag.Float64("max-spread-bps", 0, "replay worthiness: drop spread_bps above this (0=off)")
+	requireFV := flag.Bool("require-fv", false, "replay worthiness: keep only FV-path intents")
+	spotN := flag.Int("spot-check", 0, "M2: print N signal mid vs price-series checks (0=off)")
+	flag.Parse()
+
+	logging.Init(os.Getenv("ENV"))
+	logger := logging.Logger
+
+	rcfg, err := risk.LoadConfig(*riskPath)
+	if err != nil {
+		logger.Warn("risk config; using defaults", "error", err)
+		rcfg = risk.DefaultConfig()
+	}
+	if *startingEquity > 0 {
+		rcfg.StartingEquityUSD = *startingEquity
+	}
+	rcfg.Normalize()
+
+	var (
+		sigs     []signaleval.SignalIn
+		prices   signaleval.PriceIndex
+		from, to time.Time
+		loadMeta db.SignalLoadMeta
+		srcUsed  = "signals"
+	)
+	wf := signaleval.WorthinessFilter{
+		MinEdgeBps: *minEdgeBps, MaxSpreadBps: *maxSpreadBps, RequireFV: *requireFV,
+	}
+
+	if *synthetic {
+		sigs, prices = signaleval.SyntheticFixture()
+		// Apply tight budget demo if default risk leaves all accepted — keep user config
+		// but batch window helps ranking when simultaneous.
+		if rcfg.BatchWindowMs == 0 {
+			rcfg.BatchWindowMs = 1000
+		}
+		if len(sigs) > 0 {
+			from, to = sigs[0].Time, sigs[len(sigs)-1].Time
+		}
+		logger.Info("synthetic fixture", "n_signals", len(sigs))
+	} else {
+		cfg, err := config.Load()
+		if err != nil {
+			logger.Error("config", "error", err)
+			os.Exit(1)
+		}
+		logging.Init(cfg.ENV)
+		logger = logging.Logger
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-sigCh
+			cancel()
+		}()
+
+		factory, err := pipeline.NewFactory(ctx, cfg, logger)
+		if err != nil {
+			logger.Error("factory", "error", err)
+			os.Exit(1)
+		}
+		defer factory.Close()
+		pool := factory.DB()
+		_ = db.EnsureSignalsTable(ctx, pool)
+
+		to = time.Now().UTC()
+		from = to.Add(-*lookback)
+		srcUsed = *source
+		if srcUsed == "" {
+			srcUsed = "board"
+		}
+		switch srcUsed {
+		case "board":
+			snaps, err := db.LoadEdgeBoardSnapshots(ctx, pool, *strategy, from, to)
+			if err != nil {
+				logger.Error("load edge_board_snapshots", "error", err)
+				os.Exit(1)
+			}
+			// Snapshot times are the allocation clock — do not also auction a firehose.
+			rcfg.AuctionEnabled = false
+			rcfg.BatchWindowMs = 0
+			var meta signaleval.BoardAllocMeta
+			sigs, meta = signaleval.AllocateFromBoardSnapshots(snaps, rcfg, wf)
+			loadMeta = db.SignalLoadMeta{Loaded: len(sigs), DBCount: meta.NamesSeen, Capped: false, Order: "board"}
+			logger.Info("board allocation replay",
+				"snapshot_times", meta.SnapshotTimes,
+				"names_seen", meta.NamesSeen,
+				"taken", meta.Taken,
+				"rejected", meta.Rejected,
+				"signals", len(sigs),
+			)
+			srcUsed = "board_snapshots"
+		default:
+			srcUsed = "signals"
+			fil := db.SignalFilter{
+				Strategy: *strategy,
+				Mode:     "paper",
+				From:     from,
+				To:       to,
+				Order:    db.NormalizeSignalOrder(*loadOrder),
+			}
+			if *limit == 0 {
+				fil.Limit = -1
+			} else {
+				fil.Limit = *limit
+			}
+			if *versionID > 0 {
+				v := *versionID
+				fil.StrategyVersionID = &v
+			}
+			dbCount, err := db.CountSignals(ctx, pool, fil)
+			if err != nil {
+				logger.Warn("count signals", "error", err)
+			}
+			rows, err := db.LoadSignals(ctx, pool, fil)
+			if err != nil {
+				logger.Error("load signals", "error", err)
+				os.Exit(1)
+			}
+			sigs = rowsToSignals(rows)
+			beforeW := len(sigs)
+			sigs = signaleval.ApplyWorthiness(sigs, wf)
+			if beforeW != len(sigs) {
+				logger.Info("worthiness filter", "before", beforeW, "after", len(sigs), "min_edge_bps", *minEdgeBps, "max_spread_bps", *maxSpreadBps, "require_fv", *requireFV)
+			}
+			applied := fil.Limit
+			if applied == 0 {
+				applied = db.DefaultSignalLoadLimit
+			}
+			loadMeta = db.SignalLoadMetaFromOrder(len(sigs), dbCount, applied, fil.Order)
+			logger.Info("loaded signals", "n", len(sigs), "n_db", dbCount, "limit", applied, "capped", loadMeta.Capped, "order", fil.Order)
+		}
+		toks := uniqueTokens(sigs)
+		if len(toks) > 0 {
+			series, err := db.LoadPriceSeries(ctx, pool, toks, from.Add(-2*time.Hour), to.Add(48*time.Hour))
+			if err != nil {
+				logger.Warn("load prices", "error", err)
+			} else {
+				prices = priceIndexFromDB(series)
+			}
+		}
+	}
+
+	if *spotN > 0 {
+		checks := signaleval.SpotCheckFills(sigs, prices, *spotN)
+		raw, _ := json.Marshal(map[string]any{"spot_checks": checks})
+		fmt.Println(string(raw))
+		for _, c := range checks {
+			if !c.OK {
+				logger.Warn("spot-check failed", "signal_id", c.SignalID, "detail", c.Detail)
+			}
+		}
+	}
+
+	res := signaleval.Simulate(signaleval.SimConfig{Risk: rcfg}, sigs, prices)
+	runID := newRunID()
+	surf := signaleval.BuildSurface(runID, *strategy, res, from, to, *minSample)
+	surf.ApplyWindowExtra(len(sigs), loadMeta.DBCount, loadMeta.Limit, loadMeta.Capped, loadMeta.Order, srcUsed, wf.Note())
+
+	wr, err := artifacts.WriteJSON(runID, "signal_eval_surface", surf, artifacts.WriteOptions{
+		Root: *artifactsRoot, WriteLatest: true,
+	})
+	if err != nil {
+		logger.Error("write artifact", "error", err)
+		os.Exit(1)
+	}
+
+	summary, _ := json.Marshal(map[string]any{
+		"ok":                     surf.OK,
+		"economic_pass":          surf.EconomicPass,
+		"n_signals":              res.Metrics.NSignals,
+		"n_accepted":             res.Metrics.NAccepted,
+		"n_rejected":             res.Metrics.NRejectedRisk,
+		"hit_rate":               res.Metrics.HitRate,
+		"total_pnl_usd":          res.Metrics.TotalPnLUSD,
+		"total_return_bps":       res.Metrics.TotalReturnBps,
+		"sharpe":                 res.Metrics.Sharpe,
+		"sharpe_note":            res.Metrics.SharpeNote,
+		"n_periods":              res.Metrics.NPeriods,
+		"mean_period_return":     res.Metrics.MeanPeriodReturn,
+		"max_drawdown_bps":       res.Metrics.MaxDrawdownBps,
+		"max_daily_drawdown_bps": res.Metrics.MaxDailyDrawdownBps,
+		"config_hash":            res.ConfigHash[:12] + "…",
+		"path":                   wr.LatestPath,
+	})
+	fmt.Println(string(summary))
+	fmt.Fprintf(os.Stdout, `
+======== PAPER SIGNAL + RISK BACKTEST (signal-eval) ========
+signals:          %d  accepted: %d  rejected_risk: %d
+hit_rate:         %.3f
+total_pnl_usd:    %.2f
+total_return_bps: %.2f          # (~%.2f%% on starting equity)
+max_dd_bps:       %.2f
+sharpe:           %.2f  note=%s  # paper sim path
+ok:               %v            # protocol/sample only
+economic_pass:    %v            # total_pnl_usd > 0
+artifact:         %s
+===============================================================
+`,
+		res.Metrics.NSignals, res.Metrics.NAccepted, res.Metrics.NRejectedRisk,
+		res.Metrics.HitRate,
+		res.Metrics.TotalPnLUSD,
+		res.Metrics.TotalReturnBps, res.Metrics.TotalReturnBps/100.0,
+		res.Metrics.MaxDrawdownBps,
+		res.Metrics.Sharpe, res.Metrics.SharpeNote,
+		surf.OK, surf.EconomicPass,
+		wr.LatestPath,
+	)
+	if !surf.OK {
+		os.Exit(2)
+	}
+}
+
+func rowsToSignals(rows []db.SignalRow) []signaleval.SignalIn {
+	out := make([]signaleval.SignalIn, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, signaleval.SignalIn{
+			Time: r.Time, SignalID: r.SignalID, Strategy: r.Strategy,
+			StrategyVersionID: r.StrategyVersionID,
+			ConditionID: r.ConditionID, TokenID: r.TokenID, MarketID: r.MarketID,
+			Side: r.Side, Action: r.Action, EdgeBps: r.EdgeBps, Conviction: r.Conviction,
+			Urgency: r.Urgency, SizeUSD: r.SizeUSD, CapacityUSD: r.CapacityUSD,
+			CostBps: r.CostBps, Mid: r.Mid, HorizonSec: r.HorizonSec, KellyFrac: r.KellyFrac,
+			SpreadBps: r.SpreadBps, FVSource: r.FVSource, ScorePath: r.ScorePath,
+		})
+	}
+	return out
+}
+
+func uniqueTokens(sigs []signaleval.SignalIn) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	for _, s := range sigs {
+		if s.TokenID == "" {
+			continue
+		}
+		if _, ok := seen[s.TokenID]; ok {
+			continue
+		}
+		seen[s.TokenID] = struct{}{}
+		out = append(out, s.TokenID)
+	}
+	return out
+}
+
+func priceIndexFromDB(series map[string][]db.PricePoint) signaleval.PriceIndex {
+	out := make(signaleval.PriceIndex, len(series))
+	for tok, pts := range series {
+		for _, p := range pts {
+			out[tok] = append(out[tok], signaleval.PricePoint{Time: p.Timestamp, Mid: p.Price})
+		}
+	}
+	return out
+}
+
+func newRunID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	h := hex.EncodeToString(b[:])
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}

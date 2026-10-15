@@ -20,6 +20,7 @@ import (
 	"github.com/samucap/poly-asian-data/internal/config"
 	"github.com/samucap/poly-asian-data/internal/db"
 	"github.com/samucap/poly-asian-data/internal/services"
+	"github.com/samucap/poly-asian-data/internal/sportstags"
 	"github.com/samucap/poly-asian-data/internal/workerpool"
 )
 
@@ -56,15 +57,6 @@ var (
 		"football", "basketball", "hockey", "tennis", "esports", "baseball",
 		"soccer", "cricket", "rugby", "golf", "ufc", "formula1", "chess",
 		"boxing", "pickleball",
-	}
-
-	leagueDefaults = map[string]string{
-		"acn": "soccer", "bl2": "soccer", "scop": "soccer", "fr2": "soccer", "itsb": "soccer",
-		"nba": "basketball", "wnba": "basketball", "ncaab": "basketball", "cbb": "basketball",
-		"nhl": "hockey", "cfb": "football", "nfl": "football", "mlb": "baseball",
-		"csgo": "esports", "starcraft2": "esports", "es2": "esports", "bnd": "esports",
-		"bpl": "cricket", "cpl": "cricket", "wtc": "cricket", "odc": "cricket",
-		"ecc": "cricket", "weth": "cricket", "eth": "cricket",
 	}
 )
 
@@ -223,20 +215,17 @@ func (s *Saver) setSportID(slug, id string, primaryTagID *string) {
 	}
 }
 
-// findSportForLeague attempts to resolve the Sport Slug for a league
+// findSportForLeague resolves sports.slug for league/team FKs (not tag parent hierarchy).
 func (s *Saver) findSportForLeague(l *services.PlyMktSport) string {
-	s.cacheMu.RLock()
-	defer s.cacheMu.RUnlock()
-
-	// 1. Check direct defaults
-	key := strings.ToLower(l.Sport) // l.Sport is effectively the league 'slug' or 'key' often
-	if val, ok := leagueDefaults[key]; ok {
+	key := strings.ToLower(strings.TrimSpace(l.Sport))
+	if val, ok := sportstags.LeagueKeyToSportSlug[key]; ok {
 		return val
 	}
 
-	// 2. Check Tags (matches Sport Primary Tag ID)
-	tagIDs := strings.Split(l.Tags, ",")
-	for _, tagID := range tagIDs {
+	s.cacheMu.RLock()
+	defer s.cacheMu.RUnlock()
+
+	for _, tagID := range strings.Split(l.Tags, ",") {
 		tagID = strings.TrimSpace(tagID)
 		for slug, sport := range s.sportCache {
 			if sport.PrimaryTagID != nil && *sport.PrimaryTagID == tagID {
@@ -244,38 +233,20 @@ func (s *Saver) findSportForLeague(l *services.PlyMktSport) string {
 			}
 		}
 	}
-
-	// 3. Check Resolution string for Slug
 	for slug := range s.sportCache {
-		// Simple case insensitive check? Original logic was `strings.Contains(l.Resolution, cat.Tag.Slug)`
-		// cat.Tag.Slug == slug (mostly)
 		if strings.Contains(l.Resolution, slug) {
 			return slug
 		}
 	}
-
-	// 4. Default Slug match
-	if val, ok := leagueDefaults[l.Sport]; ok { // l.Sport again
-		return val
-	}
-
 	return ""
 }
 
-// findSportForTeam attempts to resolve Sport Slug for a team
+// findSportForTeam resolves sports.slug for team FKs (not tag parent hierarchy).
 func (s *Saver) findSportForTeam(t *services.PlyMktTeam) string {
-	s.cacheMu.RLock()
-	defer s.cacheMu.RUnlock()
-
-	// 1. Check League in defaults
-	if val, ok := leagueDefaults[t.League]; ok {
+	key := strings.ToLower(strings.TrimSpace(t.League))
+	if val, ok := sportstags.LeagueKeyToSportSlug[key]; ok {
 		return val
 	}
-
-	// 2. Check if League is in any Sport's list of Leagues (Saver doesn't track this easily without huge state)
-	// But we can check if t.League matches any known Sport-linked logic?
-	// Simplified: relying on defaults mainly.
-
 	return ""
 }
 
@@ -964,11 +935,15 @@ func (s *Saver) batchInsertSports(ctx context.Context, data any) (int64, error) 
 		// Or: Use `RETURNING slug, id`.
 		// Strategy: Ensure the tag exists (stub) before inserting the sport to satisfy FK.
 		if sport.PrimaryTagID != "" {
-			// Pre-insert tag stub to ensure FK constraint met immediately
-			// The actual tag definition will update this later or has already done so.
+			// Ensure FK parent exists without creating blank label/slug stubs permanently.
+			pl, ps := sportstags.KnownLabelSlug(sport.PrimaryTagID)
 			batch.Queue(`
-				INSERT INTO tags (id) VALUES ($1) ON CONFLICT (id) DO NOTHING
-			`, sport.PrimaryTagID)
+				INSERT INTO tags (id, label, slug)
+				VALUES ($1, NULLIF($2, ''), NULLIF($3, ''))
+				ON CONFLICT (id) DO UPDATE SET
+					label = COALESCE(NULLIF(tags.label, ''), EXCLUDED.label, tags.label),
+					slug  = COALESCE(NULLIF(tags.slug, ''), EXCLUDED.slug, tags.slug)
+			`, sport.PrimaryTagID, pl, ps)
 		}
 
 		batch.Queue(`
@@ -1034,27 +1009,33 @@ func (s *Saver) batchInsertTagsDefinitions(ctx context.Context, data any) (int64
 	}
 
 	batch := &pgx.Batch{}
+	nQueued := 0
 	for _, t := range tags {
-		// Only insert/update definition fields: label, slug, force_show, force_hide
-		// Ignore relationships.
+		if t.ID == "" {
+			continue
+		}
+		// Only insert/update definition fields: label, slug, force_show, force_hide.
+		// Never clobber a non-empty label/slug with empty API noise.
 		batch.Queue(`
 			INSERT INTO tags (id, label, slug, force_show, force_hide)
-			VALUES ($1, $2, $3, $4, $5)
+			VALUES ($1, NULLIF($2, ''), NULLIF($3, ''), $4, $5)
 			ON CONFLICT (id) DO UPDATE SET
-				label = EXCLUDED.label,
-				slug = EXCLUDED.slug,
+				label = COALESCE(NULLIF(EXCLUDED.label, ''), tags.label),
+				slug = COALESCE(NULLIF(EXCLUDED.slug, ''), tags.slug),
 				force_show = EXCLUDED.force_show,
 				force_hide = EXCLUDED.force_hide
 		`, t.ID, t.Label, t.Slug, t.ForceShow, t.ForceHide)
+		nQueued++
+	}
+	if nQueued == 0 {
+		return 0, nil
 	}
 
-	rowsAffected, failIdx, err := s.execBatch(ctx, batch, len(tags))
+	rowsAffected, failIdx, err := s.execBatch(ctx, batch, nQueued)
 	if err != nil {
-		if failIdx != -1 && failIdx < len(tags) {
-			t := tags[failIdx]
+		if failIdx != -1 {
 			s.logger.Error("failed to save tag definition",
-				slog.String("id", t.ID),
-				slog.String("slug", t.Slug),
+				slog.Int("batch_index", failIdx),
 				slog.String("error", err.Error()),
 			)
 		}
@@ -1069,8 +1050,13 @@ func (s *Saver) batchInsertTagsSportLink(ctx context.Context, data any) (int64, 
 		return 0, fmt.Errorf("invalid data type for tags sport link: got %T", data)
 	}
 
+	// UPDATE-only: never INSERT id-only rows with null label/slug.
 	batch := &pgx.Batch{}
+	nQueued := 0
 	for _, t := range tags {
+		if t.ID == "" {
+			continue
+		}
 		var sportID *string
 		if t.SportSlug != "" {
 			if id, found := s.getSportID(t.SportSlug); found {
@@ -1082,10 +1068,6 @@ func (s *Saver) batchInsertTagsSportLink(ctx context.Context, data any) (int64, 
 		}
 
 		if sportID == nil {
-			// Skip if we can't resolve sport. Or should we insert with null?
-			// Ideally we want to link it. If missing, maybe retry or skip.
-			// For now, allow null to ensure ID exists, but update won't do much.
-			// Actually, if we can't resolve sport, it's useless for "SportLink".
 			s.logger.Debug("skipping tag sport link - sport unresolved",
 				slog.String("tag_id", t.ID),
 				slog.String("sport_slug", t.SportSlug))
@@ -1093,19 +1075,20 @@ func (s *Saver) batchInsertTagsSportLink(ctx context.Context, data any) (int64, 
 		}
 
 		batch.Queue(`
-			INSERT INTO tags (id, sport_id)
-			VALUES ($1, $2)
-			ON CONFLICT (id) DO UPDATE SET
-				sport_id = EXCLUDED.sport_id
+			UPDATE tags SET sport_id = $2, updated_at = NOW()
+			WHERE id = $1
 		`, t.ID, sportID)
+		nQueued++
 	}
 
-	rowsAffected, failIdx, err := s.execBatch(ctx, batch, len(tags))
+	if nQueued == 0 {
+		return 0, nil
+	}
+	rowsAffected, failIdx, err := s.execBatch(ctx, batch, nQueued)
 	if err != nil {
 		if failIdx != -1 && failIdx < len(tags) {
-			t := tags[failIdx]
 			s.logger.Error("failed to save tag sport link",
-				slog.String("id", t.ID),
+				slog.Int("batch_index", failIdx),
 				slog.String("error", err.Error()),
 			)
 		}
@@ -1120,8 +1103,13 @@ func (s *Saver) batchInsertTagsHierarchy(ctx context.Context, data any) (int64, 
 		return 0, fmt.Errorf("invalid data type for tags hierarchy: got %T", data)
 	}
 
+	// UPDATE-only: never INSERT incomplete tag rows (null label/slug stubs).
 	batch := &pgx.Batch{}
+	nQueued := 0
 	for _, t := range tags {
+		if t.ID == "" {
+			continue
+		}
 		var sportID *string
 		if t.SportSlug != "" {
 			if id, found := s.getSportID(t.SportSlug); found {
@@ -1135,22 +1123,24 @@ func (s *Saver) batchInsertTagsHierarchy(ctx context.Context, data any) (int64, 
 			parentID = &pid
 		}
 
-		// Hierarchy updates parent_tag_id and potentially sport_id (if derived from league)
 		batch.Queue(`
-			INSERT INTO tags (id, parent_tag_id, sport_id)
-			VALUES ($1, $2, $3)
-			ON CONFLICT (id) DO UPDATE SET
-				parent_tag_id = EXCLUDED.parent_tag_id,
-				sport_id = COALESCE(EXCLUDED.sport_id, tags.sport_id) 
+			UPDATE tags SET
+				parent_tag_id = COALESCE($2, parent_tag_id),
+				sport_id = COALESCE($3, sport_id),
+				updated_at = NOW()
+			WHERE id = $1
 		`, t.ID, parentID, sportID)
+		nQueued++
 	}
 
-	rowsAffected, failIdx, err := s.execBatch(ctx, batch, len(tags))
+	if nQueued == 0 {
+		return 0, nil
+	}
+	rowsAffected, failIdx, err := s.execBatch(ctx, batch, nQueued)
 	if err != nil {
-		if failIdx != -1 && failIdx < len(tags) {
-			t := tags[failIdx]
+		if failIdx != -1 {
 			s.logger.Error("failed to save tag hierarchy",
-				slog.String("id", t.ID),
+				slog.Int("batch_index", failIdx),
 				slog.String("error", err.Error()),
 			)
 		}
@@ -1267,80 +1257,80 @@ func (s *Saver) batchInsertLeagueHierarchy(ctx context.Context, data any) (int64
 		return 0, fmt.Errorf("invalid data type for league hierarchy: got %T", data)
 	}
 
-	batch := &pgx.Batch{}
-	totalOps := 0
+	// Authoritative sports tree: Gamma tag id → parent Gamma tag id only.
+	// Does not write tags.sport_id (UUID); that FK is for leagues/teams grouping.
+	edges := sportstags.EdgesFromLeagues(leagues)
+	n, err := db.ApplySportsParentTags(ctx, s.db, edges)
+	if err != nil {
+		return 0, err
+	}
 
+	// Optionally ensure sports category rows for league/team FKs (slug → UUID), independent of tag parents.
+	seenSlug := map[string]bool{}
 	for _, l := range leagues {
-		// 1. Resolve Sport Slug
 		sSlug := l.SportSlug
 		if sSlug == "" {
 			sSlug = s.findSportForLeague(&l)
 		}
-		if sSlug == "" {
+		if sSlug == "" || seenSlug[sSlug] {
 			continue
 		}
+		seenSlug[sSlug] = true
+		familyTag := sportstags.SportSlugToFamilyTagID[sSlug]
+		if _, err := s.ensureSportCategory(ctx, sSlug, familyTag); err != nil {
+			s.logger.Warn("ensure sport category failed",
+				slog.String("slug", sSlug),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
+	return n, nil
+}
 
-		// 2. Get Sport Info from Cache
-		s.cacheMu.RLock()
-		sport, cached := s.sportCache[sSlug]
+// ensureSportCategory upserts a sports category row and returns its UUID.
+// primaryTagID is the Gamma family tag (e.g. esports→64) for sports.primary_tag_id — not tags.sport_id hierarchy.
+func (s *Saver) ensureSportCategory(ctx context.Context, slug, primaryTagID string) (string, error) {
+	if slug == "" {
+		return "", fmt.Errorf("empty sport slug")
+	}
+	s.cacheMu.RLock()
+	if c, ok := s.sportCache[slug]; ok && c.UUID != "" {
 		s.cacheMu.RUnlock()
+		return c.UUID, nil
+	}
+	s.cacheMu.RUnlock()
 
-		if !cached {
-			// If not in cache, we can't reliably determine root structure.
-			// Ideally we retry or warn.
-			s.logger.Warn("sport not found in cache for hierarchy", slog.String("slug", sSlug))
-			continue
-		}
-
-		primaryTagID := ""
-		if sport.PrimaryTagID != nil {
-			primaryTagID = *sport.PrimaryTagID
-		}
-		sportID := sport.UUID
-
-		// 3. Reconstruct Chain (Logic: SportTag -> Tag1 -> Tag2 per definition)
-		currTags := strings.Split(l.Tags, ",")
-		cleaned := make([]string, 0, len(currTags)+1)
-
-		// Root is correctly the Sport Primary Tag
-		if primaryTagID != "" {
-			cleaned = append(cleaned, primaryTagID)
-		}
-
-		gamesTagID := "100639"
-		for _, id := range currTags {
-			id = strings.TrimSpace(id)
-			if id != "" && id != primaryTagID && id != "1" && id != gamesTagID {
-				cleaned = append(cleaned, id)
-			}
-		}
-
-		// 4. Queue Updates
-		for i := 0; i < len(cleaned); i++ {
-			tagID := cleaned[i]
-			var parentID *string
-
-			// Chain parent to the previous tag in the list
-			if i > 0 {
-				pid := cleaned[i-1]
-				parentID = &pid
-			}
-
-			// We insert stub if missing, or update if exists.
-			// This ensures the tag exists even if definition fetch is lagging.
-			batch.Queue(`
-				INSERT INTO tags (id, parent_tag_id, sport_id)
-				VALUES ($1, $2, $3)
-				ON CONFLICT (id) DO UPDATE SET
-					parent_tag_id = EXCLUDED.parent_tag_id,
-					sport_id = EXCLUDED.sport_id
-			`, tagID, parentID, sportID)
-			totalOps++
+	if primaryTagID != "" {
+		pl, ps := sportstags.KnownLabelSlug(primaryTagID)
+		if _, err := s.db.Exec(ctx, `
+			INSERT INTO tags (id, label, slug)
+			VALUES ($1, NULLIF($2, ''), NULLIF($3, ''))
+			ON CONFLICT (id) DO UPDATE SET
+				label = COALESCE(NULLIF(tags.label, ''), EXCLUDED.label, tags.label),
+				slug  = COALESCE(NULLIF(tags.slug, ''), EXCLUDED.slug, tags.slug)
+		`, primaryTagID, pl, ps); err != nil {
+			return "", err
 		}
 	}
 
-	rowsAffected, _, err := s.execBatch(ctx, batch, totalOps)
-	return rowsAffected, err
+	var id string
+	err := s.db.QueryRow(ctx, `
+		INSERT INTO sports (slug, primary_tag_id)
+		VALUES ($1, NULLIF($2, ''))
+		ON CONFLICT (slug) DO UPDATE SET
+			primary_tag_id = COALESCE(EXCLUDED.primary_tag_id, sports.primary_tag_id)
+		RETURNING id::text
+	`, slug, primaryTagID).Scan(&id)
+	if err != nil {
+		return "", err
+	}
+	var pt *string
+	if primaryTagID != "" {
+		p := primaryTagID
+		pt = &p
+	}
+	s.setSportID(slug, id, pt)
+	return id, nil
 }
 
 // execBatch executes a batch and returns total rows affected, the index of failure (if applicable), and error.

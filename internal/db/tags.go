@@ -8,13 +8,69 @@ import (
 	"github.com/samucap/poly-asian-data/internal/services"
 )
 
-// TagAggregate is a top-category metrics row for UPDATE tags aggregates.
+// TagAggregate is a metrics-only row (legacy aggregate-only updates).
 type TagAggregate struct {
 	ID           string
 	TotalVol     float64
 	TotalVol24hr float64
 	TotalLiq     float64
 	TotalMarkets int
+}
+
+// ResetTagCatalogResult counts rows touched by ResetTagCatalog.
+type ResetTagCatalogResult struct {
+	SportsCleared int64
+	TagsDeleted   int64
+	WatermarkGone bool
+}
+
+// ResetTagCatalog wipes the tags table safely for a clean API re-seed.
+//
+// Order (single transaction):
+//  1. NULL sports.primary_tag_id (FK → tags)
+//  2. NULL tags.parent_tag_id (self-FK)
+//  3. DELETE FROM tags
+//  4. DELETE sync_state row for WatermarkTopMarketsTagCatalog (force next LoadTagCatalog API path)
+//
+// Does not run every cycle — call explicitly (e.g. catalog-markets --reset-tags).
+func ResetTagCatalog(ctx context.Context, conn DBInterface) (ResetTagCatalogResult, error) {
+	var out ResetTagCatalogResult
+	if conn == nil {
+		return out, ErrNilDB
+	}
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return out, fmt.Errorf("db: reset tag catalog begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `UPDATE sports SET primary_tag_id = NULL WHERE primary_tag_id IS NOT NULL`)
+	if err != nil {
+		return out, fmt.Errorf("db: reset tag catalog clear sports.primary_tag_id: %w", err)
+	}
+	out.SportsCleared = tag.RowsAffected()
+
+	if _, err := tx.Exec(ctx, `UPDATE tags SET parent_tag_id = NULL WHERE parent_tag_id IS NOT NULL`); err != nil {
+		return out, fmt.Errorf("db: reset tag catalog clear parent_tag_id: %w", err)
+	}
+
+	tag, err = tx.Exec(ctx, `DELETE FROM tags`)
+	if err != nil {
+		return out, fmt.Errorf("db: reset tag catalog delete tags: %w", err)
+	}
+	out.TagsDeleted = tag.RowsAffected()
+
+	tag, err = tx.Exec(ctx, `DELETE FROM sync_state WHERE sync_type = $1`, WatermarkTopMarketsTagCatalog)
+	if err != nil {
+		return out, fmt.Errorf("db: reset tag catalog clear watermark: %w", err)
+	}
+	out.WatermarkGone = tag.RowsAffected() > 0
+
+	if err := tx.Commit(ctx); err != nil {
+		return out, fmt.Errorf("db: reset tag catalog commit: %w", err)
+	}
+	return out, nil
 }
 
 // FetchTopCategoryTags loads tags with the given parent_tag_id and the newest updated_at.
@@ -24,8 +80,8 @@ func FetchTopCategoryTags(ctx context.Context, conn DBInterface, parentTagID str
 		FROM tags WHERE parent_tag_id = $1`, parentTagID)
 }
 
-// FetchTagSubtree loads all tags under rootParentID: direct children (top-level)
-// and their children (subtags). Used for hierarchical aggregates.
+// FetchTagSubtree loads the full descendant tree under rootParentID (recursive).
+// Needed for sports chains like mlb → baseball → Sports → Categories (depth 3+).
 // maxUpdated is the newest updated_at among returned rows.
 func FetchTagSubtree(ctx context.Context, conn DBInterface, rootParentID string) ([]*services.PlyMktTag, time.Time, error) {
 	if conn == nil {
@@ -34,12 +90,20 @@ func FetchTagSubtree(ctx context.Context, conn DBInterface, rootParentID string)
 	if rootParentID == "" {
 		return nil, time.Time{}, fmt.Errorf("db: rootParentID is required")
 	}
-	// Depth-1 and depth-2 under root (matches fetchCategories related-tags walk).
+	// Recursive CTE with depth cap to avoid cycles; sports trees are shallow.
 	query := `
+		WITH RECURSIVE tree AS (
+			SELECT id, label, slug, force_show, force_hide, parent_tag_id, updated_at, 1 AS depth
+			FROM tags
+			WHERE parent_tag_id = $1
+			UNION ALL
+			SELECT t.id, t.label, t.slug, t.force_show, t.force_hide, t.parent_tag_id, t.updated_at, tree.depth + 1
+			FROM tags t
+			INNER JOIN tree ON t.parent_tag_id = tree.id
+			WHERE tree.depth < 8
+		)
 		SELECT id, label, slug, force_show, force_hide, parent_tag_id, updated_at
-		FROM tags
-		WHERE parent_tag_id = $1
-		   OR parent_tag_id IN (SELECT id FROM tags WHERE parent_tag_id = $1)`
+		FROM tree`
 	return fetchTagsWhere(ctx, conn, query, rootParentID)
 }
 
@@ -79,7 +143,156 @@ func fetchTagsWhere(ctx context.Context, conn DBInterface, query string, arg str
 	return tags, maxUpdatedAt, nil
 }
 
-// UpdateTagAggregates writes volume/liquidity rollups onto tags by id.
+// UpdateTags upserts tag definitions, hierarchy, and cycle aggregates in one write.
+// Empty parent_tag_id is stored as NULL. Metrics are fully replaced for each row
+// (idle tags should be passed with zeros so stale totals do not linger).
+//
+// Parent FK safety:
+//  1. Self-parent nulled.
+//  2. Parents not in this batch and not already in DB → parent_tag_id cleared
+//     (no silent empty stubs that poison hierarchy).
+//  3. Upsert batch runs in one transaction so DEFERRABLE parent FK checks at COMMIT.
+func UpdateTags(ctx context.Context, conn DBInterface, tags []*services.PlyMktTag) error {
+	if len(tags) == 0 {
+		return nil
+	}
+	if conn == nil {
+		return ErrNilDB
+	}
+
+	tags, _ = sanitizeTagParents(ctx, conn, tags)
+
+	// parent_tag_id: writer is authoritative when non-empty (catalog-markets overlays
+	// sports hierarchy as Gamma parent tag ids before calling this). Never use
+	// tags.sport_id (UUID) as hierarchy — that is only a sports-table FK for leagues/teams.
+	// label/slug: never replace a non-empty value with empty/null from a sparse writer.
+	sql := `
+		INSERT INTO tags (
+			id, label, slug, force_show, force_hide, parent_tag_id,
+			total_vol, total_vol_24hr, total_liq, total_markets
+		) VALUES (
+			$1, $2, $3, $4, $5, NULLIF($6, ''),
+			$7, $8, $9, $10
+		)
+		ON CONFLICT (id) DO UPDATE SET
+			label = CASE
+				WHEN EXCLUDED.label IS NOT NULL AND EXCLUDED.label <> '' THEN EXCLUDED.label
+				ELSE tags.label
+			END,
+			slug = CASE
+				WHEN EXCLUDED.slug IS NOT NULL AND EXCLUDED.slug <> '' THEN EXCLUDED.slug
+				ELSE tags.slug
+			END,
+			force_show = EXCLUDED.force_show,
+			force_hide = EXCLUDED.force_hide,
+			parent_tag_id = CASE
+				WHEN EXCLUDED.parent_tag_id IS NOT NULL THEN EXCLUDED.parent_tag_id
+				ELSE tags.parent_tag_id
+			END,
+			total_vol = EXCLUDED.total_vol,
+			total_vol_24hr = EXCLUDED.total_vol_24hr,
+			total_liq = EXCLUDED.total_liq,
+			total_markets = EXCLUDED.total_markets,
+			updated_at = NOW()
+	`
+
+	var roots, rest [][]any
+	for _, t := range tags {
+		if t == nil || t.ID == "" {
+			continue
+		}
+		parent := t.ParentTagID
+		if parent == t.ID {
+			parent = ""
+		}
+		row := []any{
+			t.ID,
+			t.Label,
+			t.Slug,
+			t.ForceShow,
+			t.ForceHide,
+			parent,
+			t.TotalVol,
+			t.TotalVol24hr,
+			t.TotalLiq,
+			t.TotalMarkets,
+		}
+		if parent == "" {
+			roots = append(roots, row)
+		} else {
+			rest = append(rest, row)
+		}
+	}
+	rows := append(roots, rest...)
+	if len(rows) == 0 {
+		return nil
+	}
+	return BatchExecTx(ctx, conn, sql, rows)
+}
+
+// sanitizeTagParents nulls illegal/missing parents instead of inserting empty stubs.
+// A parent is kept if it appears in this batch or already exists in the DB.
+func sanitizeTagParents(ctx context.Context, conn DBInterface, tags []*services.PlyMktTag) ([]*services.PlyMktTag, []string) {
+	if len(tags) == 0 {
+		return tags, nil
+	}
+	byID := make(map[string]*services.PlyMktTag, len(tags))
+	out := make([]*services.PlyMktTag, 0, len(tags))
+	for _, t := range tags {
+		if t == nil || t.ID == "" {
+			continue
+		}
+		if t.ParentTagID == t.ID {
+			t.ParentTagID = ""
+		}
+		if _, ok := byID[t.ID]; ok {
+			continue
+		}
+		byID[t.ID] = t
+		out = append(out, t)
+	}
+
+	needCheck := make([]string, 0)
+	seenNeed := map[string]bool{}
+	for _, t := range out {
+		p := t.ParentTagID
+		if p == "" || byID[p] != nil {
+			continue
+		}
+		if !seenNeed[p] {
+			seenNeed[p] = true
+			needCheck = append(needCheck, p)
+		}
+	}
+
+	existing := map[string]bool{}
+	if len(needCheck) > 0 && conn != nil {
+		rows, err := conn.Query(ctx, `SELECT id FROM tags WHERE id = ANY($1)`, needCheck)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var id string
+				if rows.Scan(&id) == nil && id != "" {
+					existing[id] = true
+				}
+			}
+		}
+	}
+
+	var cleared []string
+	for _, t := range out {
+		p := t.ParentTagID
+		if p == "" || byID[p] != nil || existing[p] {
+			continue
+		}
+		t.ParentTagID = ""
+		cleared = append(cleared, p)
+	}
+	return out, cleared
+}
+
+// UpdateTagAggregates writes volume/liquidity rollups onto tags by id (metrics only).
+// Prefer UpdateTags when definitions/hierarchy must be written in the same pass.
 func UpdateTagAggregates(ctx context.Context, conn DBInterface, aggregates []TagAggregate) error {
 	if len(aggregates) == 0 {
 		return nil
